@@ -1,0 +1,18 @@
+[package]
+name = "gba_core"
+description = "Núcleo puro del emulador de Game Boy Advance (CPU, bus, PPU). Sin dependencias gráficas."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+# ⚠️ REGLA DE ORO DE LA ARQUITECTURA ⚠️
+# Esta crate NO debe depender JAMÁS de una librería gráfica, de ventanas o de
+# entrada (minifb, pixels, winit, sdl2, wgpu...). Si alguna aparece aquí, la
+# separación núcleo/frontend se ha roto y hay que revertirlo ANTES de seguir.
+# (Checkpoint de salud de la Fase 1 en plan_gba_emulador.md.)
+
+[lib]
+# Nombre explícito de la librería para dejar clara la intención.
+name = "gba_core"

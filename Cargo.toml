@@ -1,0 +1,35 @@
+# Workspace raíz del emulador de Game Boy Advance.
+#
+# Contiene dos crates con responsabilidades estrictamente separadas:
+#   - gba_core    : el núcleo de emulación. Librería PURA, sin NINGUNA
+#                   dependencia gráfica ni de sistema operativo.
+#   - gba_desktop : el frontend de escritorio. Abre la ventana, lee el teclado
+#                   y pinta el framebuffer que produce el núcleo.
+#
+# Esta separación desde el día 1 es lo que permitirá portar el emulador a
+# Android/iOS/WASM en el futuro sustituyendo solo el frontend, sin tocar el
+# núcleo. Ver "Arquitectura general" en plan_gba_emulador.md.
+
+[workspace]
+resolver = "2"
+members = ["gba_core", "gba_desktop"]
+
+# Metadatos compartidos por todas las crates del workspace. Cada crate los
+# hereda con `version.workspace = true`, etc., para mantenerlos sincronizados.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Valentín Manuel <vm.expositosono@gmail.com>"]
+repository = ""
+
+# Perfil de compilación optimizado. Un emulador necesita rendimiento incluso
+# en builds de desarrollo para correr a 60 FPS, así que subimos un poco la
+# optimización del perfil dev sin perder los símbolos de depuración.
+[profile.dev]
+opt-level = 1
+
+# Las dependencias en modo dev sí se optimizan al máximo: nunca las depuramos
+# nosotros y así el emulador va fluido también en debug.
+[profile.dev.package."*"]
+opt-level = 3

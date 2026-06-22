@@ -1,0 +1,19 @@
+# Artefactos de compilación de Cargo.
+/target
+
+# Backups del formato antiguo de rustfmt.
+**/*.rs.bk
+
+# BIOS y ROMs: NO se redistribuyen (copyright de Nintendo / del titular).
+# El emulador las carga desde el disco del usuario, nunca desde el repositorio.
+*.gba
+*.gb
+*.bin
+gba_bios.bin
+
+# Partidas guardadas generadas por el emulador.
+*.sav
+
+#Directorios
+.claude
+.venv
