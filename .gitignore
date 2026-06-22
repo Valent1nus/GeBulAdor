@@ -17,3 +17,18 @@ gba_bios.bin
 #Directorios
 .claude
 .venv
+
+# Editores / IDEs.
+.vscode/
+.idea/
+*.swp
+*~
+
+# Basura del sistema operativo.
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+
+# Documento de planificación interno: no se publica en el repo.
+plan_gba_emulador.md
