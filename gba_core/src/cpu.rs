@@ -33,6 +33,7 @@
 
 use crate::arm::{self, Decoded};
 use crate::bus::Bus;
+use crate::thumb::ThumbInstruction;
 
 /// Número de registros visibles del ARM7TDMI: `r0`–`r15`.
 pub const NUM_REGISTERS: usize = 16;
@@ -383,6 +384,15 @@ impl Cpu {
         arm::decode(instr, self.cpsr())
     }
 
+    /// **Decode** en modo THUMB (Mini-Hito 2.1c-bis): clasifica la instrucción
+    /// de 16 bits `instr`. A diferencia de [`Cpu::decode_arm`], **no** consulta
+    /// el CPSR, porque THUMB no lleva condición embebida (de ahí que ignore
+    /// `&self`); la única condicional es el salto `B<cond>`. Es una fachada sobre
+    /// [`ThumbInstruction::decode`], que vive en un decoder separado del de ARM.
+    pub fn decode_thumb(&self, instr: u16) -> ThumbInstruction {
+        ThumbInstruction::decode(instr)
+    }
+
     /// El CPSR actual (copia; es `Copy`).
     pub fn cpsr(&self) -> Cpsr {
         self.cpsr
@@ -618,5 +628,15 @@ mod tests {
             cpu.decode_arm(0x0A00_002E),
             Decoded::Execute(ArmInstruction::Branch { link: false })
         );
+    }
+
+    #[test]
+    fn decode_thumb_no_depende_del_cpsr() {
+        // El decode THUMB clasifica directo, sin importar los flags del CPSR.
+        let mut cpu = Cpu::new();
+        cpu.cpsr_mut().set_z(true);
+        cpu.cpsr_mut().set_n(true);
+        // 0x2005 = «MOV r0, #5» en THUMB (formato 3).
+        assert_eq!(cpu.decode_thumb(0x2005), ThumbInstruction::MoveCompareAddSubImm);
     }
 }

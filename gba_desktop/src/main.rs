@@ -45,6 +45,14 @@ fn main() {
                         println!("  Condición {cond:?} no se cumple con el CPSR → se ignora (NOP).")
                     }
                 }
+
+                // Mini-Hito 2.1c-bis — Decode THUMB (16 bits, decoder separado del
+                // de ARM). La GBA aún no ejecuta THUMB (el fetch real llega en
+                // 2.3a), así que lo demostramos con una instrucción conocida:
+                // 0x2005 = «MOV r0, #5» en THUMB.
+                let thumb_ej: u16 = 0x2005;
+                println!("  Ejemplo THUMB {thumb_ej:#06X} → {}", gba.decode_thumb(thumb_ej));
+
                 gba
             }
             Err(e) => {
@@ -111,7 +119,7 @@ fn run_window(gba: Gba) {
     let mut buffer: Vec<u32> = vec![0; SCREEN_WIDTH * SCREEN_HEIGHT];
 
     let mut window = Window::new(
-        "EmulaRUST — GBA (Fase 2.1c · ESC para salir)",
+        "EmulaRUST — GBA (Fase 2.1c-bis · ESC para salir)",
         SCREEN_WIDTH,
         SCREEN_HEIGHT,
         WindowOptions {

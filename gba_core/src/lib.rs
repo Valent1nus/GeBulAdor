@@ -9,30 +9,33 @@
 //! sustituir el frontend de escritorio por uno de Android, iOS o WASM sin tocar
 //! una sola línea del núcleo.
 //!
-//! ## Estado actual (Fase 2.1c)
+//! ## Estado actual (Fase 2.1c-bis)
 //!
 //! Además de cargar y validar el cartucho (Fase 1), el núcleo tiene el
 //! esqueleto del hardware: la CPU ARM7TDMI ([`Cpu`]) con sus registros y modos,
 //! y el bus de memoria ([`Bus`]) con el mapa de memoria de la consola. La
 //! consola [`Gba`] ya integra ambos: [`Gba::with_cartridge`] vuelca la ROM en
 //! el bus y coloca el `PC` en el arranque, [`Gba::fetch`] realiza el **"Fetch"**
-//! —leer la instrucción a la que apunta el `PC`— y [`Gba::decode_arm`] hace el
-//! **"Decode"** del modo ARM: identifica el tipo de instrucción aplicando el
-//! flujo de dos pasos (condición → opcode), pero todavía no ejecuta su lógica;
-//! eso llega en el Mini-Hito 2.1d. La frontera con el frontend —entregar un
-//! buffer RGBA— no cambiará.
+//! —leer la instrucción a la que apunta el `PC`— y el **"Decode"** identifica el
+//! tipo de instrucción: [`Gba::decode_arm`] para el modo ARM (flujo de dos pasos
+//! condición → opcode) y [`Gba::decode_thumb`] para el modo THUMB (16 bits, con
+//! un decoder separado). Todavía no se ejecuta su lógica; eso llega en el
+//! Mini-Hito 2.1d. La frontera con el frontend —entregar un buffer RGBA— no
+//! cambiará.
 
 pub mod arm;
 pub mod bus;
 pub mod cartridge;
 pub mod cpu;
 pub mod header;
+pub mod thumb;
 
 pub use arm::{ArmInstruction, Condition, Decoded};
 pub use bus::Bus;
 pub use cartridge::{Cartridge, CartridgeError, MAX_ROM_SIZE, MIN_ROM_SIZE};
 pub use cpu::{Cpu, CpuMode, Cpsr};
 pub use header::Header;
+pub use thumb::ThumbInstruction;
 
 /// Anchura de la pantalla de la GBA, en píxeles.
 pub const SCREEN_WIDTH: usize = 240;
@@ -117,6 +120,13 @@ impl Gba {
     /// No ejecuta nada todavía. Fachada del frontend sobre [`Cpu::decode_arm`].
     pub fn decode_arm(&self, instr: u32) -> Decoded {
         self.cpu.decode_arm(instr)
+    }
+
+    /// **Decode** del modo THUMB (Mini-Hito 2.1c-bis): identifica el formato de
+    /// la instrucción de 16 bits `instr` con un decoder **separado** del de ARM.
+    /// No ejecuta nada todavía. Fachada del frontend sobre [`Cpu::decode_thumb`].
+    pub fn decode_thumb(&self, instr: u16) -> ThumbInstruction {
+        self.cpu.decode_thumb(instr)
     }
 
     /// El Program Counter actual (`r15`).
@@ -211,5 +221,15 @@ mod tests {
             }
             Decoded::ConditionFailed(c) => panic!("no debería fallar la condición: {c:?}"),
         }
+    }
+
+    #[test]
+    fn decodifica_thumb_con_un_decoder_separado() {
+        let gba = Gba::new();
+        // 0x2005 = «MOV r0, #5» en THUMB → formato 3 (la "Prueba" de 2.1c-bis).
+        assert_eq!(
+            gba.decode_thumb(0x2005),
+            ThumbInstruction::MoveCompareAddSubImm
+        );
     }
 }
