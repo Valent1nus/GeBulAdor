@@ -31,6 +31,8 @@
 //! **cambiar de modo** (algo poco frecuente) hacemos el intercambio de bancos en
 //! [`Cpu::set_mode`].
 
+use crate::bus::Bus;
+
 /// Número de registros visibles del ARM7TDMI: `r0`–`r15`.
 pub const NUM_REGISTERS: usize = 16;
 
@@ -295,9 +297,10 @@ impl Cpu {
     /// Crea una CPU en su estado de **reset** del ARM7TDMI: modo Supervisor,
     /// estado ARM, IRQ y FIQ deshabilitadas, y todos los registros a cero.
     ///
-    /// (Más adelante, el Mini-Hito 2.1b colocará el `PC` de arranque y el 2.3a
-    /// hará que arranque de verdad desde la BIOS en `0x0`. De momento esto es
-    /// solo un punto de partida coherente con el hardware.)
+    /// (El `PC` de arranque lo coloca quien construye la consola:
+    /// [`crate::Gba::with_cartridge`] lo apunta a la ROM como atajo "skip BIOS"
+    /// (Mini-Hito 2.1b), y el 2.3a lo cambiará para arrancar de verdad desde la
+    /// BIOS en `0x0`. De momento esto es solo un punto de partida coherente.)
     pub fn new() -> Self {
         let mut cpsr = Cpsr::from_bits(0);
         // El procesador real arranca en Supervisor, en ARM, con las
@@ -354,6 +357,20 @@ impl Cpu {
     /// El Link Register (`r14`) del modo actual.
     pub fn lr(&self) -> u32 {
         self.r[LR]
+    }
+
+    /// **Fetch**: lee la instrucción ARM (32 bits) a la que apunta el `PC`, en
+    /// little-endian, a través del bus. Es la primera etapa del ciclo
+    /// Fetch→Decode→Execute (Mini-Hito 2.1b).
+    ///
+    /// No avanza ni modifica el `PC`: es una lectura pura. El avance del puntero
+    /// llega con el bucle de ejecución (2.2a) y el desfase de pipeline con el
+    /// 2.1e.
+    ///
+    /// De momento siempre lee 4 bytes (modo ARM). El Mini-Hito 2.3a añadirá la
+    /// rama THUMB: leer 2 bytes cuando el bit `T` del CPSR esté activo.
+    pub fn fetch(&self, bus: &Bus) -> u32 {
+        bus.read_u32(self.pc())
     }
 
     /// El CPSR actual (copia; es `Copy`).
@@ -559,5 +576,19 @@ mod tests {
         cpu.set_mode(CpuMode::Irq);
         assert_eq!(cpu.cpsr().mode_bits(), CpuMode::Irq.bits());
         assert_eq!(cpu.cpsr().mode_bits(), 0x12);
+    }
+
+    #[test]
+    fn fetch_lee_la_instruccion_de_32_bits_en_little_endian() {
+        // 0xEA00002E es el ejemplo del plan; en little-endian son los bytes
+        // [0x2E, 0x00, 0x00, 0xEA] al inicio de la ROM.
+        let mut rom = vec![0u8; 8];
+        rom[..4].copy_from_slice(&[0x2E, 0x00, 0x00, 0xEA]);
+        let bus = Bus::new(rom);
+
+        let mut cpu = Cpu::new();
+        cpu.set_pc(crate::bus::ROM_START);
+
+        assert_eq!(cpu.fetch(&bus), 0xEA00_002E);
     }
 }

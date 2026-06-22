@@ -17,7 +17,7 @@ use minifb::{Key, Scale, Window, WindowOptions};
 fn main() {
     // Primer argumento de la línea de comandos (opcional): la ruta a la ROM.
     //   cargo run -p gba_desktop -- "roms/Pokemon Rojo Fuego.gba"
-    match std::env::args().nth(1) {
+    let gba = match std::env::args().nth(1) {
         Some(path) => match load_cartridge(Path::new(&path)) {
             Ok(cart) => {
                 let size = cart.len();
@@ -28,6 +28,17 @@ fn main() {
                 let header = cart.header();
                 println!("  Título:       «{}»", header.title);
                 println!("  Código juego: «{}»", header.game_code);
+
+                // Mini-Hito 2.1b — El primer "Fetch": montamos la consola con el
+                // cartucho (lo que coloca el PC en la ROM) y leemos la primera
+                // instrucción a la que apunta, mostrándola en hexadecimal.
+                let gba = Gba::with_cartridge(cart);
+                println!(
+                    "  Primera instrucción ARM @ {:#010X}: {:#010X}",
+                    gba.pc(),
+                    gba.fetch()
+                );
+                gba
             }
             Err(e) => {
                 // Error legible y salida no-cero: nada de panics por un archivo
@@ -39,10 +50,11 @@ fn main() {
         None => {
             eprintln!("Uso: gba_desktop <ruta-al-rom.gba>");
             eprintln!("(No se indicó ROM; se abre solo la ventana de prueba.)");
+            Gba::new()
         }
-    }
+    };
 
-    run_window();
+    run_window(gba);
 }
 
 /// Lee un fichero `.gba` del disco y lo convierte en un [`Cartridge`] validado.
@@ -84,16 +96,15 @@ fn human_size(bytes: usize) -> String {
 }
 
 /// Abre la ventana y ejecuta el bucle de pintado del framebuffer del núcleo.
-fn run_window() {
-    // El núcleo produce los píxeles; el frontend solo los muestra.
-    let gba = Gba::new();
+fn run_window(gba: Gba) {
+    // El núcleo (`gba`) produce los píxeles; el frontend solo los muestra.
 
     // minifb pinta desde un buffer de `u32` en formato 0RGB (0x00RRGGBB). El
     // núcleo entrega RGBA en bytes, así que mantenemos un buffer de conversión.
     let mut buffer: Vec<u32> = vec![0; SCREEN_WIDTH * SCREEN_HEIGHT];
 
     let mut window = Window::new(
-        "EmulaRUST — GBA (Fase 1.2 · ESC para salir)",
+        "EmulaRUST — GBA (Fase 2.1b · ESC para salir)",
         SCREEN_WIDTH,
         SCREEN_HEIGHT,
         WindowOptions {

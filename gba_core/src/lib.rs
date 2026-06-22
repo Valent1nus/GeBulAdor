@@ -9,14 +9,16 @@
 //! sustituir el frontend de escritorio por uno de Android, iOS o WASM sin tocar
 //! una sola línea del núcleo.
 //!
-//! ## Estado actual (Fase 2.1a)
+//! ## Estado actual (Fase 2.1b)
 //!
-//! Además de cargar y validar el cartucho (Fase 1), el núcleo ya tiene el
-//! esqueleto del hardware sobre el que correrá la emulación: la CPU ARM7TDMI
-//! ([`Cpu`]) con sus registros y modos, y el bus de memoria ([`Bus`]) con el
-//! mapa de memoria de la consola. Todavía no se ejecuta ninguna instrucción;
-//! eso empieza en los siguientes mini-hitos. La frontera con el frontend
-//! —entregar un buffer RGBA— no cambiará.
+//! Además de cargar y validar el cartucho (Fase 1), el núcleo tiene el
+//! esqueleto del hardware: la CPU ARM7TDMI ([`Cpu`]) con sus registros y modos,
+//! y el bus de memoria ([`Bus`]) con el mapa de memoria de la consola. La
+//! consola [`Gba`] ya integra ambos: [`Gba::with_cartridge`] vuelca la ROM en
+//! el bus y coloca el `PC` en el arranque, y [`Gba::fetch`] realiza el primer
+//! **"Fetch"** —leer la instrucción a la que apunta el `PC`—. Todavía no se
+//! decodifica ni se ejecuta nada; eso llega en los siguientes mini-hitos. La
+//! frontera con el frontend —entregar un buffer RGBA— no cambiará.
 
 pub mod bus;
 pub mod cartridge;
@@ -42,11 +44,16 @@ pub const FRAMEBUFFER_SIZE: usize = SCREEN_WIDTH * SCREEN_HEIGHT * BYTES_PER_PIX
 
 /// Estado completo de una GBA emulada.
 ///
-/// De momento solo contiene el framebuffer. En fases posteriores este será el
-/// objeto de nivel superior que agrupe la CPU, el bus de memoria, la PPU, el
-/// scheduler, etc. El frontend interactúa con la emulación únicamente a través
-/// de este tipo.
+/// Agrupa la CPU ([`Cpu`]), el bus de memoria ([`Bus`]) y el framebuffer. En
+/// fases posteriores sumará la PPU, el scheduler, etc. El frontend interactúa
+/// con la emulación únicamente a través de este tipo.
 pub struct Gba {
+    /// La CPU ARM7TDMI con sus registros, modos y estado.
+    cpu: Cpu,
+
+    /// El bus de memoria: ROM del cartucho, RAMs y registros de I/O.
+    bus: Bus,
+
     /// Framebuffer en formato RGBA, con [`FRAMEBUFFER_SIZE`] bytes.
     ///
     /// El orden es fila a fila desde la esquina superior izquierda; cada píxel
@@ -55,18 +62,55 @@ pub struct Gba {
 }
 
 impl Gba {
-    /// Crea una nueva GBA con el framebuffer inicializado a un azul sólido.
+    /// Crea una GBA **sin cartucho**: hardware en reset y ROM vacía. Sirve para
+    /// la prueba "Hola Ventana" (Fase 1.1) sin necesidad de cargar un juego.
     ///
-    /// El color de arranque es puramente de prueba para la Fase 1.1 ("Hola
-    /// Ventana"): demuestra que el núcleo produce píxeles y que el frontend los
-    /// pinta. Desaparecerá en cuanto la PPU genere imágenes reales.
+    /// El framebuffer arranca en un azul sólido de prueba; demuestra que el
+    /// núcleo produce píxeles y que el frontend los pinta, y desaparecerá en
+    /// cuanto la PPU genere imágenes reales.
     pub fn new() -> Self {
+        Self::with_hardware(Cpu::new(), Bus::new(Vec::new()))
+    }
+
+    /// Construye la consola a partir de un cartucho ya validado y la deja lista
+    /// para ejecutar: vuelca la ROM en el bus y coloca el `PC` en el arranque.
+    ///
+    /// ## ⚠️ Atajo temporal de desarrollo ("skip BIOS")
+    ///
+    /// La GBA real arranca en `0x0000_0000` (BIOS), y es la BIOS la que salta al
+    /// cartucho. Hasta integrar la BIOS (Mini-Hito 2.3a), apuntamos el `PC`
+    /// directamente al inicio de la ROM (`0x0800_0000`) para poder ejecutar ya
+    /// el código del juego. **Esa línea desaparece en el 2.3a**, donde el
+    /// arranque pasará a ser el real desde la BIOS.
+    pub fn with_cartridge(cart: Cartridge) -> Self {
+        let mut cpu = Cpu::new();
+        cpu.set_pc(bus::ROM_START); // atajo skip-BIOS (temporal, ver 2.3a)
+        Self::with_hardware(cpu, Bus::new(cart.into_rom()))
+    }
+
+    /// Constructor común: monta la consola con la CPU y el bus dados y pinta el
+    /// framebuffer de prueba.
+    fn with_hardware(cpu: Cpu, bus: Bus) -> Self {
         let mut gba = Gba {
+            cpu,
+            bus,
             framebuffer: vec![0; FRAMEBUFFER_SIZE],
         };
         // Azul "GBA" (#1E90FF) como color de prueba visible.
         gba.clear(0x1E, 0x90, 0xFF);
         gba
+    }
+
+    /// **Fetch** (Mini-Hito 2.1b): lee —sin ejecutar ni avanzar el `PC`— la
+    /// instrucción de 32 bits a la que apunta el Program Counter. Fachada del
+    /// frontend sobre [`Cpu::fetch`].
+    pub fn fetch(&self) -> u32 {
+        self.cpu.fetch(&self.bus)
+    }
+
+    /// El Program Counter actual (`r15`).
+    pub fn pc(&self) -> u32 {
+        self.cpu.pc()
     }
 
     /// Rellena todo el framebuffer con un color sólido opaco.
@@ -122,5 +166,21 @@ mod tests {
         // Último píxel: confirma que el bucle cubre todo el buffer.
         let n = fb.len();
         assert_eq!(&fb[n - 4..n], &[10, 20, 30, 0xFF]);
+    }
+
+    #[test]
+    fn fetch_lee_la_primera_instruccion_del_cartucho() {
+        // Cartucho mínimo con la instrucción 0xEA00002E al inicio de la ROM
+        // (en little-endian: [0x2E, 0x00, 0x00, 0xEA]).
+        let mut rom = vec![0u8; MIN_ROM_SIZE];
+        rom[..4].copy_from_slice(&[0x2E, 0x00, 0x00, 0xEA]);
+        let cart = Cartridge::from_bytes(rom).expect("ROM mínima válida");
+
+        let gba = Gba::with_cartridge(cart);
+
+        // El PC arranca apuntando a la ROM (atajo skip-BIOS).
+        assert_eq!(gba.pc(), crate::bus::ROM_START);
+        // Y el fetch devuelve la instrucción reconstruida en little-endian.
+        assert_eq!(gba.fetch(), 0xEA00_002E);
     }
 }

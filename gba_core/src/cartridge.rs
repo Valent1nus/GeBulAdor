@@ -113,6 +113,13 @@ impl Cartridge {
         &self.rom
     }
 
+    /// Consume el cartucho y devuelve los bytes de la ROM, para cedérselos al
+    /// bus sin clonar los (hasta 32 MiB) de datos. Se usa al montar la consola
+    /// en [`crate::Gba::with_cartridge`].
+    pub fn into_rom(self) -> Vec<u8> {
+        self.rom
+    }
+
     /// Cabecera ya parseada del cartucho (título, código de juego...).
     pub fn header(&self) -> &Header {
         &self.header
