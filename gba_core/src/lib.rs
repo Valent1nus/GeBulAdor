@@ -9,7 +9,7 @@
 //! sustituir el frontend de escritorio por uno de Android, iOS o WASM sin tocar
 //! una sola línea del núcleo.
 //!
-//! ## Estado actual (Fase 2.1c-bis)
+//! ## Estado actual (Fase 2.1d)
 //!
 //! Además de cargar y validar el cartucho (Fase 1), el núcleo tiene el
 //! esqueleto del hardware: la CPU ARM7TDMI ([`Cpu`]) con sus registros y modos,
@@ -19,9 +19,11 @@
 //! —leer la instrucción a la que apunta el `PC`— y el **"Decode"** identifica el
 //! tipo de instrucción: [`Gba::decode_arm`] para el modo ARM (flujo de dos pasos
 //! condición → opcode) y [`Gba::decode_thumb`] para el modo THUMB (16 bits, con
-//! un decoder separado). Todavía no se ejecuta su lógica; eso llega en el
-//! Mini-Hito 2.1d. La frontera con el frontend —entregar un buffer RGBA— no
-//! cambiará.
+//! un decoder separado). El **"Execute"** acaba de empezar:
+//! [`Cpu::execute_data_processing`] ejecuta la primera familia de instrucciones
+//! (procesamiento de datos con operando inmediato), alterando registros y flags.
+//! Falta el bucle que encadene fetch→decode→execute (Mini-Hito 2.2a). La
+//! frontera con el frontend —entregar un buffer RGBA— no cambiará.
 
 pub mod arm;
 pub mod bus;

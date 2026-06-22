@@ -393,6 +393,94 @@ impl Cpu {
         ThumbInstruction::decode(instr)
     }
 
+    /// Ejecuta una instrucción de **procesamiento de datos** en su forma con
+    /// operando inmediato (Mini-Hito 2.1d). Es la primera instrucción que altera
+    /// el estado de la CPU: calcula el resultado de la operación de la ALU
+    /// (`MOV`, `ADD`, `SUB`, `AND`...), lo escribe en `Rd` salvo para las
+    /// comparaciones (`TST`/`TEQ`/`CMP`/`CMN`) y actualiza los flags `N/Z/C/V` si
+    /// el bit `S` (20) está activo.
+    ///
+    /// Se asume que la condición de la instrucción ya se evaluó (vía
+    /// [`Cpu::decode_arm`]) y se cumple. **Solo** está implementada la forma con
+    /// operando inmediato; la forma con registro desplazado (*barrel shifter*) y
+    /// los casos especiales con `Rd = r15` (PC) llegan en hitos posteriores.
+    pub fn execute_data_processing(&mut self, instr: u32) {
+        // Capturamos el CPSR de ENTRADA: el carry previo lo necesitan ADC/SBC y
+        // el carry del shifter, y debe leerse antes de actualizar los flags.
+        let cpsr_before = self.cpsr();
+
+        // --- Operando 2 (solo forma inmediata, bit 25 = 1) ----------------
+        // Un valor de 8 bits rotado a la derecha por un campo de 4 bits (×2).
+        let is_immediate = (instr & (1 << 25)) != 0;
+        debug_assert!(
+            is_immediate,
+            "data-processing con operando de registro aún no implementado (barrel shifter)"
+        );
+        if !is_immediate {
+            return;
+        }
+        let rotate = ((instr >> 8) & 0xF) * 2;
+        let imm8 = instr & 0xFF;
+        let operand2 = imm8.rotate_right(rotate);
+        // Carry del shifter (para las operaciones lógicas): con rotación 0 se
+        // conserva el C actual; con rotación, es el bit 31 del resultado.
+        let shifter_carry = if rotate == 0 {
+            cpsr_before.c()
+        } else {
+            (operand2 & 0x8000_0000) != 0
+        };
+
+        // --- Operandos y opcode -------------------------------------------
+        let rn = ((instr >> 16) & 0xF) as usize;
+        let rd = ((instr >> 12) & 0xF) as usize;
+        let opcode = (instr >> 21) & 0xF;
+        let sets_flags = (instr & (1 << 20)) != 0;
+        let a = self.reg(rn);
+        let b = operand2;
+        let carry_in = cpsr_before.c();
+
+        // --- Operación de la ALU ------------------------------------------
+        // Las lógicas dejan V sin tocar (`None`) y usan el carry del shifter;
+        // las aritméticas obtienen carry/overflow de la suma. La resta se modela
+        // como `a + !b + 1`, así que [`alu_add`] cubre todos los casos.
+        let (result, carry, overflow): (u32, bool, Option<bool>) = match opcode {
+            0x0 => (a & b, shifter_carry, None),    // AND
+            0x1 => (a ^ b, shifter_carry, None),    // EOR
+            0x2 => with_v(alu_add(a, !b, true)),    // SUB
+            0x3 => with_v(alu_add(b, !a, true)),    // RSB
+            0x4 => with_v(alu_add(a, b, false)),    // ADD
+            0x5 => with_v(alu_add(a, b, carry_in)), // ADC
+            0x6 => with_v(alu_add(a, !b, carry_in)), // SBC
+            0x7 => with_v(alu_add(b, !a, carry_in)), // RSC
+            0x8 => (a & b, shifter_carry, None),    // TST
+            0x9 => (a ^ b, shifter_carry, None),    // TEQ
+            0xA => with_v(alu_add(a, !b, true)),    // CMP
+            0xB => with_v(alu_add(a, b, false)),    // CMN
+            0xC => (a | b, shifter_carry, None),    // ORR
+            0xD => (b, shifter_carry, None),        // MOV
+            0xE => (a & !b, shifter_carry, None),   // BIC
+            0xF => (!b, shifter_carry, None),       // MVN
+            _ => unreachable!("opcode = (instr >> 21) & 0xF está en 0..=15"),
+        };
+
+        // --- Flags (solo si S = 1) ----------------------------------------
+        if sets_flags {
+            let cpsr = self.cpsr_mut();
+            cpsr.set_n((result & 0x8000_0000) != 0);
+            cpsr.set_z(result == 0);
+            cpsr.set_c(carry);
+            if let Some(v) = overflow {
+                cpsr.set_v(v);
+            }
+        }
+
+        // --- Escritura del resultado --------------------------------------
+        // Las comparaciones (TST/TEQ/CMP/CMN, opcodes 0x8..=0xB) no escriben Rd.
+        if !matches!(opcode, 0x8..=0xB) {
+            self.set_reg(rd, result);
+        }
+    }
+
     /// El CPSR actual (copia; es `Copy`).
     pub fn cpsr(&self) -> Cpsr {
         self.cpsr
@@ -488,6 +576,27 @@ impl Default for Cpu {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Suma `a + b + carry_in` devolviendo `(resultado, carry_out, overflow_con_signo)`.
+///
+/// La resta se modela como `a + !b + 1` (y `SBC`/`RSC` como `a + !b + carry`), así
+/// que esta única función cubre todas las operaciones aritméticas de la ALU. El
+/// overflow con signo se detecta cuando ambos operandos comparten signo y el
+/// resultado lo cambia; con `b = !b` esa misma fórmula da el overflow de la resta.
+fn alu_add(a: u32, b: u32, carry_in: bool) -> (u32, bool, bool) {
+    let carry = carry_in as u32;
+    let result = a.wrapping_add(b).wrapping_add(carry);
+    let carry_out = (a as u64) + (b as u64) + (carry as u64) > 0xFFFF_FFFF;
+    let overflow = (!(a ^ b) & (a ^ result) & 0x8000_0000) != 0;
+    (result, carry_out, overflow)
+}
+
+/// Adapta la tripleta de [`alu_add`] al formato `(resultado, carry, Some(V))` que
+/// espera el `match` de la ALU (las operaciones lógicas usan `None` para no tocar
+/// el flag V).
+fn with_v(t: (u32, bool, bool)) -> (u32, bool, Option<bool>) {
+    (t.0, t.1, Some(t.2))
 }
 
 #[cfg(test)]
@@ -638,5 +747,77 @@ mod tests {
         cpu.cpsr_mut().set_n(true);
         // 0x2005 = «MOV r0, #5» en THUMB (formato 3).
         assert_eq!(cpu.decode_thumb(0x2005), ThumbInstruction::MoveCompareAddSubImm);
+    }
+
+    #[test]
+    fn mov_inmediato_escribe_el_registro() {
+        // La "Prueba" del plan: MOV R0, #5 (0xE3A00005) deja R0 == 5.
+        let mut cpu = Cpu::new();
+        cpu.execute_data_processing(0xE3A0_0005);
+        assert_eq!(cpu.reg(0), 5);
+    }
+
+    #[test]
+    fn add_inmediato_suma_sobre_el_registro() {
+        // ADD R1, R1, #1 (0xE2811001) con R1 = 10 → 11.
+        let mut cpu = Cpu::new();
+        cpu.set_reg(1, 10);
+        cpu.execute_data_processing(0xE281_1001);
+        assert_eq!(cpu.reg(1), 11);
+    }
+
+    #[test]
+    fn operando_inmediato_rotado() {
+        // MOV R0, #0xFF rotado a la derecha 8 bits (0xE3A004FF) → 0xFF000000.
+        let mut cpu = Cpu::new();
+        cpu.execute_data_processing(0xE3A0_04FF);
+        assert_eq!(cpu.reg(0), 0xFF00_0000);
+    }
+
+    #[test]
+    fn movs_y_mvns_actualizan_n_y_z() {
+        let mut cpu = Cpu::new();
+        // MOVS R0, #0 (0xE3B00000) → R0 = 0, Z = 1, N = 0.
+        cpu.execute_data_processing(0xE3B0_0000);
+        assert_eq!(cpu.reg(0), 0);
+        assert!(cpu.cpsr().z());
+        assert!(!cpu.cpsr().n());
+        // MVNS R0, #0 (0xE3F00000) → R0 = 0xFFFFFFFF, N = 1, Z = 0.
+        cpu.execute_data_processing(0xE3F0_0000);
+        assert_eq!(cpu.reg(0), 0xFFFF_FFFF);
+        assert!(cpu.cpsr().n());
+        assert!(!cpu.cpsr().z());
+    }
+
+    #[test]
+    fn cmp_actualiza_flags_sin_escribir_rd() {
+        // CMP R0, #5 (0xE3500005) con R0 = 5 → Z = 1, C = 1, y R0 no cambia.
+        let mut cpu = Cpu::new();
+        cpu.set_reg(0, 5);
+        cpu.execute_data_processing(0xE350_0005);
+        assert!(cpu.cpsr().z(), "5 - 5 == 0 → Z");
+        assert!(cpu.cpsr().c(), "5 >= 5 → sin borrow → C");
+        assert_eq!(cpu.reg(0), 5, "CMP no escribe Rd");
+    }
+
+    #[test]
+    fn subs_marca_signo_y_borrow() {
+        // SUBS R0, R0, #1 (0xE2500001) con R0 = 0 → 0xFFFFFFFF, N=1, Z=0, C=0.
+        let mut cpu = Cpu::new();
+        cpu.set_reg(0, 0);
+        cpu.execute_data_processing(0xE250_0001);
+        assert_eq!(cpu.reg(0), 0xFFFF_FFFF);
+        assert!(cpu.cpsr().n());
+        assert!(!cpu.cpsr().z());
+        assert!(!cpu.cpsr().c(), "0 - 1 genera borrow → C = 0");
+    }
+
+    #[test]
+    fn adc_usa_el_carry_de_entrada() {
+        // ADC R0, R0, #0 (0xE2A00000) con R0 = 0 y C = 1 → R0 = 1.
+        let mut cpu = Cpu::new();
+        cpu.cpsr_mut().set_c(true);
+        cpu.execute_data_processing(0xE2A0_0000);
+        assert_eq!(cpu.reg(0), 1);
     }
 }

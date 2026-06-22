@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-use gba_core::{Cartridge, Decoded, Gba, MAX_ROM_SIZE, SCREEN_HEIGHT, SCREEN_WIDTH};
+use gba_core::{Cartridge, Cpu, Decoded, Gba, MAX_ROM_SIZE, SCREEN_HEIGHT, SCREEN_WIDTH};
 use minifb::{Key, Scale, Window, WindowOptions};
 
 fn main() {
@@ -52,6 +52,14 @@ fn main() {
                 // 0x2005 = «MOV r0, #5» en THUMB.
                 let thumb_ej: u16 = 0x2005;
                 println!("  Ejemplo THUMB {thumb_ej:#06X} → {}", gba.decode_thumb(thumb_ej));
+
+                // Mini-Hito 2.1d — Primera ejecución: la CPU altera un registro.
+                // Demostración sintética sobre una CPU recién reseteada (la
+                // primera instrucción de la ROM es un salto, aún no ejecutable):
+                // «MOV R0, #5» (0xE3A00005) deja R0 = 5.
+                let mut demo = Cpu::new();
+                demo.execute_data_processing(0xE3A0_0005);
+                println!("  Ejecución «MOV R0, #5» → R0 = {}", demo.reg(0));
 
                 gba
             }
@@ -119,7 +127,7 @@ fn run_window(gba: Gba) {
     let mut buffer: Vec<u32> = vec![0; SCREEN_WIDTH * SCREEN_HEIGHT];
 
     let mut window = Window::new(
-        "EmulaRUST — GBA (Fase 2.1c-bis · ESC para salir)",
+        "EmulaRUST — GBA (Fase 2.1d · ESC para salir)",
         SCREEN_WIDTH,
         SCREEN_HEIGHT,
         WindowOptions {
