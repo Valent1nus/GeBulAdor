@@ -31,6 +31,7 @@
 //! **cambiar de modo** (algo poco frecuente) hacemos el intercambio de bancos en
 //! [`Cpu::set_mode`].
 
+use crate::arm::{self, Decoded};
 use crate::bus::Bus;
 
 /// Número de registros visibles del ARM7TDMI: `r0`–`r15`.
@@ -373,6 +374,15 @@ impl Cpu {
         bus.read_u32(self.pc())
     }
 
+    /// **Decode** en modo ARM (Mini-Hito 2.1c): clasifica la instrucción `instr`
+    /// aplicando el flujo de dos pasos —primero la condición contra el CPSR
+    /// actual, y solo si se cumple, el opcode—. No ejecuta nada todavía.
+    ///
+    /// Es una fachada sobre [`crate::arm::decode`] que le pasa el CPSR vigente.
+    pub fn decode_arm(&self, instr: u32) -> Decoded {
+        arm::decode(instr, self.cpsr())
+    }
+
     /// El CPSR actual (copia; es `Copy`).
     pub fn cpsr(&self) -> Cpsr {
         self.cpsr
@@ -590,5 +600,23 @@ mod tests {
         cpu.set_pc(crate::bus::ROM_START);
 
         assert_eq!(cpu.fetch(&bus), 0xEA00_002E);
+    }
+
+    #[test]
+    fn decode_arm_usa_el_cpsr_para_la_condicion() {
+        use crate::arm::{ArmInstruction, Condition};
+
+        let mut cpu = Cpu::new();
+        // "BEQ": salta solo si Z = 1. Con Z = 0 (reset) se descarta como NOP.
+        assert_eq!(
+            cpu.decode_arm(0x0A00_002E),
+            Decoded::ConditionFailed(Condition::Eq)
+        );
+        // Activando Z, la misma instrucción ya se identifica como salto.
+        cpu.cpsr_mut().set_z(true);
+        assert_eq!(
+            cpu.decode_arm(0x0A00_002E),
+            Decoded::Execute(ArmInstruction::Branch { link: false })
+        );
     }
 }

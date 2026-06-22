@@ -9,22 +9,26 @@
 //! sustituir el frontend de escritorio por uno de Android, iOS o WASM sin tocar
 //! una sola línea del núcleo.
 //!
-//! ## Estado actual (Fase 2.1b)
+//! ## Estado actual (Fase 2.1c)
 //!
 //! Además de cargar y validar el cartucho (Fase 1), el núcleo tiene el
 //! esqueleto del hardware: la CPU ARM7TDMI ([`Cpu`]) con sus registros y modos,
 //! y el bus de memoria ([`Bus`]) con el mapa de memoria de la consola. La
 //! consola [`Gba`] ya integra ambos: [`Gba::with_cartridge`] vuelca la ROM en
-//! el bus y coloca el `PC` en el arranque, y [`Gba::fetch`] realiza el primer
-//! **"Fetch"** —leer la instrucción a la que apunta el `PC`—. Todavía no se
-//! decodifica ni se ejecuta nada; eso llega en los siguientes mini-hitos. La
-//! frontera con el frontend —entregar un buffer RGBA— no cambiará.
+//! el bus y coloca el `PC` en el arranque, [`Gba::fetch`] realiza el **"Fetch"**
+//! —leer la instrucción a la que apunta el `PC`— y [`Gba::decode_arm`] hace el
+//! **"Decode"** del modo ARM: identifica el tipo de instrucción aplicando el
+//! flujo de dos pasos (condición → opcode), pero todavía no ejecuta su lógica;
+//! eso llega en el Mini-Hito 2.1d. La frontera con el frontend —entregar un
+//! buffer RGBA— no cambiará.
 
+pub mod arm;
 pub mod bus;
 pub mod cartridge;
 pub mod cpu;
 pub mod header;
 
+pub use arm::{ArmInstruction, Condition, Decoded};
 pub use bus::Bus;
 pub use cartridge::{Cartridge, CartridgeError, MAX_ROM_SIZE, MIN_ROM_SIZE};
 pub use cpu::{Cpu, CpuMode, Cpsr};
@@ -108,6 +112,13 @@ impl Gba {
         self.cpu.fetch(&self.bus)
     }
 
+    /// **Decode** del modo ARM (Mini-Hito 2.1c): identifica el tipo de la
+    /// instrucción `instr` aplicando el flujo de dos pasos (condición → opcode).
+    /// No ejecuta nada todavía. Fachada del frontend sobre [`Cpu::decode_arm`].
+    pub fn decode_arm(&self, instr: u32) -> Decoded {
+        self.cpu.decode_arm(instr)
+    }
+
     /// El Program Counter actual (`r15`).
     pub fn pc(&self) -> u32 {
         self.cpu.pc()
@@ -182,5 +193,23 @@ mod tests {
         assert_eq!(gba.pc(), crate::bus::ROM_START);
         // Y el fetch devuelve la instrucción reconstruida en little-endian.
         assert_eq!(gba.fetch(), 0xEA00_002E);
+    }
+
+    #[test]
+    fn decodifica_la_primera_instruccion_como_salto() {
+        // Cartucho cuya primera instrucción es 0xEA00002E (el ejemplo del plan).
+        let mut rom = vec![0u8; MIN_ROM_SIZE];
+        rom[..4].copy_from_slice(&[0x2E, 0x00, 0x00, 0xEA]);
+        let gba = Gba::with_cartridge(Cartridge::from_bytes(rom).unwrap());
+
+        // Fetch → Decode: en reset (CPSR = 0) la condición AL siempre pasa.
+        match gba.decode_arm(gba.fetch()) {
+            Decoded::Execute(kind) => {
+                assert_eq!(kind, ArmInstruction::Branch { link: false });
+                // La "Prueba" del Mini-Hito 2.1c.
+                assert_eq!(format!("¡Es una instrucción de {kind}!"), "¡Es una instrucción de Salto (B / Branch)!");
+            }
+            Decoded::ConditionFailed(c) => panic!("no debería fallar la condición: {c:?}"),
+        }
     }
 }

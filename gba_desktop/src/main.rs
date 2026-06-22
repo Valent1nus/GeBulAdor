@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-use gba_core::{Cartridge, Gba, MAX_ROM_SIZE, SCREEN_HEIGHT, SCREEN_WIDTH};
+use gba_core::{Cartridge, Decoded, Gba, MAX_ROM_SIZE, SCREEN_HEIGHT, SCREEN_WIDTH};
 use minifb::{Key, Scale, Window, WindowOptions};
 
 fn main() {
@@ -29,15 +29,22 @@ fn main() {
                 println!("  Título:       «{}»", header.title);
                 println!("  Código juego: «{}»", header.game_code);
 
-                // Mini-Hito 2.1b — El primer "Fetch": montamos la consola con el
-                // cartucho (lo que coloca el PC en la ROM) y leemos la primera
-                // instrucción a la que apunta, mostrándola en hexadecimal.
+                // Mini-Hitos 2.1b/2.1c — Fetch + Decode: montamos la consola con
+                // el cartucho (lo que coloca el PC en la ROM), leemos la primera
+                // instrucción y la clasificamos (sin ejecutar su lógica todavía).
                 let gba = Gba::with_cartridge(cart);
+                let instr = gba.fetch();
                 println!(
                     "  Primera instrucción ARM @ {:#010X}: {:#010X}",
                     gba.pc(),
-                    gba.fetch()
+                    instr
                 );
+                match gba.decode_arm(instr) {
+                    Decoded::Execute(kind) => println!("  ¡Es una instrucción de {kind}!"),
+                    Decoded::ConditionFailed(cond) => {
+                        println!("  Condición {cond:?} no se cumple con el CPSR → se ignora (NOP).")
+                    }
+                }
                 gba
             }
             Err(e) => {
@@ -104,7 +111,7 @@ fn run_window(gba: Gba) {
     let mut buffer: Vec<u32> = vec![0; SCREEN_WIDTH * SCREEN_HEIGHT];
 
     let mut window = Window::new(
-        "EmulaRUST — GBA (Fase 2.1b · ESC para salir)",
+        "EmulaRUST — GBA (Fase 2.1c · ESC para salir)",
         SCREEN_WIDTH,
         SCREEN_HEIGHT,
         WindowOptions {
