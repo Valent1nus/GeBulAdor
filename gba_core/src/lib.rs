@@ -9,7 +9,7 @@
 //! sustituir el frontend de escritorio por uno de Android, iOS o WASM sin tocar
 //! una sola línea del núcleo.
 //!
-//! ## Estado actual (Fase 2.2d)
+//! ## Estado actual (Fase 2.2e)
 //!
 //! Además de cargar y validar el cartucho (Fase 1), el núcleo tiene el
 //! esqueleto del hardware: la CPU ARM7TDMI ([`Cpu`]) con sus registros y modos,
@@ -35,8 +35,11 @@
 //! cola de eventos ordenada por ciclo ([`Scheduler`]) que será la base de la
 //! sincronización de timers/PPU y del Lockstep de la Fase 4; todavía no se
 //! integra en el bucle porque aún no hay eventos reales que disparar.
-//! Implementar más instrucciones —empezando por los saltos— es lo que sigue. La
-//! frontera con el frontend —entregar un buffer RGBA— no cambia.
+//! Los **saltos** `B`/`BL`/`BX` (Mini-Hito 2.2e) ya se ejecutan: la CPU recorre
+//! el código en vez de pararse en el primer salto, y `BX` puede pasar a estado
+//! THUMB (cuya ejecución llega después). Seguir con el resto del set ARM
+//! (cargas, multiplicación...) es lo que viene. La frontera con el frontend
+//! —entregar un buffer RGBA— no cambia.
 
 pub mod arm;
 pub mod bus;
@@ -280,10 +283,10 @@ mod tests {
     }
 
     #[test]
-    fn run_ejecuta_la_rom_hasta_un_salto() {
-        // MOV r0,#1 ; MOV r1,#2 ; B (no implementado): el bucle ejecuta los dos
-        // MOV y se detiene limpiamente en el salto.
-        let programa = [0xE3A0_0001u32, 0xE3A0_1002, 0xEA00_0000];
+    fn run_ejecuta_la_rom_hasta_una_no_implementada() {
+        // MOV r0,#1 ; MOV r1,#2 ; LDR r2,[r0] (carga: aún sin implementar): el
+        // bucle ejecuta los dos MOV y se detiene limpiamente en la carga.
+        let programa = [0xE3A0_0001u32, 0xE3A0_1002, 0xE590_2000];
         let mut rom = vec![0u8; MIN_ROM_SIZE];
         for (i, w) in programa.iter().enumerate() {
             rom[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
@@ -292,7 +295,7 @@ mod tests {
         let mut gba = Gba::with_cartridge(cart);
 
         let report = gba.run(1_000);
-        assert_eq!(report.steps, 2, "dos MOV antes del salto");
+        assert_eq!(report.steps, 2, "dos MOV antes de la carga");
         assert!(matches!(
             report.stop,
             RunStop::Halted(Halt::Unimplemented { .. })

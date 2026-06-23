@@ -353,6 +353,13 @@ pub enum Halt {
         /// Sus 32 bits tal cual se leyeron del bus.
         instr: u32,
     },
+    /// La CPU entró en estado **THUMB** (por un `BX`) pero la ejecución THUMB aún
+    /// no está implementada (llega en 2.2m/2.3a). Se detiene en vez de
+    /// malinterpretar la memoria como código ARM.
+    ThumbNotImplemented {
+        /// `PC` (crudo) donde se quedó, ya en estado THUMB.
+        pc: u32,
+    },
 }
 
 /// Informe de una corrida en bucle ([`Cpu::run`] / [`crate::Gba::run`]).
@@ -374,6 +381,17 @@ pub enum RunStop {
     Halted(Halt),
     /// Se alcanzó el tope de pasos sin que la CPU se detuviera.
     StepLimit,
+}
+
+/// Efecto de ejecutar una instrucción sobre el `PC` (uso interno de [`Cpu::step`]).
+enum Executed {
+    /// Ejecutada; el `PC` avanza a la siguiente instrucción.
+    Continue,
+    /// Ejecutada y el `PC` quedó fijado a un destino (un salto): no se avanza y
+    /// el pipeline se vacía (el siguiente fetch es no secuencial).
+    Branched,
+    /// Esa instrucción —o esa variante— aún no está implementada.
+    Unimplemented,
 }
 
 impl Cpu {
@@ -612,28 +630,32 @@ impl Cpu {
         self.set_pc(self.pc().wrapping_add(self.instruction_size()));
     }
 
-    /// Ejecuta **un paso**: fetch → decode → execute de una sola instrucción,
-    /// avanzando el `PC` si procede (Mini-Hito 2.2a).
-    ///
-    /// Hoy solo se decodifica/ejecuta el set **ARM** (el fetch THUMB de 2 bytes
-    /// llega en el 2.3a) y, dentro de ARM, solo el procesamiento de datos con
-    /// operando inmediato. Ante cualquier otra instrucción la CPU se detiene
-    /// limpiamente con [`StepResult::Halted`], **sin** avanzar el `PC` (queda
-    /// apuntando a la instrucción culpable para poder inspeccionarla).
     /// Ciclos totales que la CPU ha ejecutado desde el reset (Mini-Hito 2.2c).
     pub fn cycles(&self) -> u64 {
         self.cycles
     }
 
+    /// Ejecuta **un paso**: fetch → decode → execute de una sola instrucción
+    /// (Mini-Hito 2.2a), sumando sus ciclos (2.2c) y avanzando o saltando el `PC`.
+    ///
+    /// Solo se ejecuta el set **ARM** (el fetch THUMB de 2 bytes llega en el
+    /// 2.3a). De ARM están implementados el procesamiento de datos inmediato y
+    /// los **saltos** `B`/`BL`/`BX` (Mini-Hito 2.2e); ante cualquier otra
+    /// instrucción la CPU se detiene con [`StepResult::Halted`], **sin** avanzar
+    /// el `PC` (queda en la instrucción culpable, para poder inspeccionarla).
     pub fn step(&mut self, bus: &Bus) -> StepResult {
         let pc = self.pc();
+
+        // Tras un `BX` a THUMB el estado cambia, pero la ejecución THUMB aún no
+        // está (2.2m/2.3a): paramos limpiamente en vez de malinterpretar bytes.
+        if self.cpsr.thumb() {
+            return StepResult::Halted(Halt::ThumbNotImplemented { pc });
+        }
+
         let instr = self.fetch(bus);
 
         // Coste del fetch del opcode (32 bits en ARM): N o S según haya sido
-        // secuencial respecto al fetch anterior (Mini-Hito 2.2c). Las
-        // instrucciones que hoy se ejecutan (NOP y data-processing inmediato)
-        // cuestan exactamente ese fetch; las que se implementen luego (saltos,
-        // cargas...) sumarán sus accesos adicionales encima.
+        // secuencial respecto al fetch anterior (Mini-Hito 2.2c).
         let seq = self.seq_fetch_addr == Some(pc);
         let fetch_cycles = bus.access_cycles(pc, AccessWidth::Word, seq) as u64;
 
@@ -645,22 +667,33 @@ impl Cpu {
                 self.account_step(fetch_cycles);
                 StepResult::Stepped
             }
-            Decoded::Execute(kind) => {
-                if self.try_execute_arm(kind, instr) {
-                    // Las instrucciones soportadas hoy nunca escriben el `PC`, así
-                    // que tras ejecutarlas se pasa a la siguiente.
+            // Un «b .» (salto a su propia dirección) es un bucle infinito: lo
+            // reconocemos sin ejecutarlo (colgaría) — es la señal de "fin" de las
+            // ROMs de test (2.2b).
+            Decoded::Execute(kind) if is_branch_to_self(kind, instr, pc) => {
+                StepResult::Halted(Halt::InfiniteLoop { pc, instr })
+            }
+            Decoded::Execute(kind) => match self.try_execute_arm(kind, instr) {
+                Executed::Continue => {
                     self.advance_pc();
                     self.account_step(fetch_cycles);
                     StepResult::Stepped
-                } else if is_branch_to_self(kind, instr, pc) {
-                    // Un «b .» (salto a su propia dirección) es un bucle infinito
-                    // de una instrucción: no hace falta ejecutarlo para saber que
-                    // no avanza. Es la señal de "fin" de las ROMs de test (2.2b).
-                    StepResult::Halted(Halt::InfiniteLoop { pc, instr })
-                } else {
+                }
+                Executed::Branched => {
+                    // El salto ya fijó el `PC`. Coste del ARM7TDMI = 2S + 1N: el
+                    // fetch del salto, el prefetch secuencial descartado y el
+                    // fetch del destino (que cuenta el próximo paso como N, por el
+                    // flush). Vaciamos el pipeline → el siguiente fetch es N.
+                    let discarded =
+                        bus.access_cycles(pc.wrapping_add(4), AccessWidth::Word, true) as u64;
+                    self.cycles += fetch_cycles + discarded;
+                    self.seq_fetch_addr = None;
+                    StepResult::Stepped
+                }
+                Executed::Unimplemented => {
                     StepResult::Halted(Halt::Unimplemented { pc, instr, kind })
                 }
-            }
+            },
         }
     }
 
@@ -700,29 +733,65 @@ impl Cpu {
     }
 
     /// Intenta ejecutar la instrucción ARM `kind` (bits crudos en `instr`),
-    /// asumiendo que su condición ya pasó. Devuelve `true` si la ejecutó, o
-    /// `false` si esa instrucción —o esa variante— aún no está implementada (lo
-    /// que hará que [`Cpu::step`] detenga el bucle).
+    /// asumiendo que su condición ya pasó. Devuelve cómo afecta al `PC`
+    /// ([`Executed::Continue`] / [`Executed::Branched`]) o
+    /// [`Executed::Unimplemented`] si esa instrucción o variante aún no existe.
     ///
     /// A medida que se implementen instrucciones, este `match` ganará ramas.
-    fn try_execute_arm(&mut self, kind: ArmInstruction, instr: u32) -> bool {
+    fn try_execute_arm(&mut self, kind: ArmInstruction, instr: u32) -> Executed {
         match kind {
             ArmInstruction::DataProcessing => {
                 // Solo la forma con operando inmediato (bit 25) y destino distinto
                 // de `r15`. La forma con registro desplazado (barrel shifter) y
-                // escribir el `PC` (un salto) llegan más adelante; hasta entonces
-                // se tratan como no implementadas en vez de ejecutarse a medias.
+                // escribir el `PC` llegan más adelante; hasta entonces se tratan
+                // como no implementadas en vez de ejecutarse a medias.
                 let is_immediate = (instr & (1 << 25)) != 0;
                 let rd = (instr >> 12) & 0xF;
                 if is_immediate && rd != PC as u32 {
                     self.execute_data_processing(instr);
-                    true
+                    Executed::Continue
                 } else {
-                    false
+                    Executed::Unimplemented
                 }
             }
-            _ => false,
+            // Saltos relativos `B`/`BL` (Mini-Hito 2.2e).
+            ArmInstruction::Branch { link } => {
+                self.execute_branch(instr, link);
+                Executed::Branched
+            }
+            // `BX`: salto a registro con posible cambio de estado ARM/THUMB.
+            ArmInstruction::BranchExchange => {
+                self.execute_bx(instr);
+                Executed::Branched
+            }
+            _ => Executed::Unimplemented,
         }
+    }
+
+    /// Ejecuta un salto relativo `B` (o `BL` si `link`): Mini-Hito 2.2e. El
+    /// destino se calcula sobre el `PC` adelantado por el pipeline (`pc + 8`, ver
+    /// 2.1e) más el desplazamiento de 24 bits con signo (×4). `BL` guarda en `LR`
+    /// la dirección de la instrucción siguiente al salto.
+    fn execute_branch(&mut self, instr: u32, link: bool) {
+        if link {
+            // Retorno = la instrucción siguiente al `BL` (PC crudo + su tamaño).
+            let return_addr = self.pc().wrapping_add(self.instruction_size());
+            self.set_reg(LR, return_addr);
+        }
+        let target = self.reg(PC).wrapping_add(arm_branch_offset(instr) as u32);
+        self.set_pc(target);
+    }
+
+    /// Ejecuta `BX Rn` (Mini-Hito 2.2e): salta a la dirección de `Rn` y cambia el
+    /// estado de ejecución según su bit 0 (1 = THUMB, 0 = ARM) — es lo que activa
+    /// por primera vez el modo THUMB. El `PC` se alinea al ancho del nuevo estado.
+    fn execute_bx(&mut self, instr: u32) {
+        let rn = (instr & 0xF) as usize;
+        let target = self.reg(rn);
+        let to_thumb = (target & 1) != 0;
+        self.cpsr.set_thumb(to_thumb);
+        let aligned = if to_thumb { target & !1 } else { target & !3 };
+        self.set_pc(aligned);
     }
 
     /// El CPSR actual (copia; es `Copy`).
@@ -1150,8 +1219,8 @@ mod tests {
     #[test]
     fn el_bucle_ejecuta_hasta_una_no_implementada() {
         use crate::arm::ArmInstruction;
-        // MOV r0,#5 ; ADD r0,r0,#1 ; B (salto, aún sin ejecutar).
-        let programa = [0xE3A0_0005u32, 0xE280_0001, 0xEA00_0000];
+        // MOV r0,#5 ; ADD r0,r0,#1 ; LDR r2,[r0] (carga: aún sin implementar).
+        let programa = [0xE3A0_0005u32, 0xE280_0001, 0xE590_2000];
         let mut rom = vec![0u8; programa.len() * 4];
         for (i, w) in programa.iter().enumerate() {
             rom[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
@@ -1165,13 +1234,13 @@ mod tests {
         assert_eq!(cpu.step(&bus), StepResult::Stepped);
         assert_eq!(cpu.reg(0), 6); // ADD r0, r0, #1
 
-        // La tercera es un salto: no implementado → la CPU se detiene en él.
+        // La tercera (una carga) aún no está implementada → la CPU se detiene.
         let pc_culpable = cpu.pc();
         match cpu.step(&bus) {
             StepResult::Halted(Halt::Unimplemented { pc, instr, kind }) => {
                 assert_eq!(pc, crate::bus::ROM_START + 8);
-                assert_eq!(instr, 0xEA00_0000);
-                assert_eq!(kind, ArmInstruction::Branch { link: false });
+                assert_eq!(instr, 0xE590_2000);
+                assert_eq!(kind, ArmInstruction::SingleDataTransfer);
             }
             otro => panic!("esperaba Halted, fue {otro:?}"),
         }
@@ -1222,18 +1291,82 @@ mod tests {
     }
 
     #[test]
-    fn un_salto_que_no_es_a_si_mismo_sigue_siendo_no_implementado() {
-        // 0xEA00002E = salto hacia delante (el de arranque de las ROMs reales):
-        // NO es un bucle a sí mismo, así que se reporta como no implementado
-        // hasta el Mini-Hito 2.2e.
-        let mut rom = vec![0u8; 8];
-        rom[0..4].copy_from_slice(&0xEA00_002Eu32.to_le_bytes());
-        let bus = Bus::new(rom);
+    fn b_no_a_si_mismo_se_ejecuta_y_salta() {
+        // 0xEA00002E (el salto de arranque de las ROMs reales) ya NO es "no
+        // implementado": se ejecuta y salta a pc+8 + (0x2E×4) = pc + 0xC0.
+        let base = crate::bus::IWRAM_START;
+        let mut bus = Bus::new(vec![0u8; 4]);
+        bus.write_u32(base, 0xEA00_002E);
         let mut cpu = Cpu::new();
-        cpu.set_pc(crate::bus::ROM_START);
+        cpu.set_pc(base);
+        assert_eq!(cpu.step(&bus), StepResult::Stepped);
+        assert_eq!(cpu.pc(), base + 0xC0);
+    }
+
+    #[test]
+    fn b_salta_hacia_delante_y_se_salta_instrucciones() {
+        // [0] B → base+8 (se salta [1]); [1] MOV r0,#0xFF; [2] MOV r1,#1.
+        let base = crate::bus::IWRAM_START;
+        let mut bus = Bus::new(vec![0u8; 4]);
+        bus.write_u32(base, 0xEA00_0000); // B con offset 0 → destino = pc+8 = [2]
+        bus.write_u32(base + 4, 0xE3A0_00FF); // MOV r0, #0xFF (debe saltarse)
+        bus.write_u32(base + 8, 0xE3A0_1001); // MOV r1, #1
+        let mut cpu = Cpu::new();
+        cpu.set_pc(base);
+
+        assert_eq!(cpu.step(&bus), StepResult::Stepped); // B
+        assert_eq!(cpu.pc(), base + 8);
+        assert_eq!(cpu.step(&bus), StepResult::Stepped); // MOV r1, #1
+        assert_eq!(cpu.reg(1), 1);
+        assert_eq!(cpu.reg(0), 0, "la instrucción saltada no se ejecutó");
+    }
+
+    #[test]
+    fn bl_y_bx_lr_vuelven_del_subprograma() {
+        // [0] BL [3] ; [1] MOV r0,#1 (al volver) ; [2] relleno ;
+        // [3] MOV r2,#2 ; [4] BX lr
+        let base = crate::bus::IWRAM_START;
+        let mut bus = Bus::new(vec![0u8; 4]);
+        bus.write_u32(base, 0xEB00_0001); // BL → base+12 ([3]); LR = base+4
+        bus.write_u32(base + 4, 0xE3A0_0001); // MOV r0, #1 (tras volver)
+        bus.write_u32(base + 8, 0xE3A0_00AA); // relleno (no se ejecuta)
+        bus.write_u32(base + 12, 0xE3A0_2002); // [3] MOV r2, #2
+        bus.write_u32(base + 16, 0xE12F_FF1E); // [4] BX lr
+        let mut cpu = Cpu::new();
+        cpu.set_pc(base);
+
+        cpu.step(&bus); // BL
+        assert_eq!(cpu.pc(), base + 12, "BL salta a la subrutina");
+        assert_eq!(cpu.reg(LR), base + 4, "BL guarda el retorno en LR");
+
+        cpu.step(&bus); // MOV r2, #2
+        assert_eq!(cpu.reg(2), 2);
+
+        cpu.step(&bus); // BX lr
+        assert_eq!(cpu.pc(), base + 4, "BX lr vuelve a la instrucción siguiente al BL");
+        assert!(!cpu.cpsr().thumb(), "LR con bit0=0 → sigue en ARM");
+
+        cpu.step(&bus); // MOV r0, #1
+        assert_eq!(cpu.reg(0), 1);
+    }
+
+    #[test]
+    fn bx_a_thumb_cambia_de_estado_y_se_detiene() {
+        // BX a una dirección impar → estado THUMB. Como la ejecución THUMB aún no
+        // existe (2.2m/2.3a), el siguiente paso se detiene limpiamente.
+        let base = crate::bus::IWRAM_START;
+        let mut bus = Bus::new(vec![0u8; 4]);
+        bus.write_u32(base, 0xE12F_FF10); // BX r0
+        let mut cpu = Cpu::new();
+        cpu.set_pc(base);
+        cpu.set_reg(0, base + 0x101); // destino impar (bit0=1) → THUMB
+
+        cpu.step(&bus); // BX → THUMB, PC = (base+0x101) & !1 = base+0x100
+        assert!(cpu.cpsr().thumb());
+        assert_eq!(cpu.pc(), base + 0x100);
         assert!(matches!(
             cpu.step(&bus),
-            StepResult::Halted(Halt::Unimplemented { .. })
+            StepResult::Halted(Halt::ThumbNotImplemented { .. })
         ));
     }
 

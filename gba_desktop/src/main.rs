@@ -104,6 +104,9 @@ fn main() {
                     RunStop::Halted(Halt::InfiniteLoop { pc, .. }) => {
                         println!("  Bucle infinito (b .) en {pc:#010X} — la CPU no avanza más.")
                     }
+                    RunStop::Halted(Halt::ThumbNotImplemented { pc }) => {
+                        println!("  Estado THUMB en {pc:#010X} — ejecución THUMB aún no implementada.")
+                    }
                     RunStop::StepLimit => {
                         println!("  Tope de pasos alcanzado sin detenerse (¿bucle?).")
                     }
@@ -174,8 +177,12 @@ fn run_test_rom(path: &Path) {
         RunStop::Halted(Halt::Unimplemented { pc, instr, kind }) => {
             println!("⏸️  Detenida en {pc:#010X}: {instr:#010X} → {kind} (aún sin implementar).");
             println!(
-                "    Es lo esperado hasta tener el set de instrucciones; el primer paso es Branch (2.2e)."
+                "    Se llegará más lejos según se implemente el resto del set ARM \
+                 (data-processing con registro, cargas/almacenes, multiplicación...)."
             );
+        }
+        RunStop::Halted(Halt::ThumbNotImplemented { pc }) => {
+            println!("⏸️  Estado THUMB en {pc:#010X}: la ejecución THUMB aún no está (2.2m/2.3a).");
         }
         RunStop::StepLimit => {
             println!("⏱️  Tope de {MAX_STEPS} pasos sin terminar (¿bucle no detectado o ROM muy larga?).");
