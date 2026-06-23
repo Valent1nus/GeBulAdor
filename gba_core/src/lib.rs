@@ -158,6 +158,13 @@ impl Gba {
         self.cpu.pc()
     }
 
+    /// Lee un registro visible de la CPU (`0`–`15`). Pensado para depuración y
+    /// para el arnés de test del Mini-Hito 2.2b, que lee el veredicto en `r12`.
+    /// `r15` viene con el desfase de pipeline aplicado (ver [`Cpu::reg`]).
+    pub fn reg(&self, index: usize) -> u32 {
+        self.cpu.reg(index)
+    }
+
     /// Rellena todo el framebuffer con un color sólido opaco.
     ///
     /// El canal alfa se fija siempre a `0xFF` (totalmente opaco).

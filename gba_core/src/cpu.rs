@@ -336,6 +336,16 @@ pub enum Halt {
         /// La categoría ARM en la que se clasificó.
         kind: ArmInstruction,
     },
+    /// La CPU llegó a un **bucle infinito de un salto** (`b .`): un salto cuyo
+    /// destino es su propia dirección. No avanza más. Es la señal de "fin" de las
+    /// ROMs de test del Mini-Hito 2.2b (que dejan el veredicto en `r12`) y, en
+    /// general, que el programa se ha quedado clavado.
+    InfiniteLoop {
+        /// `PC` (crudo) del salto que se cierra sobre sí mismo.
+        pc: u32,
+        /// Sus 32 bits tal cual se leyeron del bus.
+        instr: u32,
+    },
 }
 
 /// Informe de una corrida en bucle ([`Cpu::run`] / [`crate::Gba::run`]).
@@ -616,6 +626,11 @@ impl Cpu {
                     // que tras ejecutarlas se pasa a la siguiente.
                     self.advance_pc();
                     StepResult::Stepped
+                } else if is_branch_to_self(kind, instr, pc) {
+                    // Un «b .» (salto a su propia dirección) es un bucle infinito
+                    // de una instrucción: no hace falta ejecutarlo para saber que
+                    // no avanza. Es la señal de "fin" de las ROMs de test (2.2b).
+                    StepResult::Halted(Halt::InfiniteLoop { pc, instr })
                 } else {
                     StepResult::Halted(Halt::Unimplemented { pc, instr, kind })
                 }
@@ -790,6 +805,25 @@ fn alu_add(a: u32, b: u32, carry_in: bool) -> (u32, bool, bool) {
 /// el flag V).
 fn with_v(t: (u32, bool, bool)) -> (u32, bool, Option<bool>) {
     (t.0, t.1, Some(t.2))
+}
+
+/// Decodifica el desplazamiento de un salto ARM `B`/`BL`: los 24 bits bajos son
+/// un offset con signo en palabras, así que se extiende el signo y se multiplica
+/// por 4. (Lo reutilizará la ejecución real de saltos en el Mini-Hito 2.2e.)
+fn arm_branch_offset(instr: u32) -> i32 {
+    (((instr & 0x00FF_FFFF) << 8) as i32) >> 6
+}
+
+/// `true` si `instr` es un salto ARM (`B`/`BL`) cuyo destino es su propia
+/// dirección (`b .`): un bucle infinito de una sola instrucción. `pc` es la
+/// dirección cruda de la instrucción; el destino se calcula sobre el `PC`
+/// adelantado por el pipeline (+8 en ARM), igual que hará la ejecución real.
+fn is_branch_to_self(kind: ArmInstruction, instr: u32, pc: u32) -> bool {
+    matches!(kind, ArmInstruction::Branch { .. })
+        && pc
+            .wrapping_add(PC_AHEAD_ARM)
+            .wrapping_add(arm_branch_offset(instr) as u32)
+            == pc
 }
 
 #[cfg(test)]
@@ -1131,5 +1165,39 @@ mod tests {
         let report = cpu.run(&bus, 10);
         assert_eq!(report.steps, 10);
         assert_eq!(report.stop, RunStop::StepLimit);
+    }
+
+    #[test]
+    fn detecta_el_bucle_infinito_b_a_si_mismo() {
+        // 0xEAFFFFFE = «b .» (salto a su propia dirección): la señal de "fin"
+        // de las ROMs de test. Se reconoce sin necesidad de ejecutar el salto.
+        let mut rom = vec![0u8; 8];
+        rom[0..4].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes());
+        let bus = Bus::new(rom);
+        let mut cpu = Cpu::new();
+        cpu.set_pc(crate::bus::ROM_START);
+        match cpu.step(&bus) {
+            StepResult::Halted(Halt::InfiniteLoop { pc, instr }) => {
+                assert_eq!(pc, crate::bus::ROM_START);
+                assert_eq!(instr, 0xEAFF_FFFE);
+            }
+            otro => panic!("esperaba InfiniteLoop, fue {otro:?}"),
+        }
+    }
+
+    #[test]
+    fn un_salto_que_no_es_a_si_mismo_sigue_siendo_no_implementado() {
+        // 0xEA00002E = salto hacia delante (el de arranque de las ROMs reales):
+        // NO es un bucle a sí mismo, así que se reporta como no implementado
+        // hasta el Mini-Hito 2.2e.
+        let mut rom = vec![0u8; 8];
+        rom[0..4].copy_from_slice(&0xEA00_002Eu32.to_le_bytes());
+        let bus = Bus::new(rom);
+        let mut cpu = Cpu::new();
+        cpu.set_pc(crate::bus::ROM_START);
+        assert!(matches!(
+            cpu.step(&bus),
+            StepResult::Halted(Halt::Unimplemented { .. })
+        ));
     }
 }

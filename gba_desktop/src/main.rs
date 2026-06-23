@@ -17,6 +17,19 @@ use gba_core::{
 use minifb::{Key, Scale, Window, WindowOptions};
 
 fn main() {
+    // Modo arnés de test headless (Mini-Hito 2.2b), sin ventana:
+    //   cargo run -p gba_desktop -- --test roms/arm.gba
+    if std::env::args().nth(1).as_deref() == Some("--test") {
+        match std::env::args().nth(2) {
+            Some(path) => run_test_rom(Path::new(&path)),
+            None => {
+                eprintln!("Uso: gba_desktop --test <ruta-al-rom-de-test.gba>");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     // Primer argumento de la línea de comandos (opcional): la ruta a la ROM.
     //   cargo run -p gba_desktop -- "roms/Pokemon Rojo Fuego.gba"
     let gba = match std::env::args().nth(1) {
@@ -85,6 +98,9 @@ fn main() {
                     RunStop::Halted(Halt::Unimplemented { pc, instr, kind }) => println!(
                         "  Detenida en {pc:#010X}: {instr:#010X} → {kind} (aún sin implementar)."
                     ),
+                    RunStop::Halted(Halt::InfiniteLoop { pc, .. }) => {
+                        println!("  Bucle infinito (b .) en {pc:#010X} — la CPU no avanza más.")
+                    }
                     RunStop::StepLimit => {
                         println!("  Tope de pasos alcanzado sin detenerse (¿bucle?).")
                     }
@@ -107,6 +123,58 @@ fn main() {
     };
 
     run_window(gba);
+}
+
+/// Arnés de test headless (Mini-Hito 2.2b): carga una ROM de test, la ejecuta
+/// hasta que la CPU se detiene (bucle final `b .` o tope de pasos) y reporta el
+/// veredicto leyendo `r12`, la convención de las gba-tests de jsmolka.
+///
+/// Mientras falten instrucciones por implementar, la CPU se detendrá antes de
+/// llegar a ningún test (en el primer salto, por ejemplo); eso se reporta como
+/// estado intermedio, no como veredicto. El primer paso para que avance es
+/// Branch (Mini-Hito 2.2e).
+fn run_test_rom(path: &Path) {
+    let cart = match load_cartridge(path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error al cargar la ROM de test «{}»: {e}", path.display());
+            std::process::exit(1);
+        }
+    };
+    println!(
+        "ROM de test «{}» ({} bytes). Ejecutando…",
+        cart.header().title,
+        cart.len()
+    );
+
+    // Tope de seguridad: una suite de test cabe de sobra; si se supera, algo va mal.
+    const MAX_STEPS: u64 = 50_000_000;
+    let mut gba = Gba::with_cartridge(cart);
+    let report = gba.run(MAX_STEPS);
+    println!("Instrucciones ejecutadas: {}", report.steps);
+
+    match report.stop {
+        // Fin natural del test: r12 lleva el veredicto.
+        RunStop::Halted(Halt::InfiniteLoop { pc, .. }) => {
+            let r12 = gba.reg(12);
+            if r12 == 0 {
+                println!("✅ PASS — todos los tests pasaron (r12 = 0; bucle final en {pc:#010X}).");
+            } else {
+                println!("❌ FALLO en el test #{r12} (bucle final en {pc:#010X}).");
+                std::process::exit(1);
+            }
+        }
+        // Aún no es un veredicto: falta implementar la instrucción donde se paró.
+        RunStop::Halted(Halt::Unimplemented { pc, instr, kind }) => {
+            println!("⏸️  Detenida en {pc:#010X}: {instr:#010X} → {kind} (aún sin implementar).");
+            println!(
+                "    Es lo esperado hasta tener el set de instrucciones; el primer paso es Branch (2.2e)."
+            );
+        }
+        RunStop::StepLimit => {
+            println!("⏱️  Tope de {MAX_STEPS} pasos sin terminar (¿bucle no detectado o ROM muy larga?).");
+        }
+    }
 }
 
 /// Lee un fichero `.gba` del disco y lo convierte en un [`Cartridge`] validado.
