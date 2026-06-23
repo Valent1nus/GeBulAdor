@@ -828,6 +828,121 @@ impl Cpu {
         }
     }
 
+    // ===== Multiplicación: MUL / MLA / largas (Mini-Hito 2.2h) ==============
+
+    /// Ejecuta una **multiplicación de 32 bits** (Mini-Hito 2.2h): `MUL` o, con el
+    /// bit `A` (21) activo, `MLA` (multiplica y acumula).
+    ///
+    /// Encoding: `cccc 0000 00AS dddd nnnn ssss 1001 mmmm`. Calcula
+    /// `Rd = Rm·Rs` (`+ Rn` si es `MLA`) quedándose con los **32 bits bajos** del
+    /// producto —que son idénticos con y sin signo, de ahí que una sola operación
+    /// sirva para ambas interpretaciones—.
+    ///
+    /// Con `S = 1` actualiza `N` (bit 31 del resultado) y `Z` (resultado nulo). El
+    /// flag `C` queda **UNPREDECIBLE** en el ARM7TDMI real tras un *multiply* (su
+    /// valor depende del estado interno del multiplicador de Booth); aquí lo
+    /// **preservamos** —convención de emulador que respetan las gba-tests, que
+    /// enmascaran `C` en esta familia— y `V` no se toca.
+    ///
+    /// Nunca escribe `r15`, así que siempre continúa ([`Executed::Continue`]). El
+    /// coste es `1S + mI` (`MUL`) o `1S + (m+1)I` (`MLA`): la `S` la cuenta el fetch
+    /// del bucle y los I-cycles, variables según `Rs`, van como `extra_cycles`
+    /// (ver [`multiply_internal_cycles`]).
+    ///
+    /// Usar `r15` como cualquier operando es UNPREDECIBLE en ARMv4 y no aparece en
+    /// código real; no se le da un trato especial (leerlo daría `PC + 8`).
+    pub fn execute_multiply(&mut self, instr: u32) -> Executed {
+        let accumulate = (instr & (1 << 21)) != 0;
+        let sets_flags = (instr & (1 << 20)) != 0;
+        let rd = ((instr >> 16) & 0xF) as usize;
+        let rn = ((instr >> 12) & 0xF) as usize;
+        let rs = ((instr >> 8) & 0xF) as usize;
+        let rm = (instr & 0xF) as usize;
+
+        // `Rm` es el operando; `Rs` el multiplicador, del que depende el coste.
+        let multiplier = self.reg(rs);
+        let mut result = self.reg(rm).wrapping_mul(multiplier);
+        if accumulate {
+            result = result.wrapping_add(self.reg(rn));
+        }
+        self.set_reg(rd, result);
+
+        if sets_flags {
+            let cpsr = self.cpsr_mut();
+            cpsr.set_n(bit(result, 31));
+            cpsr.set_z(result == 0);
+            // C queda UNPREDECIBLE tras multiplicar en el ARM7TDMI: lo preservamos.
+            // V no se modifica.
+        }
+
+        // 1S + mI (MUL) o 1S + (m+1)I (MLA). La terminación temprana del Booth usa
+        // el criterio con signo (todo ceros o todo unos) para MUL/MLA.
+        let m = multiply_internal_cycles(multiplier, true);
+        Executed::Continue {
+            extra_cycles: if accumulate { m + 1 } else { m },
+        }
+    }
+
+    /// Ejecuta una **multiplicación larga de 64 bits** (Mini-Hito 2.2h):
+    /// `UMULL`/`UMLAL` (sin signo) y `SMULL`/`SMLAL` (con signo).
+    ///
+    /// Encoding: `cccc 0000 1UAS hhhh llll ssss 1001 mmmm`, donde el bit `U` (22)
+    /// elige sin signo (0) o con signo (1) y el bit `A` (21) activa la acumulación.
+    /// El producto de 64 bits se reparte entre `RdHi` (bits 19-16, palabra alta) y
+    /// `RdLo` (bits 15-12, palabra baja); en las variantes con acumulación se le
+    /// **suma** el valor previo de `RdHi:RdLo` (módulo 2⁶⁴).
+    ///
+    /// Con `S = 1` fija `N` (bit 63 del resultado) y `Z` (los 64 bits a cero); `C` y
+    /// `V` quedan UNPREDECIBLES en el hardware, así que se preservan (igual que en
+    /// [`Cpu::execute_multiply`]). Nunca salta: devuelve [`Executed::Continue`].
+    ///
+    /// Coste: `1S + (m+1)I` (sin acumular) o `1S + (m+2)I` (acumulando). La
+    /// terminación temprana por «todo unos» **solo** aplica a las versiones con
+    /// signo; las sin signo solo cuentan los bits altos a cero (ver
+    /// [`multiply_internal_cycles`]).
+    pub fn execute_multiply_long(&mut self, instr: u32) -> Executed {
+        let signed = (instr & (1 << 22)) != 0;
+        let accumulate = (instr & (1 << 21)) != 0;
+        let sets_flags = (instr & (1 << 20)) != 0;
+        let rd_hi = ((instr >> 16) & 0xF) as usize;
+        let rd_lo = ((instr >> 12) & 0xF) as usize;
+        let rs = ((instr >> 8) & 0xF) as usize;
+        let rm = (instr & 0xF) as usize;
+
+        let multiplier = self.reg(rs);
+        let operand = self.reg(rm);
+
+        // Producto de 64 bits según el bit U: con signo extiende ambos operandos a
+        // i64 (y reinterpreta a u64); sin signo los amplía a u64 directamente.
+        let mut product: u64 = if signed {
+            (i64::from(operand as i32).wrapping_mul(i64::from(multiplier as i32))) as u64
+        } else {
+            u64::from(operand).wrapping_mul(u64::from(multiplier))
+        };
+
+        if accumulate {
+            // Acumulador previo = RdHi:RdLo (RdHi es la palabra alta).
+            let acc = (u64::from(self.reg(rd_hi)) << 32) | u64::from(self.reg(rd_lo));
+            product = product.wrapping_add(acc);
+        }
+
+        self.set_reg(rd_lo, product as u32);
+        self.set_reg(rd_hi, (product >> 32) as u32);
+
+        if sets_flags {
+            let cpsr = self.cpsr_mut();
+            cpsr.set_n(product >> 63 != 0); // bit 63 = signo del resultado de 64 bits
+            cpsr.set_z(product == 0); // nulo solo si AMBAS palabras son cero
+            // C y V quedan UNPREDECIBLES en el hardware: se preservan.
+        }
+
+        // 1S + (m+1)I (largo) o 1S + (m+2)I (largo con acumulación).
+        let m = multiply_internal_cycles(multiplier, signed);
+        Executed::Continue {
+            extra_cycles: if accumulate { m + 2 } else { m + 1 },
+        }
+    }
+
     // ===== Bucle de ejecución (Mini-Hito 2.2a) ==============================
 
     /// El tamaño en bytes de la instrucción actual según el estado: 4 en ARM, 2
@@ -858,10 +973,11 @@ impl Cpu {
     /// Solo se ejecuta el set **ARM** (el fetch THUMB de 2 bytes llega en el
     /// 2.3a). De ARM están implementados el **procesamiento de datos completo**
     /// (Mini-Hito 2.2f: inmediato y registro por el barrel shifter, incluido
-    /// `Rd = r15`), la **transferencia de PSR** `MRS`/`MSR` (Mini-Hito 2.2g) y los
-    /// **saltos** `B`/`BL`/`BX` (Mini-Hito 2.2e); ante cualquier otra instrucción
-    /// la CPU se detiene con [`StepResult::Halted`], **sin** avanzar el `PC`
-    /// (queda en la instrucción culpable, para inspeccionarla).
+    /// `Rd = r15`), la **transferencia de PSR** `MRS`/`MSR` (Mini-Hito 2.2g), la
+    /// **multiplicación** `MUL`/`MLA`/largas (Mini-Hito 2.2h) y los **saltos**
+    /// `B`/`BL`/`BX` (Mini-Hito 2.2e); ante cualquier otra instrucción la CPU se
+    /// detiene con [`StepResult::Halted`], **sin** avanzar el `PC` (queda en la
+    /// instrucción culpable, para inspeccionarla).
     pub fn step(&mut self, bus: &Bus) -> StepResult {
         let pc = self.pc();
 
@@ -968,6 +1084,11 @@ impl Cpu {
             // Transferencia de PSR `MRS`/`MSR` (Mini-Hito 2.2g): leer/escribir el
             // CPSR/SPSR. No es un salto. Ver [`Cpu::execute_psr_transfer`].
             ArmInstruction::PsrTransfer => self.execute_psr_transfer(instr),
+            // Multiplicación de 32 bits `MUL`/`MLA` (Mini-Hito 2.2h).
+            ArmInstruction::Multiply => self.execute_multiply(instr),
+            // Multiplicación larga de 64 bits `UMULL`/`UMLAL`/`SMULL`/`SMLAL`
+            // (Mini-Hito 2.2h). Ver [`Cpu::execute_multiply_long`].
+            ArmInstruction::MultiplyLong => self.execute_multiply_long(instr),
             // Saltos relativos `B`/`BL` (Mini-Hito 2.2e).
             ArmInstruction::Branch { link } => {
                 self.execute_branch(instr, link);
@@ -1131,6 +1252,35 @@ fn with_v(t: (u32, bool, bool)) -> (u32, bool, Option<bool>) {
 #[inline]
 fn bit(value: u32, n: u32) -> bool {
     ((value >> n) & 1) != 0
+}
+
+/// Ciclos internos `m` del multiplicador de Booth del ARM7TDMI (Mini-Hito 2.2h),
+/// que **termina antes** cuanto más pequeño es —en magnitud— el multiplicador
+/// `Rs`. Es la fuente del «coste en ciclos variable según el operando».
+///
+/// `m` vale 1, 2, 3 o 4 según cuántos bytes altos de `Rs` sean homogéneos:
+/// - `m = 1` si los bits 31-8 son todos iguales (ver `allow_all_ones`),
+/// - `m = 2` si lo son los bits 31-16,
+/// - `m = 3` si lo son los bits 31-24,
+/// - `m = 4` en cualquier otro caso.
+///
+/// `allow_all_ones` separa la terminación **con signo** de la **sin signo**: con
+/// signo (`MUL`/`MLA` y `SMULL`/`SMLAL`) termina pronto tanto con los bits altos
+/// «todo ceros» como «todo unos» (el relleno de signo de un negativo pequeño);
+/// sin signo (`UMULL`/`UMLAL`) solo con «todo ceros».
+fn multiply_internal_cycles(multiplier: u32, allow_all_ones: bool) -> u64 {
+    // `high` son los bits altos examinados; homogéneo = todo ceros (o todo unos,
+    // que es `high == mask`, si la variante lo permite).
+    let homogeneous = |high: u32, mask: u32| high == 0 || (allow_all_ones && high == mask);
+    if homogeneous(multiplier & 0xFFFF_FF00, 0xFFFF_FF00) {
+        1
+    } else if homogeneous(multiplier & 0xFFFF_0000, 0xFFFF_0000) {
+        2
+    } else if homogeneous(multiplier & 0xFF00_0000, 0xFF00_0000) {
+        3
+    } else {
+        4
+    }
 }
 
 /// Tipo de desplazamiento del *barrel shifter* (bits 6-5 de una instrucción de
@@ -2058,5 +2208,221 @@ mod tests {
         assert_eq!(cpu.step(&bus), StepResult::Stepped);
         assert!(cpu.cpsr().z(), "MSR puso Z");
         assert_eq!(cpu.pc(), base + 4, "MRS/MSR avanzan el PC como una instrucción normal");
+    }
+
+    // ===== Multiplicación: MUL / MLA / largas (Mini-Hito 2.2h) =============
+
+    #[test]
+    fn mul_multiplica_dos_registros() {
+        // MUL r0, r1, r2 (0xE0000291): r0 = r1·r2 = 6·7 = 42.
+        let mut cpu = Cpu::new();
+        cpu.set_reg(1, 6);
+        cpu.set_reg(2, 7);
+        cpu.execute_multiply(0xE000_0291);
+        assert_eq!(cpu.reg(0), 42);
+    }
+
+    #[test]
+    fn mla_multiplica_y_acumula() {
+        // MLA r3, r1, r2, r4 (0xE0234291): r3 = r1·r2 + r4 = 6·7 + 100 = 142.
+        let mut cpu = Cpu::new();
+        cpu.set_reg(1, 6);
+        cpu.set_reg(2, 7);
+        cpu.set_reg(4, 100);
+        cpu.execute_multiply(0xE023_4291);
+        assert_eq!(cpu.reg(3), 142);
+    }
+
+    #[test]
+    fn mul_se_queda_con_los_32_bits_bajos() {
+        // 0x10000 · 0x10000 = 0x1_0000_0000; los 32 bits bajos son 0.
+        let mut cpu = Cpu::new();
+        cpu.set_reg(1, 0x0001_0000);
+        cpu.set_reg(2, 0x0001_0000);
+        cpu.execute_multiply(0xE000_0291); // MUL r0, r1, r2
+        assert_eq!(cpu.reg(0), 0, "MUL solo conserva la palabra baja del producto");
+    }
+
+    #[test]
+    fn muls_actualiza_n_y_z_y_preserva_el_carry() {
+        // El ARM7TDMI deja C UNPREDECIBLE tras multiplicar; aquí lo preservamos.
+        let mut cpu = Cpu::new();
+        cpu.cpsr_mut().set_c(true);
+
+        // Resultado positivo no nulo: N=0, Z=0, C intacto.
+        cpu.set_reg(1, 2);
+        cpu.set_reg(2, 3);
+        cpu.execute_multiply(0xE010_0291); // MULS r0, r1, r2 → 6
+        assert_eq!(cpu.reg(0), 6);
+        assert!(!cpu.cpsr().n() && !cpu.cpsr().z());
+        assert!(cpu.cpsr().c(), "C no se toca en multiply");
+
+        // Resultado con el bit 31 a 1: N=1.
+        cpu.set_reg(1, 0x8000_0000);
+        cpu.set_reg(2, 1);
+        cpu.execute_multiply(0xE010_0291);
+        assert!(cpu.cpsr().n());
+
+        // Resultado nulo: Z=1.
+        cpu.set_reg(1, 0);
+        cpu.set_reg(2, 0x1234);
+        cpu.execute_multiply(0xE010_0291);
+        assert!(cpu.cpsr().z());
+    }
+
+    #[test]
+    fn umull_producto_sin_signo_de_64_bits() {
+        // UMULL r0, r1, r2, r3 (0xE0810392): RdLo=r0, RdHi=r1, Rm=r2, Rs=r3.
+        // 0xFFFFFFFF · 0xFFFFFFFF = 0xFFFFFFFE_00000001.
+        let mut cpu = Cpu::new();
+        cpu.set_reg(2, 0xFFFF_FFFF);
+        cpu.set_reg(3, 0xFFFF_FFFF);
+        cpu.execute_multiply_long(0xE081_0392);
+        assert_eq!(cpu.reg(1), 0xFFFF_FFFE, "RdHi = palabra alta");
+        assert_eq!(cpu.reg(0), 0x0000_0001, "RdLo = palabra baja");
+    }
+
+    #[test]
+    fn smull_interpreta_los_operandos_con_signo() {
+        // SMULL r0, r1, r2, r3 (0xE0C10392): con los MISMOS bits que el UMULL de
+        // arriba, (-1)·(-1) = 1 → RdHi=0, RdLo=1. Es el contraste signo/sin signo.
+        let mut cpu = Cpu::new();
+        cpu.set_reg(2, 0xFFFF_FFFF); // -1
+        cpu.set_reg(3, 0xFFFF_FFFF); // -1
+        cpu.execute_multiply_long(0xE0C1_0392);
+        assert_eq!(cpu.reg(1), 0);
+        assert_eq!(cpu.reg(0), 1);
+
+        // Y un caso negativo·positivo: (-3)·5 = -15 = 0xFFFFFFFF_FFFFFFF1.
+        cpu.set_reg(2, (-3i32) as u32);
+        cpu.set_reg(3, 5);
+        cpu.execute_multiply_long(0xE0C1_0392);
+        assert_eq!(cpu.reg(1), 0xFFFF_FFFF);
+        assert_eq!(cpu.reg(0), (-15i32) as u32);
+    }
+
+    #[test]
+    fn umlal_acumula_en_64_bits() {
+        // UMLAL r0, r1, r2, r3 (0xE0A10392): RdHi:RdLo += Rm·Rs.
+        // acc = 0x0000_0000_FFFF_FFFF, producto = 0x10·0x10 = 0x100.
+        let mut cpu = Cpu::new();
+        cpu.set_reg(1, 0x0000_0000); // RdHi (alta del acumulador)
+        cpu.set_reg(0, 0xFFFF_FFFF); // RdLo (baja del acumulador)
+        cpu.set_reg(2, 0x10);
+        cpu.set_reg(3, 0x10);
+        cpu.execute_multiply_long(0xE0A1_0392);
+        // 0xFFFFFFFF + 0x100 = 0x1_0000_00FF.
+        assert_eq!(cpu.reg(1), 0x0000_0001);
+        assert_eq!(cpu.reg(0), 0x0000_00FF);
+    }
+
+    #[test]
+    fn smlal_acumula_con_signo() {
+        // SMLAL r0, r1, r2, r3 (0xE0E10392): (-1)·5 + 10 = 5 → RdHi=0, RdLo=5.
+        let mut cpu = Cpu::new();
+        cpu.set_reg(1, 0); // acc alto
+        cpu.set_reg(0, 10); // acc bajo
+        cpu.set_reg(2, 0xFFFF_FFFF); // -1
+        cpu.set_reg(3, 5);
+        cpu.execute_multiply_long(0xE0E1_0392);
+        assert_eq!(cpu.reg(1), 0);
+        assert_eq!(cpu.reg(0), 5);
+    }
+
+    #[test]
+    fn umulls_actualiza_n_y_z_desde_los_64_bits() {
+        // UMULLS r0, r1, r2, r3 (0xE0910392): S=1.
+        let mut cpu = Cpu::new();
+        // N viene del bit 63: 0xFFFFFFFF·0xFFFFFFFF = 0xFFFFFFFE_00000001.
+        cpu.set_reg(2, 0xFFFF_FFFF);
+        cpu.set_reg(3, 0xFFFF_FFFF);
+        cpu.execute_multiply_long(0xE091_0392);
+        assert!(cpu.cpsr().n(), "N = bit 63 del resultado");
+        assert!(!cpu.cpsr().z());
+
+        // Z exige que AMBAS palabras sean cero (producto nulo).
+        cpu.set_reg(2, 0);
+        cpu.set_reg(3, 0x1234);
+        cpu.execute_multiply_long(0xE091_0392);
+        assert!(cpu.cpsr().z());
+        assert!(!cpu.cpsr().n());
+    }
+
+    #[test]
+    fn multiply_avanza_el_pc_como_instruccion_normal() {
+        // Por el step completo: MUL ya no es "no implementada"; se ejecuta, escribe
+        // Rd y avanza el PC una instrucción (no es un salto).
+        let base = crate::bus::IWRAM_START;
+        let mut bus = Bus::new(vec![0u8; 4]);
+        bus.write_u32(base, 0xE000_0291); // MUL r0, r1, r2
+        let mut cpu = Cpu::new();
+        cpu.set_pc(base);
+        cpu.set_reg(1, 4);
+        cpu.set_reg(2, 5);
+        assert_eq!(cpu.step(&bus), StepResult::Stepped);
+        assert_eq!(cpu.reg(0), 20);
+        assert_eq!(cpu.pc(), base + 4, "no es un salto: el PC avanza 4 bytes");
+    }
+
+    #[test]
+    fn mul_coste_en_ciclos_varia_con_el_multiplicador() {
+        // En IWRAM (1 ciclo/fetch). MUL = 1S + mI; la S es ese fetch de 1 ciclo.
+        let mut bus = Bus::new(vec![0u8; 4]);
+        bus.write_u32(crate::bus::IWRAM_START, 0xE000_0291); // MUL r0, r1, r2
+
+        // Rs = 0xFF → bits 31-8 todos cero → m=1 → 1 (fetch) + 1 = 2.
+        let mut cpu = Cpu::new();
+        cpu.set_pc(crate::bus::IWRAM_START);
+        cpu.set_reg(1, 3);
+        cpu.set_reg(2, 0xFF);
+        cpu.step(&bus);
+        assert_eq!(cpu.cycles(), 2, "multiplicador pequeño → m=1");
+
+        // Rs = 0x12345678 → ningún byte alto homogéneo → m=4 → 1 + 4 = 5.
+        let mut cpu = Cpu::new();
+        cpu.set_pc(crate::bus::IWRAM_START);
+        cpu.set_reg(1, 3);
+        cpu.set_reg(2, 0x1234_5678);
+        cpu.step(&bus);
+        assert_eq!(cpu.cycles(), 5, "multiplicador grande → m=4");
+    }
+
+    #[test]
+    fn el_coste_largo_distingue_multiplicador_con_y_sin_signo() {
+        // Rs = 0xFFFFFFFF: con signo es -1 (bits altos "todo unos") → termina
+        // pronto (m=1); sin signo no hay terminación por unos → m=4.
+        let mut bus = Bus::new(vec![0u8; 4]);
+
+        // SMULL r0, r1, r2, r3 (0xE0C10392): m=1 → 1S + (1+1)I = 1 + 2 = 3.
+        bus.write_u32(crate::bus::IWRAM_START, 0xE0C1_0392);
+        let mut cpu = Cpu::new();
+        cpu.set_pc(crate::bus::IWRAM_START);
+        cpu.set_reg(2, 5);
+        cpu.set_reg(3, 0xFFFF_FFFF);
+        cpu.step(&bus);
+        assert_eq!(cpu.cycles(), 3, "SMULL: -1 termina pronto (m=1)");
+
+        // UMULL r0, r1, r2, r3 (0xE0810392): mismo Rs, m=4 → 1 + (4+1) = 6.
+        bus.write_u32(crate::bus::IWRAM_START, 0xE081_0392);
+        let mut cpu = Cpu::new();
+        cpu.set_pc(crate::bus::IWRAM_START);
+        cpu.set_reg(2, 5);
+        cpu.set_reg(3, 0xFFFF_FFFF);
+        cpu.step(&bus);
+        assert_eq!(cpu.cycles(), 6, "UMULL: 0xFFFFFFFF no termina pronto (m=4)");
+    }
+
+    #[test]
+    fn multiply_internal_cycles_escalona_segun_los_bytes_altos() {
+        // Con signo (allow_all_ones = true): todo ceros o todo unos termina pronto.
+        assert_eq!(multiply_internal_cycles(0x0000_00FF, true), 1);
+        assert_eq!(multiply_internal_cycles(0x0000_FF00, true), 2);
+        assert_eq!(multiply_internal_cycles(0x00FF_0000, true), 3);
+        assert_eq!(multiply_internal_cycles(0x1234_5678, true), 4);
+        // "Todo unos" en los bits altos también termina pronto SOLO con signo.
+        assert_eq!(multiply_internal_cycles(0xFFFF_FFFF, true), 1);
+        assert_eq!(multiply_internal_cycles(0xFFFF_FFFF, false), 4);
+        assert_eq!(multiply_internal_cycles(0xFF00_0000, true), 3);
+        assert_eq!(multiply_internal_cycles(0xFF00_0000, false), 4);
     }
 }
