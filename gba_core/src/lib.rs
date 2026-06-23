@@ -9,7 +9,7 @@
 //! sustituir el frontend de escritorio por uno de Android, iOS o WASM sin tocar
 //! una sola línea del núcleo.
 //!
-//! ## Estado actual (Fase 2.2g)
+//! ## Estado actual (Fase 2.2i)
 //!
 //! Además de cargar y validar el cartucho (Fase 1), el núcleo tiene el
 //! esqueleto del hardware: la CPU ARM7TDMI ([`Cpu`]) con sus registros y modos,
@@ -41,9 +41,16 @@
 //! (Mini-Hito 2.2g) ya permite leer y escribir el `CPSR`/`SPSR` desde el código,
 //! respetando las máscaras de campos y que en modo User solo se toquen los flags
 //! —es el prerrequisito de las rutinas que cambian de modo y de la entrada/salida
-//! de IRQ y `SWI`—. Seguir con el resto del set ARM (cargas, multiplicación...)
-//! es lo que viene. La frontera con el frontend —entregar un buffer RGBA— no
-//! cambia.
+//! de IRQ y `SWI`—. La **multiplicación** `MUL`/`MLA`/`UMULL`/`UMLAL`/`SMULL`/
+//! `SMLAL` (Mini-Hito 2.2h) ya calcula productos de 32 y 64 bits con sus flags y
+//! su coste en ciclos variable. Y la **carga/almacén** `LDR`/`STR`/`LDRB`/`STRB`
+//! más la de media palabra/byte con signo `LDRH`/`STRH`/`LDRSB`/`LDRSH` (Mini-Hito
+//! 2.2i) ya mueve datos entre registros y memoria, con todos sus modos de
+//! direccionamiento (offset inmediato/registro, pre/post-indexado, write-back) y
+//! las rotaciones del acceso desalineado; por eso el bus se presta ahora como
+//! `&mut` al ejecutar. Seguir con el resto del set ARM (bloque `LDM`/`STM`,
+//! `SWP`, `SWI`...) es lo que viene. La frontera con el frontend —entregar un
+//! buffer RGBA— no cambia.
 
 pub mod arm;
 pub mod bus;
@@ -161,13 +168,13 @@ impl Gba {
     /// bucles infinitos mientras faltan instrucciones por implementar). Delega en
     /// [`Cpu::run`] prestándole el bus.
     pub fn run(&mut self, max_steps: u64) -> RunReport {
-        self.cpu.run(&self.bus, max_steps)
+        self.cpu.run(&mut self.bus, max_steps)
     }
 
     /// Ejecuta una sola instrucción: un paso del bucle de [`Gba::run`]. Útil para
     /// un frontend que en el futuro quiera intercalar ejecución y pintado.
     pub fn step(&mut self) -> StepResult {
-        self.cpu.step(&self.bus)
+        self.cpu.step(&mut self.bus)
     }
 
     /// El Program Counter actual (`r15`).
@@ -288,9 +295,9 @@ mod tests {
 
     #[test]
     fn run_ejecuta_la_rom_hasta_una_no_implementada() {
-        // MOV r0,#1 ; MOV r1,#2 ; LDR r2,[r0] (carga: aún sin implementar): el
-        // bucle ejecuta los dos MOV y se detiene limpiamente en la carga.
-        let programa = [0xE3A0_0001u32, 0xE3A0_1002, 0xE590_2000];
+        // MOV r0,#1 ; MOV r1,#2 ; STMFD sp!,{r0,r1,lr} (bloque: aún sin implementar):
+        // el bucle ejecuta los dos MOV y se detiene limpiamente en el bloque.
+        let programa = [0xE3A0_0001u32, 0xE3A0_1002, 0xE92D_4003];
         let mut rom = vec![0u8; MIN_ROM_SIZE];
         for (i, w) in programa.iter().enumerate() {
             rom[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());

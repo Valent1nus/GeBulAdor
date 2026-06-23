@@ -409,6 +409,14 @@ pub enum Executed {
         /// Ciclos internos extra, como en [`Executed::Continue`].
         extra_cycles: u64,
     },
+    /// Ejecutada y **accedió a memoria de datos** (`LDR`/`STR`/...). Avanza el `PC`
+    /// como [`Executed::Continue`], pero el acceso a datos rompe la secuencialidad
+    /// del bus: el **siguiente fetch de opcode es no secuencial** (N). `extra_cycles`
+    /// incluye el coste del acceso a datos (N) más el I-cycle de las cargas.
+    Accessed {
+        /// Ciclos del acceso a datos (más el I-cycle si es carga), sobre el fetch.
+        extra_cycles: u64,
+    },
     /// Esa instrucción —o esa variante— aún no está implementada.
     Unimplemented,
 }
@@ -943,6 +951,185 @@ impl Cpu {
         }
     }
 
+    // ===== Carga/almacén simple: LDR/STR/LDRB/STRB y media palabra (2.2i) ===
+
+    /// Ejecuta una **transferencia de datos simple** (Mini-Hito 2.2i):
+    /// `LDR`/`STR` (palabra) y `LDRB`/`STRB` (byte).
+    ///
+    /// Encoding: `cccc 01IP UBWL nnnn dddd oooo oooo oooo`. ⚠️ Aquí el bit `I` (25)
+    /// está **invertido** respecto al procesamiento de datos: `I=0` es offset
+    /// **inmediato** (12 bits) e `I=1` es un registro `Rm` desplazado por una
+    /// cantidad **inmediata** (el offset nunca usa shift por registro). Los demás
+    /// bits: `P` (24) pre/post-indexado, `U` (23) suma/resta del offset, `B` (22)
+    /// byte/palabra, `W` (21) write-back y `L` (20) carga/almacén.
+    ///
+    /// Modos de direccionamiento (ver [`Cpu::apply_writeback`]): **pre-indexado**
+    /// accede a `base ± offset` (y con `W` lo guarda en `Rn`); **post-indexado**
+    /// accede a `base` y siempre escribe `base ± offset` en `Rn`. Las lecturas de
+    /// palabra desalineadas **rotan** (lo resuelve [`Bus::read_u32`], Mini-Hito
+    /// 2.1a); los bytes se extienden con ceros (`LDRB`).
+    ///
+    /// Casos con `r15`: `LDR Rd=r15` es un **salto** (devuelve [`Executed::Branched`],
+    /// alineado a palabra, sin cambiar a THUMB en ARMv4); al **almacenar** `r15`,
+    /// el valor escrito es la dirección de la instrucción **+12** (el `reg(PC)` ya
+    /// da +8). El resto devuelve [`Executed::Accessed`] (avanza el `PC`, pero el
+    /// acceso a datos hace que el próximo fetch sea N).
+    pub fn execute_single_data_transfer(&mut self, instr: u32, bus: &mut Bus) -> Executed {
+        let register_offset = (instr & (1 << 25)) != 0; // I (¡invertido vs data-proc!)
+        let pre = (instr & (1 << 24)) != 0; // P
+        let add = (instr & (1 << 23)) != 0; // U
+        let byte = (instr & (1 << 22)) != 0; // B
+        let write_back = (instr & (1 << 21)) != 0; // W
+        let load = (instr & (1 << 20)) != 0; // L
+        let rn = ((instr >> 16) & 0xF) as usize;
+        let rd = ((instr >> 12) & 0xF) as usize;
+
+        // Offset: inmediato de 12 bits, o `Rm` desplazado por cantidad inmediata.
+        let offset = if register_offset {
+            let rm = (instr & 0xF) as usize;
+            let ty = ShiftType::from_bits(instr >> 5);
+            let amount = (instr >> 7) & 0x1F;
+            let (shifted, _carry) = shift_by_immediate(ty, amount, self.reg(rm), self.cpsr().c());
+            shifted
+        } else {
+            instr & 0xFFF
+        };
+
+        let base = self.reg(rn);
+        let offset_addr = if add {
+            base.wrapping_add(offset)
+        } else {
+            base.wrapping_sub(offset)
+        };
+        let address = if pre { offset_addr } else { base };
+
+        let width = if byte { AccessWidth::Byte } else { AccessWidth::Word };
+        // El acceso a datos es no secuencial (N) respecto al fetch del opcode.
+        let mut extra = u64::from(bus.access_cycles(address, width, false));
+
+        if load {
+            let value = if byte {
+                u32::from(bus.read_u8(address)) // LDRB: byte con extensión de ceros
+            } else {
+                bus.read_u32(address) // LDR: palabra (con rotación si está desalineada)
+            };
+            // Write-back ANTES de escribir Rd: si Rn==Rd, prevalece el dato cargado.
+            self.apply_writeback(rn, offset_addr, pre, write_back);
+            extra += 1; // las cargas añaden un I-cycle (el dato no llega hasta después)
+            if rd == PC {
+                self.set_pc(value & !3); // LDR a r15 = salto (ARMv4: alinea a palabra)
+                return Executed::Branched { extra_cycles: extra };
+            }
+            self.set_reg(rd, value);
+        } else {
+            let value = self.store_value(rd); // r15 se almacena como instrucción+12
+            if byte {
+                bus.write_u8(address, value as u8); // STRB
+            } else {
+                bus.write_u32(address, value); // STR (el bus alinea la dirección)
+            }
+            self.apply_writeback(rn, offset_addr, pre, write_back);
+        }
+
+        Executed::Accessed { extra_cycles: extra }
+    }
+
+    /// Ejecuta una **transferencia de media palabra o byte con signo** (Mini-Hito
+    /// 2.2i): `LDRH`/`STRH` (media palabra sin signo), `LDRSB` (byte con signo) y
+    /// `LDRSH` (media palabra con signo).
+    ///
+    /// Encoding: `cccc 000P U·WL nnnn dddd ···· 1SH1 ····`. El bit 22 elige offset
+    /// **inmediato** (partido en los nibbles 11-8 y 3-0) o de **registro** `Rm`
+    /// (bits 3-0); `P`/`U`/`W`/`L` son como en [`Cpu::execute_single_data_transfer`].
+    /// El par `SH` (bits 6-5) da el tipo: `01` media palabra, `10` byte con signo,
+    /// `11` media palabra con signo (el decode ya excluye `00`). Para `L=0` solo
+    /// `STRH` (`SH=01`) está definido.
+    ///
+    /// Quirks de desalineado del ARM7TDMI (Mini-Hito 2.1a): `LDRH` desde dirección
+    /// impar rota el halfword dentro de los 32 bits (ver [`load_halfword`]) y
+    /// `LDRSH` desde dirección impar carga en realidad un **byte con signo** (ver
+    /// [`load_signed_halfword`]). Mismos casos de `r15` y mismo [`Executed`] que la
+    /// transferencia simple.
+    pub fn execute_halfword_transfer(&mut self, instr: u32, bus: &mut Bus) -> Executed {
+        let pre = (instr & (1 << 24)) != 0; // P
+        let add = (instr & (1 << 23)) != 0; // U
+        let immediate_offset = (instr & (1 << 22)) != 0; // 1 = offset inmediato
+        let write_back = (instr & (1 << 21)) != 0; // W
+        let load = (instr & (1 << 20)) != 0; // L
+        let rn = ((instr >> 16) & 0xF) as usize;
+        let rd = ((instr >> 12) & 0xF) as usize;
+        let sh = (instr >> 5) & 0b11; // 01=H, 10=SB, 11=SH
+
+        // Offset: inmediato en dos nibbles (11-8 alto + 3-0 bajo) o registro `Rm`.
+        let offset = if immediate_offset {
+            (((instr >> 8) & 0xF) << 4) | (instr & 0xF)
+        } else {
+            self.reg((instr & 0xF) as usize)
+        };
+
+        let base = self.reg(rn);
+        let offset_addr = if add {
+            base.wrapping_add(offset)
+        } else {
+            base.wrapping_sub(offset)
+        };
+        let address = if pre { offset_addr } else { base };
+
+        // Anchura para el conteo de ciclos: byte (LDRSB) o media palabra (resto).
+        let width = if sh == 0b10 {
+            AccessWidth::Byte
+        } else {
+            AccessWidth::Half
+        };
+        let mut extra = u64::from(bus.access_cycles(address, width, false));
+
+        if load {
+            let value = match sh {
+                0b01 => load_halfword(bus, address), // LDRH (sin signo, con rotación)
+                0b10 => i32::from(bus.read_u8(address) as i8) as u32, // LDRSB (byte con signo)
+                0b11 => load_signed_halfword(bus, address), // LDRSH (con signo; quirk en impar)
+                _ => unreachable!("el decode excluye SH=00 de HalfwordTransfer"),
+            };
+            self.apply_writeback(rn, offset_addr, pre, write_back);
+            extra += 1; // I-cycle de carga
+            if rd == PC {
+                self.set_pc(value & !3);
+                return Executed::Branched { extra_cycles: extra };
+            }
+            self.set_reg(rd, value);
+        } else {
+            // Único almacén definido aquí: STRH (los SH=10/11 con L=0 son indefinidos).
+            let value = self.store_value(rd);
+            bus.write_u16(address, value as u16); // el bus alinea; STRH no rota
+            self.apply_writeback(rn, offset_addr, pre, write_back);
+        }
+
+        Executed::Accessed { extra_cycles: extra }
+    }
+
+    /// El valor con el que un registro `Rd` participa como **fuente de un
+    /// almacén**. Idéntico a [`Cpu::reg`] salvo para `r15`: al almacenar, el
+    /// ARM7TDMI escribe la dirección de la instrucción **+12**; como `reg(PC)` ya
+    /// adelanta +8 (pipeline), se le suman los 4 restantes.
+    fn store_value(&self, rd: usize) -> u32 {
+        if rd == PC {
+            self.reg(PC).wrapping_add(4)
+        } else {
+            self.reg(rd)
+        }
+    }
+
+    /// Aplica el **write-back** de la base `Rn` de una transferencia: escribe en
+    /// `Rn` la base ya desplazada (`offset_addr`). En **post-indexado** (`!pre`)
+    /// es siempre implícito; en **pre-indexado**, solo si `W = 1`. (En
+    /// post-indexado el bit `W` marca en realidad el acceso "de usuario"
+    /// `LDRT`/`STRT`, que aún no se modela.)
+    fn apply_writeback(&mut self, rn: usize, offset_addr: u32, pre: bool, write_back: bool) {
+        if !pre || write_back {
+            self.set_reg(rn, offset_addr);
+        }
+    }
+
     // ===== Bucle de ejecución (Mini-Hito 2.2a) ==============================
 
     /// El tamaño en bytes de la instrucción actual según el estado: 4 en ARM, 2
@@ -974,11 +1161,13 @@ impl Cpu {
     /// 2.3a). De ARM están implementados el **procesamiento de datos completo**
     /// (Mini-Hito 2.2f: inmediato y registro por el barrel shifter, incluido
     /// `Rd = r15`), la **transferencia de PSR** `MRS`/`MSR` (Mini-Hito 2.2g), la
-    /// **multiplicación** `MUL`/`MLA`/largas (Mini-Hito 2.2h) y los **saltos**
-    /// `B`/`BL`/`BX` (Mini-Hito 2.2e); ante cualquier otra instrucción la CPU se
-    /// detiene con [`StepResult::Halted`], **sin** avanzar el `PC` (queda en la
-    /// instrucción culpable, para inspeccionarla).
-    pub fn step(&mut self, bus: &Bus) -> StepResult {
+    /// **multiplicación** `MUL`/`MLA`/largas (Mini-Hito 2.2h), la **carga/almacén
+    /// simple** `LDR`/`STR`/`LDRB`/`STRB` y de media palabra/byte con signo
+    /// `LDRH`/`STRH`/`LDRSB`/`LDRSH` (Mini-Hito 2.2i) y los **saltos** `B`/`BL`/`BX`
+    /// (Mini-Hito 2.2e); ante cualquier otra instrucción la CPU se detiene con
+    /// [`StepResult::Halted`], **sin** avanzar el `PC` (queda en la instrucción
+    /// culpable, para inspeccionarla).
+    pub fn step(&mut self, bus: &mut Bus) -> StepResult {
         let pc = self.pc();
 
         // Tras un `BX` a THUMB el estado cambia, pero la ejecución THUMB aún no
@@ -1008,10 +1197,19 @@ impl Cpu {
             Decoded::Execute(kind) if is_branch_to_self(kind, instr, pc) => {
                 StepResult::Halted(Halt::InfiniteLoop { pc, instr })
             }
-            Decoded::Execute(kind) => match self.try_execute_arm(kind, instr) {
+            Decoded::Execute(kind) => match self.try_execute_arm(kind, instr, bus) {
                 Executed::Continue { extra_cycles } => {
                     self.advance_pc();
                     self.account_step(fetch_cycles + extra_cycles);
+                    StepResult::Stepped
+                }
+                Executed::Accessed { extra_cycles } => {
+                    // Como `Continue` (avanza el PC), pero el acceso a datos dejó el
+                    // bus en una dirección ajena al flujo de instrucciones: el
+                    // siguiente fetch es no secuencial (N), no S.
+                    self.advance_pc();
+                    self.cycles += fetch_cycles + extra_cycles;
+                    self.seq_fetch_addr = None;
                     StepResult::Stepped
                 }
                 Executed::Branched { extra_cycles } => {
@@ -1046,7 +1244,7 @@ impl Cpu {
     /// El tope `max_steps` es una **salvaguarda**: mientras falten instrucciones
     /// por implementar, una secuencia de NOPs (p. ej. memoria a cero) avanzaría
     /// el `PC` indefinidamente; sin un límite, el bucle no terminaría nunca.
-    pub fn run(&mut self, bus: &Bus, max_steps: u64) -> RunReport {
+    pub fn run(&mut self, bus: &mut Bus, max_steps: u64) -> RunReport {
         let cycles_start = self.cycles;
         let mut steps = 0;
         while steps < max_steps {
@@ -1074,7 +1272,7 @@ impl Cpu {
     /// [`Executed::Unimplemented`] si esa instrucción o variante aún no existe.
     ///
     /// A medida que se implementen instrucciones, este `match` ganará ramas.
-    fn try_execute_arm(&mut self, kind: ArmInstruction, instr: u32) -> Executed {
+    fn try_execute_arm(&mut self, kind: ArmInstruction, instr: u32, bus: &mut Bus) -> Executed {
         match kind {
             // Procesamiento de datos completo (Mini-Hito 2.2f): ambas formas del
             // operando 2 (inmediato y registro por el barrel shifter) y el caso
@@ -1089,6 +1287,11 @@ impl Cpu {
             // Multiplicación larga de 64 bits `UMULL`/`UMLAL`/`SMULL`/`SMLAL`
             // (Mini-Hito 2.2h). Ver [`Cpu::execute_multiply_long`].
             ArmInstruction::MultiplyLong => self.execute_multiply_long(instr),
+            // Carga/almacén simple `LDR`/`STR`/`LDRB`/`STRB` (Mini-Hito 2.2i).
+            ArmInstruction::SingleDataTransfer => self.execute_single_data_transfer(instr, bus),
+            // Carga/almacén de media palabra y byte con signo `LDRH`/`STRH`/
+            // `LDRSB`/`LDRSH` (Mini-Hito 2.2i). Ver [`Cpu::execute_halfword_transfer`].
+            ArmInstruction::HalfwordTransfer => self.execute_halfword_transfer(instr, bus),
             // Saltos relativos `B`/`BL` (Mini-Hito 2.2e).
             ArmInstruction::Branch { link } => {
                 self.execute_branch(instr, link);
@@ -1280,6 +1483,33 @@ fn multiply_internal_cycles(multiplier: u32, allow_all_ones: bool) -> u64 {
         3
     } else {
         4
+    }
+}
+
+/// Carga para `LDRH` (Mini-Hito 2.2i): el halfword **sin signo** en `addr`, con
+/// la rotación de desalineado del ARM7TDMI (Mini-Hito 2.1a). Si `addr` es impar,
+/// se lee el halfword alineado y el valor de 32 bits se **rota** 8 a la derecha
+/// (el resultado queda en los bits 0-7 y 24-31), en vez de fallar.
+///
+/// Se leen los dos bytes a mano (no `Bus::read_u16`) para aplicar la rotación
+/// sobre los 32 bits del registro, no sobre los 16 del halfword —que darían un
+/// resultado distinto en dirección impar—.
+fn load_halfword(bus: &Bus, addr: u32) -> u32 {
+    let base = addr & !1;
+    let halfword = u32::from(bus.read_u8(base)) | (u32::from(bus.read_u8(base + 1)) << 8);
+    halfword.rotate_right((addr & 1) * 8)
+}
+
+/// Carga para `LDRSH` (Mini-Hito 2.2i): media palabra **con signo**. Quirk del
+/// ARM7TDMI: en dirección **impar** no carga un halfword, sino el **byte** de esa
+/// dirección extendido con signo (como `LDRSB`). En dirección par, lee el
+/// halfword y lo extiende con signo de 16 a 32 bits.
+fn load_signed_halfword(bus: &Bus, addr: u32) -> u32 {
+    if addr & 1 != 0 {
+        i32::from(bus.read_u8(addr) as i8) as u32
+    } else {
+        let halfword = u16::from(bus.read_u8(addr)) | (u16::from(bus.read_u8(addr + 1)) << 8);
+        i32::from(halfword as i16) as u32
     }
 }
 
@@ -1698,39 +1928,39 @@ mod tests {
         // avanza el PC, sin detener el bucle.
         let mut rom = vec![0u8; 8];
         rom[0..4].copy_from_slice(&0x0A00_0000u32.to_le_bytes()); // 0000 = EQ
-        let bus = Bus::new(rom);
+        let mut bus = Bus::new(rom);
         let mut cpu = Cpu::new();
         cpu.set_pc(crate::bus::ROM_START);
 
-        assert_eq!(cpu.step(&bus), StepResult::Stepped);
+        assert_eq!(cpu.step(&mut bus), StepResult::Stepped);
         assert_eq!(cpu.pc(), crate::bus::ROM_START + 4, "el NOP avanza una instrucción");
     }
 
     #[test]
     fn el_bucle_ejecuta_hasta_una_no_implementada() {
         use crate::arm::ArmInstruction;
-        // MOV r0,#5 ; ADD r0,r0,#1 ; LDR r2,[r0] (carga: aún sin implementar).
-        let programa = [0xE3A0_0005u32, 0xE280_0001, 0xE590_2000];
+        // MOV r0,#5 ; ADD r0,r0,#1 ; STMFD sp!,{r0,r1,lr} (bloque: aún sin implementar).
+        let programa = [0xE3A0_0005u32, 0xE280_0001, 0xE92D_4003];
         let mut rom = vec![0u8; programa.len() * 4];
         for (i, w) in programa.iter().enumerate() {
             rom[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
         }
-        let bus = Bus::new(rom);
+        let mut bus = Bus::new(rom);
         let mut cpu = Cpu::new();
         cpu.set_pc(crate::bus::ROM_START);
 
-        assert_eq!(cpu.step(&bus), StepResult::Stepped);
+        assert_eq!(cpu.step(&mut bus), StepResult::Stepped);
         assert_eq!(cpu.reg(0), 5); // MOV r0, #5
-        assert_eq!(cpu.step(&bus), StepResult::Stepped);
+        assert_eq!(cpu.step(&mut bus), StepResult::Stepped);
         assert_eq!(cpu.reg(0), 6); // ADD r0, r0, #1
 
         // La tercera (una carga) aún no está implementada → la CPU se detiene.
         let pc_culpable = cpu.pc();
-        match cpu.step(&bus) {
+        match cpu.step(&mut bus) {
             StepResult::Halted(Halt::Unimplemented { pc, instr, kind }) => {
                 assert_eq!(pc, crate::bus::ROM_START + 8);
-                assert_eq!(instr, 0xE590_2000);
-                assert_eq!(kind, ArmInstruction::SingleDataTransfer);
+                assert_eq!(instr, 0xE92D_4003);
+                assert_eq!(kind, ArmInstruction::BlockDataTransfer);
             }
             otro => panic!("esperaba Halted, fue {otro:?}"),
         }
@@ -1744,11 +1974,11 @@ mod tests {
         // Mini-Hito 2.2f ya se ejecuta (barrel shifter), en vez de detener el bucle.
         let mut rom = vec![0u8; 8];
         rom[0..4].copy_from_slice(&0xE1A0_0001u32.to_le_bytes());
-        let bus = Bus::new(rom);
+        let mut bus = Bus::new(rom);
         let mut cpu = Cpu::new();
         cpu.set_pc(crate::bus::ROM_START);
         cpu.set_reg(1, 0x1234_5678);
-        assert_eq!(cpu.step(&bus), StepResult::Stepped);
+        assert_eq!(cpu.step(&mut bus), StepResult::Stepped);
         assert_eq!(cpu.reg(0), 0x1234_5678);
     }
 
@@ -1756,10 +1986,10 @@ mod tests {
     fn run_para_al_alcanzar_el_tope_de_pasos() {
         // ROM de ceros: 0x00000000 es cond EQ (falla en reset) → NOP infinito.
         // El tope debe cortar el bucle en seco.
-        let bus = Bus::new(vec![0u8; 64]);
+        let mut bus = Bus::new(vec![0u8; 64]);
         let mut cpu = Cpu::new();
         cpu.set_pc(crate::bus::ROM_START);
-        let report = cpu.run(&bus, 10);
+        let report = cpu.run(&mut bus, 10);
         assert_eq!(report.steps, 10);
         assert_eq!(report.stop, RunStop::StepLimit);
     }
@@ -1770,10 +2000,10 @@ mod tests {
         // de las ROMs de test. Se reconoce sin necesidad de ejecutar el salto.
         let mut rom = vec![0u8; 8];
         rom[0..4].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes());
-        let bus = Bus::new(rom);
+        let mut bus = Bus::new(rom);
         let mut cpu = Cpu::new();
         cpu.set_pc(crate::bus::ROM_START);
-        match cpu.step(&bus) {
+        match cpu.step(&mut bus) {
             StepResult::Halted(Halt::InfiniteLoop { pc, instr }) => {
                 assert_eq!(pc, crate::bus::ROM_START);
                 assert_eq!(instr, 0xEAFF_FFFE);
@@ -1791,7 +2021,7 @@ mod tests {
         bus.write_u32(base, 0xEA00_002E);
         let mut cpu = Cpu::new();
         cpu.set_pc(base);
-        assert_eq!(cpu.step(&bus), StepResult::Stepped);
+        assert_eq!(cpu.step(&mut bus), StepResult::Stepped);
         assert_eq!(cpu.pc(), base + 0xC0);
     }
 
@@ -1806,9 +2036,9 @@ mod tests {
         let mut cpu = Cpu::new();
         cpu.set_pc(base);
 
-        assert_eq!(cpu.step(&bus), StepResult::Stepped); // B
+        assert_eq!(cpu.step(&mut bus), StepResult::Stepped); // B
         assert_eq!(cpu.pc(), base + 8);
-        assert_eq!(cpu.step(&bus), StepResult::Stepped); // MOV r1, #1
+        assert_eq!(cpu.step(&mut bus), StepResult::Stepped); // MOV r1, #1
         assert_eq!(cpu.reg(1), 1);
         assert_eq!(cpu.reg(0), 0, "la instrucción saltada no se ejecutó");
     }
@@ -1827,18 +2057,18 @@ mod tests {
         let mut cpu = Cpu::new();
         cpu.set_pc(base);
 
-        cpu.step(&bus); // BL
+        cpu.step(&mut bus); // BL
         assert_eq!(cpu.pc(), base + 12, "BL salta a la subrutina");
         assert_eq!(cpu.reg(LR), base + 4, "BL guarda el retorno en LR");
 
-        cpu.step(&bus); // MOV r2, #2
+        cpu.step(&mut bus); // MOV r2, #2
         assert_eq!(cpu.reg(2), 2);
 
-        cpu.step(&bus); // BX lr
+        cpu.step(&mut bus); // BX lr
         assert_eq!(cpu.pc(), base + 4, "BX lr vuelve a la instrucción siguiente al BL");
         assert!(!cpu.cpsr().thumb(), "LR con bit0=0 → sigue en ARM");
 
-        cpu.step(&bus); // MOV r0, #1
+        cpu.step(&mut bus); // MOV r0, #1
         assert_eq!(cpu.reg(0), 1);
     }
 
@@ -1853,11 +2083,11 @@ mod tests {
         cpu.set_pc(base);
         cpu.set_reg(0, base + 0x101); // destino impar (bit0=1) → THUMB
 
-        cpu.step(&bus); // BX → THUMB, PC = (base+0x101) & !1 = base+0x100
+        cpu.step(&mut bus); // BX → THUMB, PC = (base+0x101) & !1 = base+0x100
         assert!(cpu.cpsr().thumb());
         assert_eq!(cpu.pc(), base + 0x100);
         assert!(matches!(
-            cpu.step(&bus),
+            cpu.step(&mut bus),
             StepResult::Halted(Halt::ThumbNotImplemented { .. })
         ));
     }
@@ -1874,7 +2104,7 @@ mod tests {
         assert_eq!(cpu.cycles(), 0);
 
         for _ in 0..3 {
-            assert_eq!(cpu.step(&bus), StepResult::Stepped);
+            assert_eq!(cpu.step(&mut bus), StepResult::Stepped);
         }
         // 3 instrucciones × 1 ciclo (IWRAM no distingue N de S: ambos cuestan 1).
         assert_eq!(cpu.cycles(), 3);
@@ -1890,12 +2120,12 @@ mod tests {
 
         let mut en_iwram = Cpu::new();
         en_iwram.set_pc(crate::bus::IWRAM_START);
-        en_iwram.step(&bus);
+        en_iwram.step(&mut bus);
         assert_eq!(en_iwram.cycles(), 1);
 
         let mut en_ewram = Cpu::new();
         en_ewram.set_pc(crate::bus::EWRAM_START);
-        en_ewram.step(&bus);
+        en_ewram.step(&mut bus);
         assert_eq!(en_ewram.cycles(), 6);
     }
 
@@ -1906,11 +2136,11 @@ mod tests {
         let mut bus = Bus::new(vec![0u8; 4]);
         bus.write_u32(crate::bus::IWRAM_START, 0xE3A0_0000); // MOV r0, #0
         bus.write_u32(crate::bus::IWRAM_START + 4, 0xE3A0_1001); // MOV r1, #1
-        bus.write_u32(crate::bus::IWRAM_START + 8, 0xE590_2000); // LDR r2, [r0]: no impl.
+        bus.write_u32(crate::bus::IWRAM_START + 8, 0xE92D_4003); // STMFD sp!,{...}: no impl.
         let mut cpu = Cpu::new();
         cpu.set_pc(crate::bus::IWRAM_START);
 
-        let report = cpu.run(&bus, 100);
+        let report = cpu.run(&mut bus, 100);
         assert_eq!(report.steps, 2);
         assert_eq!(report.cycles, 2);
         assert!(matches!(
@@ -2022,13 +2252,13 @@ mod tests {
         bus.write_u32(crate::bus::IWRAM_START, 0xE1A0_0081); // MOV r0, r1, LSL #1
         let mut por_inmediato = Cpu::new();
         por_inmediato.set_pc(crate::bus::IWRAM_START);
-        por_inmediato.step(&bus);
+        por_inmediato.step(&mut bus);
         assert_eq!(por_inmediato.cycles(), 1);
 
         bus.write_u32(crate::bus::IWRAM_START, 0xE1A0_0211); // MOV r0, r1, LSL r2
         let mut por_registro = Cpu::new();
         por_registro.set_pc(crate::bus::IWRAM_START);
-        por_registro.step(&bus);
+        por_registro.step(&mut bus);
         assert_eq!(por_registro.cycles(), 2, "el shift por registro añade un I-cycle");
     }
 
@@ -2084,7 +2314,7 @@ mod tests {
         let mut cpu = Cpu::new();
         cpu.set_pc(base);
         cpu.set_reg(0, base + 0x40);
-        assert_eq!(cpu.step(&bus), StepResult::Stepped);
+        assert_eq!(cpu.step(&mut bus), StepResult::Stepped);
         assert_eq!(cpu.pc(), base + 0x40, "el PC quedó en el destino del salto");
     }
 
@@ -2205,7 +2435,7 @@ mod tests {
         bus.write_u32(base, 0xE328_F101);
         let mut cpu = Cpu::new();
         cpu.set_pc(base);
-        assert_eq!(cpu.step(&bus), StepResult::Stepped);
+        assert_eq!(cpu.step(&mut bus), StepResult::Stepped);
         assert!(cpu.cpsr().z(), "MSR puso Z");
         assert_eq!(cpu.pc(), base + 4, "MRS/MSR avanzan el PC como una instrucción normal");
     }
@@ -2359,7 +2589,7 @@ mod tests {
         cpu.set_pc(base);
         cpu.set_reg(1, 4);
         cpu.set_reg(2, 5);
-        assert_eq!(cpu.step(&bus), StepResult::Stepped);
+        assert_eq!(cpu.step(&mut bus), StepResult::Stepped);
         assert_eq!(cpu.reg(0), 20);
         assert_eq!(cpu.pc(), base + 4, "no es un salto: el PC avanza 4 bytes");
     }
@@ -2375,7 +2605,7 @@ mod tests {
         cpu.set_pc(crate::bus::IWRAM_START);
         cpu.set_reg(1, 3);
         cpu.set_reg(2, 0xFF);
-        cpu.step(&bus);
+        cpu.step(&mut bus);
         assert_eq!(cpu.cycles(), 2, "multiplicador pequeño → m=1");
 
         // Rs = 0x12345678 → ningún byte alto homogéneo → m=4 → 1 + 4 = 5.
@@ -2383,7 +2613,7 @@ mod tests {
         cpu.set_pc(crate::bus::IWRAM_START);
         cpu.set_reg(1, 3);
         cpu.set_reg(2, 0x1234_5678);
-        cpu.step(&bus);
+        cpu.step(&mut bus);
         assert_eq!(cpu.cycles(), 5, "multiplicador grande → m=4");
     }
 
@@ -2399,7 +2629,7 @@ mod tests {
         cpu.set_pc(crate::bus::IWRAM_START);
         cpu.set_reg(2, 5);
         cpu.set_reg(3, 0xFFFF_FFFF);
-        cpu.step(&bus);
+        cpu.step(&mut bus);
         assert_eq!(cpu.cycles(), 3, "SMULL: -1 termina pronto (m=1)");
 
         // UMULL r0, r1, r2, r3 (0xE0810392): mismo Rs, m=4 → 1 + (4+1) = 6.
@@ -2408,7 +2638,7 @@ mod tests {
         cpu.set_pc(crate::bus::IWRAM_START);
         cpu.set_reg(2, 5);
         cpu.set_reg(3, 0xFFFF_FFFF);
-        cpu.step(&bus);
+        cpu.step(&mut bus);
         assert_eq!(cpu.cycles(), 6, "UMULL: 0xFFFFFFFF no termina pronto (m=4)");
     }
 
@@ -2424,5 +2654,269 @@ mod tests {
         assert_eq!(multiply_internal_cycles(0xFFFF_FFFF, false), 4);
         assert_eq!(multiply_internal_cycles(0xFF00_0000, true), 3);
         assert_eq!(multiply_internal_cycles(0xFF00_0000, false), 4);
+    }
+
+    // ===== Carga/almacén simple: LDR/STR/LDRB/STRB y media palabra (2.2i) ==
+
+    #[test]
+    fn str_y_ldr_de_palabra_en_memoria() {
+        let mut bus = Bus::new(vec![0u8; 4]);
+        let mut cpu = Cpu::new();
+        let addr = crate::bus::IWRAM_START;
+        cpu.set_reg(0, addr);
+        cpu.set_reg(1, 0x1234_5678);
+        cpu.execute_single_data_transfer(0xE580_1000, &mut bus); // STR r1, [r0]
+        assert_eq!(bus.read_u32(addr), 0x1234_5678);
+        let efecto = cpu.execute_single_data_transfer(0xE590_2000, &mut bus); // LDR r2, [r0]
+        assert_eq!(cpu.reg(2), 0x1234_5678);
+        assert!(matches!(efecto, Executed::Accessed { .. }), "una carga/almacén es Accessed");
+    }
+
+    #[test]
+    fn strb_escribe_un_byte_y_ldrb_extiende_con_ceros() {
+        let mut bus = Bus::new(vec![0u8; 4]);
+        let mut cpu = Cpu::new();
+        let addr = crate::bus::IWRAM_START;
+        cpu.set_reg(0, addr);
+        cpu.set_reg(1, 0x1234_56AB);
+        cpu.execute_single_data_transfer(0xE5C0_1000, &mut bus); // STRB r1, [r0] → solo 0xAB
+        assert_eq!(bus.read_u8(addr), 0xAB);
+        assert_eq!(bus.read_u8(addr + 1), 0, "STRB toca un solo byte");
+        cpu.execute_single_data_transfer(0xE5D0_2000, &mut bus); // LDRB r2, [r0]
+        assert_eq!(cpu.reg(2), 0x0000_00AB, "LDRB extiende con ceros");
+    }
+
+    #[test]
+    fn ldr_con_offset_inmediato_pre_indexado_sin_write_back() {
+        let mut bus = Bus::new(vec![0u8; 16]);
+        let mut cpu = Cpu::new();
+        let addr = crate::bus::IWRAM_START;
+        bus.write_u32(addr + 4, 0xCAFE_F00D);
+        cpu.set_reg(0, addr);
+        cpu.execute_single_data_transfer(0xE590_1004, &mut bus); // LDR r1, [r0, #4]
+        assert_eq!(cpu.reg(1), 0xCAFE_F00D);
+        assert_eq!(cpu.reg(0), addr, "pre-indexado sin W no modifica la base");
+    }
+
+    #[test]
+    fn pre_indexado_con_write_back_actualiza_la_base() {
+        let mut bus = Bus::new(vec![0u8; 16]);
+        let mut cpu = Cpu::new();
+        let addr = crate::bus::IWRAM_START;
+        cpu.set_reg(0, addr);
+        cpu.set_reg(1, 0xAA);
+        cpu.execute_single_data_transfer(0xE5A0_1004, &mut bus); // STR r1, [r0, #4]!
+        assert_eq!(bus.read_u32(addr + 4), 0xAA, "almacena en base+4");
+        assert_eq!(cpu.reg(0), addr + 4, "write-back deja Rn en base+4");
+    }
+
+    #[test]
+    fn post_indexado_accede_a_la_base_y_luego_la_desplaza() {
+        let mut bus = Bus::new(vec![0u8; 16]);
+        let mut cpu = Cpu::new();
+        let addr = crate::bus::IWRAM_START;
+        cpu.set_reg(0, addr);
+        cpu.set_reg(1, 0xBB);
+        cpu.execute_single_data_transfer(0xE480_1004, &mut bus); // STR r1, [r0], #4
+        assert_eq!(bus.read_u32(addr), 0xBB, "post-indexado almacena en la base original");
+        assert_eq!(cpu.reg(0), addr + 4, "y luego suma el offset a Rn (write-back implícito)");
+    }
+
+    #[test]
+    fn offset_negativo_resta_de_la_base() {
+        let mut bus = Bus::new(vec![0u8; 16]);
+        let mut cpu = Cpu::new();
+        let addr = crate::bus::IWRAM_START;
+        bus.write_u32(addr, 0x1111_2222);
+        cpu.set_reg(0, addr + 4);
+        cpu.execute_single_data_transfer(0xE510_1004, &mut bus); // LDR r1, [r0, #-4]
+        assert_eq!(cpu.reg(1), 0x1111_2222, "U=0 resta el offset");
+    }
+
+    #[test]
+    fn offset_de_registro_desplazado_por_el_shifter() {
+        let mut bus = Bus::new(vec![0u8; 32]);
+        let mut cpu = Cpu::new();
+        let addr = crate::bus::IWRAM_START;
+        bus.write_u32(addr + 8, 0xDEAD_BEEF);
+        cpu.set_reg(0, addr);
+        cpu.set_reg(2, 2);
+        // LDR r1, [r0, r2, LSL #2]: offset = 2 << 2 = 8.
+        cpu.execute_single_data_transfer(0xE790_1102, &mut bus);
+        assert_eq!(cpu.reg(1), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn ldr_desalineado_rota_la_palabra() {
+        // Integración de la rotación del 2.1a: LDR desde dirección no alineada.
+        let mut bus = Bus::new(vec![0u8; 16]);
+        let mut cpu = Cpu::new();
+        let addr = crate::bus::IWRAM_START;
+        bus.write_u32(addr, 0xAABB_CCDD);
+        cpu.set_reg(0, addr + 1); // dirección no múltiplo de 4
+        cpu.execute_single_data_transfer(0xE590_1000, &mut bus); // LDR r1, [r0]
+        assert_eq!(cpu.reg(1), 0xDDAA_BBCC, "LDR desalineado rota 8 bits a la derecha");
+    }
+
+    #[test]
+    fn str_de_r15_almacena_la_instruccion_mas_12() {
+        let mut bus = Bus::new(vec![0u8; 16]);
+        let mut cpu = Cpu::new();
+        let addr = crate::bus::IWRAM_START;
+        cpu.set_pc(0x0800_0100);
+        cpu.set_reg(0, addr);
+        cpu.execute_single_data_transfer(0xE580_F000, &mut bus); // STR r15, [r0]
+        assert_eq!(bus.read_u32(addr), 0x0800_0100 + 12, "STR r15 guarda la instrucción + 12");
+    }
+
+    #[test]
+    fn ldr_a_r15_es_un_salto_alineado_a_palabra() {
+        let mut bus = Bus::new(vec![0u8; 16]);
+        let mut cpu = Cpu::new();
+        let addr = crate::bus::IWRAM_START;
+        bus.write_u32(addr, 0x0800_1235); // bits bajos sucios a propósito
+        cpu.set_reg(0, addr);
+        let efecto = cpu.execute_single_data_transfer(0xE590_F000, &mut bus); // LDR r15, [r0]
+        assert_eq!(cpu.pc(), 0x0800_1234, "destino alineado a palabra (ARMv4, sin THUMB)");
+        assert!(matches!(efecto, Executed::Branched { .. }));
+    }
+
+    #[test]
+    fn strh_y_ldrh_de_media_palabra() {
+        let mut bus = Bus::new(vec![0u8; 8]);
+        let mut cpu = Cpu::new();
+        let addr = crate::bus::IWRAM_START;
+        cpu.set_reg(0, addr);
+        cpu.set_reg(1, 0x1234_BEEF);
+        cpu.execute_halfword_transfer(0xE1C0_10B0, &mut bus); // STRH r1, [r0]
+        assert_eq!(bus.read_u16(addr), 0xBEEF, "STRH escribe solo 16 bits");
+        assert_eq!(bus.read_u16(addr + 2), 0, "no toca el halfword siguiente");
+        cpu.execute_halfword_transfer(0xE1D0_20B0, &mut bus); // LDRH r2, [r0]
+        assert_eq!(cpu.reg(2), 0x0000_BEEF, "LDRH extiende con ceros");
+    }
+
+    #[test]
+    fn ldrsb_extiende_el_byte_con_signo() {
+        let mut bus = Bus::new(vec![0u8; 8]);
+        let mut cpu = Cpu::new();
+        let addr = crate::bus::IWRAM_START;
+        bus.write_u8(addr, 0x80); // -128 con signo
+        cpu.set_reg(0, addr);
+        cpu.execute_halfword_transfer(0xE1D0_10D0, &mut bus); // LDRSB r1, [r0]
+        assert_eq!(cpu.reg(1), 0xFFFF_FF80, "byte 0x80 extendido con signo");
+    }
+
+    #[test]
+    fn ldrsh_extiende_la_media_palabra_con_signo() {
+        let mut bus = Bus::new(vec![0u8; 8]);
+        let mut cpu = Cpu::new();
+        let addr = crate::bus::IWRAM_START;
+        bus.write_u16(addr, 0x8001); // negativo con signo de 16 bits
+        cpu.set_reg(0, addr);
+        cpu.execute_halfword_transfer(0xE1D0_10F0, &mut bus); // LDRSH r1, [r0]
+        assert_eq!(cpu.reg(1), 0xFFFF_8001, "halfword 0x8001 extendido con signo");
+    }
+
+    #[test]
+    fn ldrsh_desde_direccion_impar_carga_un_byte_con_signo() {
+        // Quirk del ARM7TDMI: LDRSH en dirección impar carga el BYTE con signo.
+        let mut bus = Bus::new(vec![0u8; 8]);
+        let mut cpu = Cpu::new();
+        let addr = crate::bus::IWRAM_START;
+        bus.write_u8(addr + 1, 0x90); // byte negativo en la dirección impar
+        cpu.set_reg(0, addr + 1);
+        cpu.execute_halfword_transfer(0xE1D0_10F0, &mut bus); // LDRSH r1, [r0]
+        assert_eq!(cpu.reg(1), 0xFFFF_FF90, "en impar, LDRSH equivale a LDRSB");
+    }
+
+    #[test]
+    fn ldrh_desde_direccion_impar_rota() {
+        // LDRH en impar lee el halfword alineado y rota 8 bits en los 32.
+        let mut bus = Bus::new(vec![0u8; 8]);
+        let mut cpu = Cpu::new();
+        let addr = crate::bus::IWRAM_START;
+        bus.write_u16(addr, 0xBEEF); // halfword en dirección par
+        cpu.set_reg(0, addr + 1); // pero leemos desde impar
+        cpu.execute_halfword_transfer(0xE1D0_10B0, &mut bus); // LDRH r1, [r0]
+        assert_eq!(cpu.reg(1), 0xEF00_00BE, "0x0000BEEF ROR 8 = 0xEF0000BE");
+    }
+
+    #[test]
+    fn ldrh_con_offset_inmediato_partido_en_nibbles() {
+        let mut bus = Bus::new(vec![0u8; 32]);
+        let mut cpu = Cpu::new();
+        let addr = crate::bus::IWRAM_START;
+        bus.write_u16(addr + 0x10, 0xABCD);
+        cpu.set_reg(0, addr);
+        // LDRH r1, [r0, #0x10]: el inmediato va partido (nibble alto 1, bajo 0).
+        cpu.execute_halfword_transfer(0xE1D0_11B0, &mut bus);
+        assert_eq!(cpu.reg(1), 0x0000_ABCD);
+    }
+
+    #[test]
+    fn ldrh_con_offset_de_registro() {
+        let mut bus = Bus::new(vec![0u8; 16]);
+        let mut cpu = Cpu::new();
+        let addr = crate::bus::IWRAM_START;
+        bus.write_u16(addr + 6, 0x0BAD);
+        cpu.set_reg(0, addr);
+        cpu.set_reg(2, 6);
+        cpu.execute_halfword_transfer(0xE190_10B2, &mut bus); // LDRH r1, [r0, r2]
+        assert_eq!(cpu.reg(1), 0x0000_0BAD);
+    }
+
+    #[test]
+    fn strh_post_indexado_actualiza_la_base() {
+        let mut bus = Bus::new(vec![0u8; 16]);
+        let mut cpu = Cpu::new();
+        let addr = crate::bus::IWRAM_START;
+        cpu.set_reg(0, addr);
+        cpu.set_reg(1, 0xCAFE);
+        cpu.execute_halfword_transfer(0xE0C0_10B2, &mut bus); // STRH r1, [r0], #2
+        assert_eq!(bus.read_u16(addr), 0xCAFE, "almacena en la base original");
+        assert_eq!(cpu.reg(0), addr + 2, "post-indexado suma el offset a Rn");
+    }
+
+    #[test]
+    fn coste_en_ciclos_de_ldr_y_str() {
+        // En IWRAM (1 ciclo/acceso). LDR = 1S(fetch) + 1N(dato) + 1I = 3.
+        // STR = 1S(fetch) + 1N(dato) = 2 (sin I-cycle).
+        let mut bus = Bus::new(vec![0u8; 4]);
+        let base = crate::bus::IWRAM_START;
+
+        bus.write_u32(base, 0xE590_1000); // LDR r1, [r0]
+        let mut cpu = Cpu::new();
+        cpu.set_pc(base);
+        cpu.set_reg(0, base + 0x100);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.cycles(), 3, "LDR: fetch(1) + dato(1) + I(1)");
+
+        bus.write_u32(base, 0xE580_1000); // STR r1, [r0]
+        let mut cpu = Cpu::new();
+        cpu.set_pc(base);
+        cpu.set_reg(0, base + 0x100);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.cycles(), 2, "STR: fetch(1) + dato(1), sin I-cycle");
+    }
+
+    #[test]
+    fn tras_un_acceso_a_memoria_el_siguiente_fetch_es_no_secuencial() {
+        // En ROM, S y N difieren (fetch de palabra: N=8, S=6). Tras un STR, el
+        // fetch de la siguiente instrucción debe ser N, porque el acceso a datos
+        // rompió la secuencialidad del bus (lo modela `Executed::Accessed`).
+        let base = crate::bus::ROM_START;
+        let mut rom = vec![0u8; 16];
+        rom[0..4].copy_from_slice(&0xE580_1000u32.to_le_bytes()); // STR r1, [r0]
+        rom[4..8].copy_from_slice(&0xE3A0_0000u32.to_le_bytes()); // MOV r0, #0
+        let mut bus = Bus::new(rom);
+        let mut cpu = Cpu::new();
+        cpu.set_pc(base);
+        cpu.set_reg(0, crate::bus::IWRAM_START); // almacenamos en IWRAM (la ROM es R/O)
+
+        cpu.step(&mut bus); // STR
+        let tras_str = cpu.cycles();
+        cpu.step(&mut bus); // MOV: su fetch
+        let fetch_mov = cpu.cycles() - tras_str;
+        assert_eq!(fetch_mov, 8, "el fetch tras un acceso a memoria es N (8), no S (6)");
     }
 }
