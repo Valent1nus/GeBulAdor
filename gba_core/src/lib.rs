@@ -9,7 +9,7 @@
 //! sustituir el frontend de escritorio por uno de Android, iOS o WASM sin tocar
 //! una sola línea del núcleo.
 //!
-//! ## Estado actual (Fase 2.2a)
+//! ## Estado actual (Fase 2.2c)
 //!
 //! Además de cargar y validar el cartucho (Fase 1), el núcleo tiene el
 //! esqueleto del hardware: la CPU ARM7TDMI ([`Cpu`]) con sus registros y modos,
@@ -28,9 +28,11 @@
 //! fetch→decode→execute paso a paso ([`Gba::run`] / [`Gba::step`]): avanza el
 //! `PC` y se detiene limpiamente al llegar a una instrucción todavía no
 //! implementada. Como por ahora solo se ejecuta el procesamiento de datos
-//! inmediato, una ROM real se detiene en su primer salto; implementar más
-//! instrucciones y el conteo de ciclos (2.2c) es lo que sigue. La frontera con
-//! el frontend —entregar un buffer RGBA— no cambia.
+//! inmediato, una ROM real se detiene en su primer salto. El **contador de
+//! ciclos** (Mini-Hito 2.2c) ya está: cada instrucción ejecutada suma su coste
+//! según la región de memoria y si el acceso es secuencial (S) o no (N).
+//! Implementar más instrucciones —empezando por los saltos— es lo que sigue. La
+//! frontera con el frontend —entregar un buffer RGBA— no cambia.
 
 pub mod arm;
 pub mod bus;
@@ -40,7 +42,7 @@ pub mod header;
 pub mod thumb;
 
 pub use arm::{ArmInstruction, Condition, Decoded};
-pub use bus::Bus;
+pub use bus::{AccessWidth, Bus};
 pub use cartridge::{Cartridge, CartridgeError, MAX_ROM_SIZE, MIN_ROM_SIZE};
 pub use cpu::{Cpu, CpuMode, Cpsr, Halt, RunReport, RunStop, StepResult};
 pub use header::Header;
@@ -163,6 +165,11 @@ impl Gba {
     /// `r15` viene con el desfase de pipeline aplicado (ver [`Cpu::reg`]).
     pub fn reg(&self, index: usize) -> u32 {
         self.cpu.reg(index)
+    }
+
+    /// Ciclos totales que la CPU ha ejecutado desde el arranque (Mini-Hito 2.2c).
+    pub fn cycles(&self) -> u64 {
+        self.cpu.cycles()
     }
 
     /// Rellena todo el framebuffer con un color sólido opaco.

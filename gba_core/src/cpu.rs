@@ -40,7 +40,7 @@
 //! [`Cpu::set_mode`].
 
 use crate::arm::{self, ArmInstruction, Decoded};
-use crate::bus::Bus;
+use crate::bus::{AccessWidth, Bus};
 use crate::thumb::ThumbInstruction;
 
 /// Número de registros visibles del ARM7TDMI: `r0`–`r15`.
@@ -310,6 +310,13 @@ pub struct Cpu {
     usr_r8_r12: [u32; 5],
     /// Copia de `r8`–`r12` exclusiva del modo **FIQ**.
     fiq_r8_r12: [u32; 5],
+
+    /// Ciclos totales ejecutados desde el reset (Mini-Hito 2.2c).
+    cycles: u64,
+    /// Dirección desde la que el próximo fetch sería **secuencial** (S). Si el
+    /// fetch coincide, el acceso es S; si no, es N (no secuencial). `None` tras
+    /// un reset o un salto, donde el primer fetch es siempre N.
+    seq_fetch_addr: Option<u32>,
 }
 
 /// Resultado de ejecutar **un paso** de la CPU ([`Cpu::step`]).
@@ -354,6 +361,8 @@ pub struct RunReport {
     /// Instrucciones ejecutadas antes de parar (sin contar la que provocó la
     /// parada, que no llega a ejecutarse).
     pub steps: u64,
+    /// Ciclos consumidos durante esta corrida (Mini-Hito 2.2c).
+    pub cycles: u64,
     /// Por qué se detuvo la corrida.
     pub stop: RunStop,
 }
@@ -393,6 +402,8 @@ impl Cpu {
             spsr: [0; NUM_BANKS],
             usr_r8_r12: [0; 5],
             fiq_r8_r12: [0; 5],
+            cycles: 0,
+            seq_fetch_addr: None,
         }
     }
 
@@ -609,15 +620,29 @@ impl Cpu {
     /// operando inmediato. Ante cualquier otra instrucción la CPU se detiene
     /// limpiamente con [`StepResult::Halted`], **sin** avanzar el `PC` (queda
     /// apuntando a la instrucción culpable para poder inspeccionarla).
+    /// Ciclos totales que la CPU ha ejecutado desde el reset (Mini-Hito 2.2c).
+    pub fn cycles(&self) -> u64 {
+        self.cycles
+    }
+
     pub fn step(&mut self, bus: &Bus) -> StepResult {
         let pc = self.pc();
         let instr = self.fetch(bus);
+
+        // Coste del fetch del opcode (32 bits en ARM): N o S según haya sido
+        // secuencial respecto al fetch anterior (Mini-Hito 2.2c). Las
+        // instrucciones que hoy se ejecutan (NOP y data-processing inmediato)
+        // cuestan exactamente ese fetch; las que se implementen luego (saltos,
+        // cargas...) sumarán sus accesos adicionales encima.
+        let seq = self.seq_fetch_addr == Some(pc);
+        let fetch_cycles = bus.access_cycles(pc, AccessWidth::Word, seq) as u64;
 
         match self.decode_arm(instr) {
             // Condición no cumplida: la instrucción es un NOP de un ciclo. Lo
             // único que hace es dejar pasar el tiempo, así que solo avanzamos.
             Decoded::ConditionFailed(_) => {
                 self.advance_pc();
+                self.account_step(fetch_cycles);
                 StepResult::Stepped
             }
             Decoded::Execute(kind) => {
@@ -625,6 +650,7 @@ impl Cpu {
                     // Las instrucciones soportadas hoy nunca escriben el `PC`, así
                     // que tras ejecutarlas se pasa a la siguiente.
                     self.advance_pc();
+                    self.account_step(fetch_cycles);
                     StepResult::Stepped
                 } else if is_branch_to_self(kind, instr, pc) {
                     // Un «b .» (salto a su propia dirección) es un bucle infinito
@@ -638,6 +664,13 @@ impl Cpu {
         }
     }
 
+    /// Contabiliza un paso ejecutado: suma sus `cycles` al total y anota desde
+    /// dónde sería secuencial el siguiente fetch (para distinguir accesos S de N).
+    fn account_step(&mut self, cycles: u64) {
+        self.cycles += cycles;
+        self.seq_fetch_addr = Some(self.pc());
+    }
+
     /// Ejecuta pasos en bucle hasta que la CPU se detiene ([`StepResult::Halted`])
     /// o hasta completar `max_steps` instrucciones (Mini-Hito 2.2a).
     ///
@@ -645,6 +678,7 @@ impl Cpu {
     /// por implementar, una secuencia de NOPs (p. ej. memoria a cero) avanzaría
     /// el `PC` indefinidamente; sin un límite, el bucle no terminaría nunca.
     pub fn run(&mut self, bus: &Bus, max_steps: u64) -> RunReport {
+        let cycles_start = self.cycles;
         let mut steps = 0;
         while steps < max_steps {
             match self.step(bus) {
@@ -652,6 +686,7 @@ impl Cpu {
                 StepResult::Halted(halt) => {
                     return RunReport {
                         steps,
+                        cycles: self.cycles - cycles_start,
                         stop: RunStop::Halted(halt),
                     };
                 }
@@ -659,6 +694,7 @@ impl Cpu {
         }
         RunReport {
             steps,
+            cycles: self.cycles - cycles_start,
             stop: RunStop::StepLimit,
         }
     }
@@ -1198,6 +1234,63 @@ mod tests {
         assert!(matches!(
             cpu.step(&bus),
             StepResult::Halted(Halt::Unimplemented { .. })
+        ));
+    }
+
+    #[test]
+    fn el_contador_de_ciclos_suma_cada_fetch() {
+        // Tres MOV inmediatos en IWRAM (bus de 32 bits, 0 waits → 1 ciclo/fetch).
+        let mut bus = Bus::new(vec![0u8; 4]);
+        for i in 0..3u32 {
+            bus.write_u32(crate::bus::IWRAM_START + i * 4, 0xE3A0_0000 | i);
+        }
+        let mut cpu = Cpu::new();
+        cpu.set_pc(crate::bus::IWRAM_START);
+        assert_eq!(cpu.cycles(), 0);
+
+        for _ in 0..3 {
+            assert_eq!(cpu.step(&bus), StepResult::Stepped);
+        }
+        // 3 instrucciones × 1 ciclo (IWRAM no distingue N de S: ambos cuestan 1).
+        assert_eq!(cpu.cycles(), 3);
+    }
+
+    #[test]
+    fn los_ciclos_dependen_de_la_region() {
+        // El mismo MOV cuesta más desde EWRAM (bus de 16 bits + 2 waits → un fetch
+        // de 32 bits son 2 sub-accesos = 6 ciclos) que desde IWRAM (1 ciclo).
+        let mut bus = Bus::new(vec![0u8; 4]);
+        bus.write_u32(crate::bus::IWRAM_START, 0xE3A0_0000);
+        bus.write_u32(crate::bus::EWRAM_START, 0xE3A0_0000);
+
+        let mut en_iwram = Cpu::new();
+        en_iwram.set_pc(crate::bus::IWRAM_START);
+        en_iwram.step(&bus);
+        assert_eq!(en_iwram.cycles(), 1);
+
+        let mut en_ewram = Cpu::new();
+        en_ewram.set_pc(crate::bus::EWRAM_START);
+        en_ewram.step(&bus);
+        assert_eq!(en_ewram.cycles(), 6);
+    }
+
+    #[test]
+    fn run_reporta_los_ciclos_consumidos() {
+        // Dos MOV en IWRAM y una tercera no implementada: `run` cuenta solo los
+        // ciclos de los dos pasos ejecutados (2 × 1 = 2).
+        let mut bus = Bus::new(vec![0u8; 4]);
+        bus.write_u32(crate::bus::IWRAM_START, 0xE3A0_0000); // MOV r0, #0
+        bus.write_u32(crate::bus::IWRAM_START + 4, 0xE3A0_1001); // MOV r1, #1
+        bus.write_u32(crate::bus::IWRAM_START + 8, 0xE1A0_0001); // MOV r0, r1 (reg): no impl.
+        let mut cpu = Cpu::new();
+        cpu.set_pc(crate::bus::IWRAM_START);
+
+        let report = cpu.run(&bus, 100);
+        assert_eq!(report.steps, 2);
+        assert_eq!(report.cycles, 2);
+        assert!(matches!(
+            report.stop,
+            RunStop::Halted(Halt::Unimplemented { .. })
         ));
     }
 }

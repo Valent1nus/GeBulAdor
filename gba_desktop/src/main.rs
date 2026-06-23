@@ -93,7 +93,10 @@ fn main() {
                 // implementada (o hasta un tope de seguridad contra bucles).
                 println!("  ── Ejecutando (Mini-Hito 2.2a) ──");
                 let report = gba.run(1_000_000);
-                println!("  Instrucciones ejecutadas: {}", report.steps);
+                println!(
+                    "  Instrucciones ejecutadas: {} ({} ciclos)",
+                    report.steps, report.cycles
+                );
                 match report.stop {
                     RunStop::Halted(Halt::Unimplemented { pc, instr, kind }) => println!(
                         "  Detenida en {pc:#010X}: {instr:#010X} → {kind} (aún sin implementar)."
@@ -151,7 +154,10 @@ fn run_test_rom(path: &Path) {
     const MAX_STEPS: u64 = 50_000_000;
     let mut gba = Gba::with_cartridge(cart);
     let report = gba.run(MAX_STEPS);
-    println!("Instrucciones ejecutadas: {}", report.steps);
+    println!(
+        "Instrucciones ejecutadas: {} ({} ciclos)",
+        report.steps, report.cycles
+    );
 
     match report.stop {
         // Fin natural del test: r12 lleva el veredicto.

@@ -77,6 +77,18 @@ pub const VRAM_SIZE: usize = 96 * 1024;
 /// Tamaño de la OAM: 1 KiB.
 pub const OAM_SIZE: usize = 1024;
 
+/// Anchura de un acceso a memoria: byte (8), media palabra (16) o palabra (32).
+/// La usa [`Bus::access_cycles`] para el conteo de ciclos del Mini-Hito 2.2c.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessWidth {
+    /// 8 bits.
+    Byte,
+    /// 16 bits.
+    Half,
+    /// 32 bits.
+    Word,
+}
+
 /// El bus de memoria con todas las regiones direccionables.
 ///
 /// Cada región es un `Vec<u8>` de su tamaño real. La ROM es la única de tamaño
@@ -215,6 +227,27 @@ impl Bus {
         self.write_u8(aligned + 2, (value >> 16) as u8);
         self.write_u8(aligned + 3, (value >> 24) as u8);
     }
+
+    // ---- Temporización (Mini-Hito 2.2c) ---------------------------------
+
+    /// Ciclos que cuesta un **acceso a memoria** a `addr` con la anchura `width`,
+    /// secuencial (`seq` = acceso *S*) o no (acceso *N*). Es la base del conteo
+    /// de ciclos: cada región tiene su ancho de bus y sus *waitstates*, y un
+    /// acceso de 32 bits a una región de bus de 16 bits cuesta dos sub-accesos
+    /// (el segundo siempre secuencial).
+    ///
+    /// Los tiempos de las regiones fijas (BIOS, IWRAM, I/O, OAM, PRAM, VRAM,
+    /// EWRAM) son los del hardware; los de la ROM son **provisionales** (asumen
+    /// los waitstates por defecto, ya que `WAITCNT` aún no se emula).
+    pub fn access_cycles(&self, addr: u32, width: AccessWidth, seq: bool) -> u32 {
+        let t = region_timing(addr);
+        let first = 1 + if seq { t.wait_s } else { t.wait_n };
+        if width == AccessWidth::Word && t.bus16 {
+            first + (1 + t.wait_s)
+        } else {
+            first
+        }
+    }
 }
 
 /// Traduce una dirección de la franja VRAM (`0x06xx_xxxx`) a un offset dentro de
@@ -243,6 +276,35 @@ fn read_at(buf: &[u8], offset: usize) -> u8 {
 fn write_at(buf: &mut [u8], offset: usize, value: u8) {
     if let Some(slot) = buf.get_mut(offset) {
         *slot = value;
+    }
+}
+
+/// Parámetros de temporización de una región: ancho de bus y *waitstates* para
+/// accesos N (no secuencial) y S (secuencial).
+struct RegionTiming {
+    /// `true` si la región usa un bus de 16 bits (un acceso de 32 bits cuesta dos
+    /// sub-accesos); `false` si es de 32 bits.
+    bus16: bool,
+    /// Waitstates de un acceso no secuencial (N).
+    wait_n: u32,
+    /// Waitstates de un acceso secuencial (S).
+    wait_s: u32,
+}
+
+/// Temporización de la región que contiene `addr` (Mini-Hito 2.2c).
+fn region_timing(addr: u32) -> RegionTiming {
+    match addr >> 24 {
+        // BIOS, IWRAM, I/O, OAM: bus de 32 bits sin waitstates → 1 ciclo.
+        0x00 | 0x03 | 0x04 | 0x07 => RegionTiming { bus16: false, wait_n: 0, wait_s: 0 },
+        // PRAM y VRAM: bus de 16 bits sin waitstates.
+        0x05 | 0x06 => RegionTiming { bus16: true, wait_n: 0, wait_s: 0 },
+        // EWRAM: bus de 16 bits con 2 waitstates.
+        0x02 => RegionTiming { bus16: true, wait_n: 2, wait_s: 2 },
+        // ROM del cartucho: bus de 16 bits; waitstates por defecto (WS0 = 4 para
+        // N, 2 para S). PROVISIONAL hasta emular `WAITCNT`.
+        0x08..=0x0D => RegionTiming { bus16: true, wait_n: 4, wait_s: 2 },
+        // Resto (huecos, SRAM aún sin timing propio): 1 ciclo, conservador.
+        _ => RegionTiming { bus16: false, wait_n: 0, wait_s: 0 },
     }
 }
 
@@ -364,5 +426,25 @@ mod tests {
         let mut bus = bus_de_prueba();
         bus.write_u32(IWRAM_START, 0x1122_3344);
         assert_eq!(bus.read_u32(IWRAM_START), 0x1122_3344);
+    }
+
+    #[test]
+    fn ciclos_de_acceso_por_region() {
+        use AccessWidth::*;
+        let bus = bus_de_prueba();
+        // IWRAM: bus de 32 bits, 0 waits → 1 ciclo (S o N, 16 o 32 bits).
+        assert_eq!(bus.access_cycles(IWRAM_START, Word, true), 1);
+        assert_eq!(bus.access_cycles(IWRAM_START, Word, false), 1);
+        // VRAM: bus de 16 bits → 32 bits = 2 sub-accesos; 16 bits = 1.
+        assert_eq!(bus.access_cycles(VRAM_START, Word, true), 2);
+        assert_eq!(bus.access_cycles(VRAM_START, Half, true), 1);
+        // EWRAM: bus de 16 bits, 2 waits → 16b = 3, 32b = 6.
+        assert_eq!(bus.access_cycles(EWRAM_START, Half, true), 3);
+        assert_eq!(bus.access_cycles(EWRAM_START, Word, true), 6);
+        // ROM (WS0 por defecto, provisional): N y S distintos.
+        assert_eq!(bus.access_cycles(ROM_START, Half, false), 5); // 1 + 4 (N)
+        assert_eq!(bus.access_cycles(ROM_START, Half, true), 3); //  1 + 2 (S)
+        assert_eq!(bus.access_cycles(ROM_START, Word, false), 8); // 5 (N) + 3 (S)
+        assert_eq!(bus.access_cycles(ROM_START, Word, true), 6); //  3 (S) + 3 (S)
     }
 }
