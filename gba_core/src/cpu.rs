@@ -39,7 +39,7 @@
 //! **cambiar de modo** (algo poco frecuente) hacemos el intercambio de bancos en
 //! [`Cpu::set_mode`].
 
-use crate::arm::{self, Decoded};
+use crate::arm::{self, ArmInstruction, Decoded};
 use crate::bus::Bus;
 use crate::thumb::ThumbInstruction;
 
@@ -312,6 +312,51 @@ pub struct Cpu {
     fiq_r8_r12: [u32; 5],
 }
 
+/// Resultado de ejecutar **un paso** de la CPU ([`Cpu::step`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepResult {
+    /// Se procesó una instrucción (o un NOP por condición fallida); el bucle
+    /// puede continuar.
+    Stepped,
+    /// La CPU se detuvo; el bucle debe terminar. Lleva el motivo.
+    Halted(Halt),
+}
+
+/// Motivo por el que la CPU detiene el bucle de ejecución.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Halt {
+    /// Se alcanzó una instrucción cuya ejecución aún no está implementada. Se
+    /// guarda dónde está, sus bits y su categoría decodificada, para saber qué
+    /// falta por implementar.
+    Unimplemented {
+        /// `PC` (crudo) de la instrucción no implementada.
+        pc: u32,
+        /// Sus 32 bits tal cual se leyeron del bus.
+        instr: u32,
+        /// La categoría ARM en la que se clasificó.
+        kind: ArmInstruction,
+    },
+}
+
+/// Informe de una corrida en bucle ([`Cpu::run`] / [`crate::Gba::run`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunReport {
+    /// Instrucciones ejecutadas antes de parar (sin contar la que provocó la
+    /// parada, que no llega a ejecutarse).
+    pub steps: u64,
+    /// Por qué se detuvo la corrida.
+    pub stop: RunStop,
+}
+
+/// Cómo terminó una corrida de [`Cpu::run`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunStop {
+    /// La CPU se detuvo por sí sola (instrucción no implementada).
+    Halted(Halt),
+    /// Se alcanzó el tope de pasos sin que la CPU se detuviera.
+    StepLimit,
+}
+
 impl Cpu {
     /// Crea una CPU en su estado de **reset** del ARM7TDMI: modo Supervisor,
     /// estado ARM, IRQ y FIQ deshabilitadas, y todos los registros a cero.
@@ -524,6 +569,108 @@ impl Cpu {
         // Las comparaciones (TST/TEQ/CMP/CMN, opcodes 0x8..=0xB) no escriben Rd.
         if !matches!(opcode, 0x8..=0xB) {
             self.set_reg(rd, result);
+        }
+    }
+
+    // ===== Bucle de ejecución (Mini-Hito 2.2a) ==============================
+
+    /// El tamaño en bytes de la instrucción actual según el estado: 4 en ARM, 2
+    /// en THUMB. Es cuánto avanza el `PC` hacia la siguiente instrucción.
+    pub fn instruction_size(&self) -> u32 {
+        if self.cpsr.thumb() {
+            2
+        } else {
+            4
+        }
+    }
+
+    /// Avanza el `PC` a la siguiente instrucción. Lo usa [`Cpu::step`] tras una
+    /// instrucción que **no** sea un salto (los saltos fijan el `PC` ellos
+    /// mismos). Opera sobre el `PC` crudo ([`Cpu::pc`]).
+    fn advance_pc(&mut self) {
+        self.set_pc(self.pc().wrapping_add(self.instruction_size()));
+    }
+
+    /// Ejecuta **un paso**: fetch → decode → execute de una sola instrucción,
+    /// avanzando el `PC` si procede (Mini-Hito 2.2a).
+    ///
+    /// Hoy solo se decodifica/ejecuta el set **ARM** (el fetch THUMB de 2 bytes
+    /// llega en el 2.3a) y, dentro de ARM, solo el procesamiento de datos con
+    /// operando inmediato. Ante cualquier otra instrucción la CPU se detiene
+    /// limpiamente con [`StepResult::Halted`], **sin** avanzar el `PC` (queda
+    /// apuntando a la instrucción culpable para poder inspeccionarla).
+    pub fn step(&mut self, bus: &Bus) -> StepResult {
+        let pc = self.pc();
+        let instr = self.fetch(bus);
+
+        match self.decode_arm(instr) {
+            // Condición no cumplida: la instrucción es un NOP de un ciclo. Lo
+            // único que hace es dejar pasar el tiempo, así que solo avanzamos.
+            Decoded::ConditionFailed(_) => {
+                self.advance_pc();
+                StepResult::Stepped
+            }
+            Decoded::Execute(kind) => {
+                if self.try_execute_arm(kind, instr) {
+                    // Las instrucciones soportadas hoy nunca escriben el `PC`, así
+                    // que tras ejecutarlas se pasa a la siguiente.
+                    self.advance_pc();
+                    StepResult::Stepped
+                } else {
+                    StepResult::Halted(Halt::Unimplemented { pc, instr, kind })
+                }
+            }
+        }
+    }
+
+    /// Ejecuta pasos en bucle hasta que la CPU se detiene ([`StepResult::Halted`])
+    /// o hasta completar `max_steps` instrucciones (Mini-Hito 2.2a).
+    ///
+    /// El tope `max_steps` es una **salvaguarda**: mientras falten instrucciones
+    /// por implementar, una secuencia de NOPs (p. ej. memoria a cero) avanzaría
+    /// el `PC` indefinidamente; sin un límite, el bucle no terminaría nunca.
+    pub fn run(&mut self, bus: &Bus, max_steps: u64) -> RunReport {
+        let mut steps = 0;
+        while steps < max_steps {
+            match self.step(bus) {
+                StepResult::Stepped => steps += 1,
+                StepResult::Halted(halt) => {
+                    return RunReport {
+                        steps,
+                        stop: RunStop::Halted(halt),
+                    };
+                }
+            }
+        }
+        RunReport {
+            steps,
+            stop: RunStop::StepLimit,
+        }
+    }
+
+    /// Intenta ejecutar la instrucción ARM `kind` (bits crudos en `instr`),
+    /// asumiendo que su condición ya pasó. Devuelve `true` si la ejecutó, o
+    /// `false` si esa instrucción —o esa variante— aún no está implementada (lo
+    /// que hará que [`Cpu::step`] detenga el bucle).
+    ///
+    /// A medida que se implementen instrucciones, este `match` ganará ramas.
+    fn try_execute_arm(&mut self, kind: ArmInstruction, instr: u32) -> bool {
+        match kind {
+            ArmInstruction::DataProcessing => {
+                // Solo la forma con operando inmediato (bit 25) y destino distinto
+                // de `r15`. La forma con registro desplazado (barrel shifter) y
+                // escribir el `PC` (un salto) llegan más adelante; hasta entonces
+                // se tratan como no implementadas en vez de ejecutarse a medias.
+                let is_immediate = (instr & (1 << 25)) != 0;
+                let rd = (instr >> 12) & 0xF;
+                if is_immediate && rd != PC as u32 {
+                    self.execute_data_processing(instr);
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
         }
     }
 
@@ -818,7 +965,7 @@ mod tests {
 
     #[test]
     fn decode_arm_usa_el_cpsr_para_la_condicion() {
-        use crate::arm::{ArmInstruction, Condition};
+        use crate::arm::Condition;
 
         let mut cpu = Cpu::new();
         // "BEQ": salta solo si Z = 1. Con Z = 0 (reset) se descarta como NOP.
@@ -914,5 +1061,75 @@ mod tests {
         cpu.cpsr_mut().set_c(true);
         cpu.execute_data_processing(0xE2A0_0000);
         assert_eq!(cpu.reg(0), 1);
+    }
+
+    #[test]
+    fn el_paso_trata_la_condicion_fallida_como_nop() {
+        // BEQ con Z = 0 (reset): la condición falla → NOP de un ciclo que solo
+        // avanza el PC, sin detener el bucle.
+        let mut rom = vec![0u8; 8];
+        rom[0..4].copy_from_slice(&0x0A00_0000u32.to_le_bytes()); // 0000 = EQ
+        let bus = Bus::new(rom);
+        let mut cpu = Cpu::new();
+        cpu.set_pc(crate::bus::ROM_START);
+
+        assert_eq!(cpu.step(&bus), StepResult::Stepped);
+        assert_eq!(cpu.pc(), crate::bus::ROM_START + 4, "el NOP avanza una instrucción");
+    }
+
+    #[test]
+    fn el_bucle_ejecuta_hasta_una_no_implementada() {
+        use crate::arm::ArmInstruction;
+        // MOV r0,#5 ; ADD r0,r0,#1 ; B (salto, aún sin ejecutar).
+        let programa = [0xE3A0_0005u32, 0xE280_0001, 0xEA00_0000];
+        let mut rom = vec![0u8; programa.len() * 4];
+        for (i, w) in programa.iter().enumerate() {
+            rom[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        let bus = Bus::new(rom);
+        let mut cpu = Cpu::new();
+        cpu.set_pc(crate::bus::ROM_START);
+
+        assert_eq!(cpu.step(&bus), StepResult::Stepped);
+        assert_eq!(cpu.reg(0), 5); // MOV r0, #5
+        assert_eq!(cpu.step(&bus), StepResult::Stepped);
+        assert_eq!(cpu.reg(0), 6); // ADD r0, r0, #1
+
+        // La tercera es un salto: no implementado → la CPU se detiene en él.
+        let pc_culpable = cpu.pc();
+        match cpu.step(&bus) {
+            StepResult::Halted(Halt::Unimplemented { pc, instr, kind }) => {
+                assert_eq!(pc, crate::bus::ROM_START + 8);
+                assert_eq!(instr, 0xEA00_0000);
+                assert_eq!(kind, ArmInstruction::Branch { link: false });
+            }
+            otro => panic!("esperaba Halted, fue {otro:?}"),
+        }
+        // El PC NO avanzó: sigue apuntando a la instrucción no implementada.
+        assert_eq!(cpu.pc(), pc_culpable);
+    }
+
+    #[test]
+    fn data_processing_con_registro_aun_no_se_ejecuta() {
+        // MOV r0, r1 (forma con registro, bit 25 = 0): 0xE1A00001. Todavía no
+        // implementada → el paso se detiene en vez de "ejecutar" en silencio.
+        let mut rom = vec![0u8; 8];
+        rom[0..4].copy_from_slice(&0xE1A0_0001u32.to_le_bytes());
+        let bus = Bus::new(rom);
+        let mut cpu = Cpu::new();
+        cpu.set_pc(crate::bus::ROM_START);
+        assert!(matches!(cpu.step(&bus), StepResult::Halted(_)));
+    }
+
+    #[test]
+    fn run_para_al_alcanzar_el_tope_de_pasos() {
+        // ROM de ceros: 0x00000000 es cond EQ (falla en reset) → NOP infinito.
+        // El tope debe cortar el bucle en seco.
+        let bus = Bus::new(vec![0u8; 64]);
+        let mut cpu = Cpu::new();
+        cpu.set_pc(crate::bus::ROM_START);
+        let report = cpu.run(&bus, 10);
+        assert_eq!(report.steps, 10);
+        assert_eq!(report.stop, RunStop::StepLimit);
     }
 }

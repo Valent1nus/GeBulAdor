@@ -9,7 +9,7 @@
 //! sustituir el frontend de escritorio por uno de Android, iOS o WASM sin tocar
 //! una sola línea del núcleo.
 //!
-//! ## Estado actual (Fase 2.1e)
+//! ## Estado actual (Fase 2.2a)
 //!
 //! Además de cargar y validar el cartucho (Fase 1), el núcleo tiene el
 //! esqueleto del hardware: la CPU ARM7TDMI ([`Cpu`]) con sus registros y modos,
@@ -24,8 +24,13 @@
 //! (procesamiento de datos con operando inmediato), alterando registros y flags.
 //! Y el **pipeline de 3 etapas** (Mini-Hito 2.1e) ya está modelado: leer `r15`
 //! devuelve el `PC` adelantado (+8 en ARM, +4 en THUMB), como el hardware real.
-//! Falta el bucle que encadene fetch→decode→execute (Mini-Hito 2.2a). La
-//! frontera con el frontend —entregar un buffer RGBA— no cambiará.
+//! Sobre todo eso, el **bucle de ejecución** (Mini-Hito 2.2a) ya encadena
+//! fetch→decode→execute paso a paso ([`Gba::run`] / [`Gba::step`]): avanza el
+//! `PC` y se detiene limpiamente al llegar a una instrucción todavía no
+//! implementada. Como por ahora solo se ejecuta el procesamiento de datos
+//! inmediato, una ROM real se detiene en su primer salto; implementar más
+//! instrucciones y el conteo de ciclos (2.2c) es lo que sigue. La frontera con
+//! el frontend —entregar un buffer RGBA— no cambia.
 
 pub mod arm;
 pub mod bus;
@@ -37,7 +42,7 @@ pub mod thumb;
 pub use arm::{ArmInstruction, Condition, Decoded};
 pub use bus::Bus;
 pub use cartridge::{Cartridge, CartridgeError, MAX_ROM_SIZE, MIN_ROM_SIZE};
-pub use cpu::{Cpu, CpuMode, Cpsr};
+pub use cpu::{Cpu, CpuMode, Cpsr, Halt, RunReport, RunStop, StepResult};
 pub use header::Header;
 pub use thumb::ThumbInstruction;
 
@@ -131,6 +136,21 @@ impl Gba {
     /// No ejecuta nada todavía. Fachada del frontend sobre [`Cpu::decode_thumb`].
     pub fn decode_thumb(&self, instr: u16) -> ThumbInstruction {
         self.cpu.decode_thumb(instr)
+    }
+
+    /// **Bucle de ejecución** (Mini-Hito 2.2a): corre la CPU encadenando
+    /// fetch→decode→execute hasta que se detiene —al toparse con una instrucción
+    /// aún no implementada— o hasta ejecutar `max_steps` (salvaguarda contra
+    /// bucles infinitos mientras faltan instrucciones por implementar). Delega en
+    /// [`Cpu::run`] prestándole el bus.
+    pub fn run(&mut self, max_steps: u64) -> RunReport {
+        self.cpu.run(&self.bus, max_steps)
+    }
+
+    /// Ejecuta una sola instrucción: un paso del bucle de [`Gba::run`]. Útil para
+    /// un frontend que en el futuro quiera intercalar ejecución y pintado.
+    pub fn step(&mut self) -> StepResult {
+        self.cpu.step(&self.bus)
     }
 
     /// El Program Counter actual (`r15`).
@@ -235,5 +255,25 @@ mod tests {
             gba.decode_thumb(0x2005),
             ThumbInstruction::MoveCompareAddSubImm
         );
+    }
+
+    #[test]
+    fn run_ejecuta_la_rom_hasta_un_salto() {
+        // MOV r0,#1 ; MOV r1,#2 ; B (no implementado): el bucle ejecuta los dos
+        // MOV y se detiene limpiamente en el salto.
+        let programa = [0xE3A0_0001u32, 0xE3A0_1002, 0xEA00_0000];
+        let mut rom = vec![0u8; MIN_ROM_SIZE];
+        for (i, w) in programa.iter().enumerate() {
+            rom[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        let cart = Cartridge::from_bytes(rom).unwrap();
+        let mut gba = Gba::with_cartridge(cart);
+
+        let report = gba.run(1_000);
+        assert_eq!(report.steps, 2, "dos MOV antes del salto");
+        assert!(matches!(
+            report.stop,
+            RunStop::Halted(Halt::Unimplemented { .. })
+        ));
     }
 }

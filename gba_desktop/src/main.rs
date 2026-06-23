@@ -11,7 +11,9 @@
 
 use std::path::Path;
 
-use gba_core::{Cartridge, Cpu, Decoded, Gba, MAX_ROM_SIZE, SCREEN_HEIGHT, SCREEN_WIDTH};
+use gba_core::{
+    Cartridge, Cpu, Decoded, Gba, Halt, RunStop, MAX_ROM_SIZE, SCREEN_HEIGHT, SCREEN_WIDTH,
+};
 use minifb::{Key, Scale, Window, WindowOptions};
 
 fn main() {
@@ -32,7 +34,7 @@ fn main() {
                 // Mini-Hitos 2.1b/2.1c — Fetch + Decode: montamos la consola con
                 // el cartucho (lo que coloca el PC en la ROM), leemos la primera
                 // instrucción y la clasificamos (sin ejecutar su lógica todavía).
-                let gba = Gba::with_cartridge(cart);
+                let mut gba = Gba::with_cartridge(cart);
                 let instr = gba.fetch();
                 println!(
                     "  Primera instrucción ARM @ {:#010X}: {:#010X}",
@@ -72,6 +74,21 @@ fn main() {
                     demo_pc.reg(15),
                     demo_pc.reg(15) - demo_pc.pc()
                 );
+
+                // Mini-Hito 2.2a — Bucle de ejecución: corremos la CPU sobre la
+                // ROM real hasta que se atasca en una instrucción aún no
+                // implementada (o hasta un tope de seguridad contra bucles).
+                println!("  ── Ejecutando (Mini-Hito 2.2a) ──");
+                let report = gba.run(1_000_000);
+                println!("  Instrucciones ejecutadas: {}", report.steps);
+                match report.stop {
+                    RunStop::Halted(Halt::Unimplemented { pc, instr, kind }) => println!(
+                        "  Detenida en {pc:#010X}: {instr:#010X} → {kind} (aún sin implementar)."
+                    ),
+                    RunStop::StepLimit => {
+                        println!("  Tope de pasos alcanzado sin detenerse (¿bucle?).")
+                    }
+                }
 
                 gba
             }
@@ -139,7 +156,7 @@ fn run_window(gba: Gba) {
     let mut buffer: Vec<u32> = vec![0; SCREEN_WIDTH * SCREEN_HEIGHT];
 
     let mut window = Window::new(
-        "EmulaRUST — GBA (Fase 2.1e · ESC para salir)",
+        "EmulaRUST — GBA (Fase 2.2a · ESC para salir)",
         SCREEN_WIDTH,
         SCREEN_HEIGHT,
         WindowOptions {
