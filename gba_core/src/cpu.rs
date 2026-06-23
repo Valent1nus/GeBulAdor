@@ -1,13 +1,21 @@
 //! La CPU **ARM7TDMI** de la Game Boy Advance: registros, estado y modos.
 //!
-//! Este módulo solo construye el *esqueleto* donde más adelante vivirá la
-//! ejecución de instrucciones (Mini-Hitos 2.1b en adelante). De momento modela:
+//! Este módulo modela el estado de la CPU y, sobre él, el ciclo
+//! Fetch→Decode→Execute tal como está implementado hasta el Mini-Hito 2.1e. De
+//! momento cubre:
 //!
 //! - Los **16 registros visibles** `r0`–`r15` (`r13` = SP, `r14` = LR,
 //!   `r15` = PC).
 //! - El registro de estado **CPSR** (flags de condición + bits de control).
 //! - Los **modos de operación** del procesador y, lo más importante, el
 //!   *banking* de registros entre modos.
+//! - El **Fetch** ([`Cpu::fetch`]), el **Decode** de ARM ([`Cpu::decode_arm`]) y
+//!   THUMB ([`Cpu::decode_thumb`]), y el inicio del **Execute**
+//!   ([`Cpu::execute_data_processing`]: la primera familia de instrucciones, el
+//!   procesamiento de datos con operando inmediato).
+//! - El **desfase del pipeline** de 3 etapas: al leer `r15`, una instrucción ve
+//!   el `PC` adelantado (+8 en ARM, +4 en THUMB), ver [`Cpu::reg`] y
+//!   [`Cpu::pipeline_offset`].
 //!
 //! ## ⚠️ Por qué tanto cuidado con los registros "banked"
 //!
@@ -44,6 +52,15 @@ pub const SP: usize = 13;
 pub const LR: usize = 14;
 /// Índice del *Program Counter* (`r15`).
 pub const PC: usize = 15;
+
+/// Desfase del `PC` por el **pipeline de 3 etapas** en estado **ARM**: una
+/// instrucción que lee `r15` ve su dirección + 8, porque el fetch va dos
+/// instrucciones de 4 bytes por delante (Mini-Hito 2.1e).
+pub const PC_AHEAD_ARM: u32 = 8;
+
+/// Desfase del `PC` por el pipeline en estado **THUMB**: + 4, dos instrucciones
+/// de 2 bytes por delante (Mini-Hito 2.1e).
+pub const PC_AHEAD_THUMB: u32 = 4;
 
 /// Número de "bancos" de registros distintos. Cada banco agrupa los modos que
 /// comparten el mismo `r13`/`r14`. User y System comparten banco, así que hay 6:
@@ -324,18 +341,27 @@ impl Cpu {
         }
     }
 
-    /// Lee un registro visible por índice (`0`–`15`).
+    /// Lee un registro visible por índice (`0`–`15`), **con la semántica de
+    /// pipeline para `r15`**.
     ///
     /// El índice siempre proviene de un campo de 4 bits de una instrucción ya
     /// decodificada, así que está garantizado en rango; el `debug_assert!` lo
     /// verifica en builds de depuración sin coste en release.
     ///
-    /// *(Nota para el futuro: en el Mini-Hito 2.1e, leer `r15` deberá devolver el
-    /// `PC` con el desfase del pipeline aplicado (+8 en ARM, +4 en THUMB). Por
-    /// ahora devolvemos el valor crudo.)*
+    /// **Pipeline de 3 etapas (Mini-Hito 2.1e):** leer `r15` como operando NO
+    /// devuelve la dirección de la instrucción en curso, sino la del fetch que va
+    /// por delante: `PC + 8` en ARM y `PC + 4` en THUMB (ver
+    /// [`Cpu::pipeline_offset`]). Cualquier instrucción que use `r15` para
+    /// calcular una dirección (saltos relativos, `LDR Rd, [PC, #imm]`...) asume
+    /// este desfase. El valor **crudo** (la dirección de fetch real, sin
+    /// adelantar) se obtiene con [`Cpu::pc`], que es lo que usa [`Cpu::fetch`].
     pub fn reg(&self, index: usize) -> u32 {
         debug_assert!(index < NUM_REGISTERS, "índice de registro fuera de rango: {index}");
-        self.r[index]
+        if index == PC {
+            self.r[PC].wrapping_add(self.pipeline_offset())
+        } else {
+            self.r[index]
+        }
     }
 
     /// Escribe un registro visible por índice (`0`–`15`).
@@ -344,7 +370,10 @@ impl Cpu {
         self.r[index] = value;
     }
 
-    /// El Program Counter (`r15`).
+    /// El Program Counter **crudo** (`r15` sin el desfase de pipeline): la
+    /// dirección de fetch real. Es lo que usa [`Cpu::fetch`]. Para el valor que
+    /// ve una instrucción al leer `r15` como operando (adelantado por el
+    /// pipeline) usa [`Cpu::reg`]`(PC)`.
     pub fn pc(&self) -> u32 {
         self.r[PC]
     }
@@ -361,13 +390,30 @@ impl Cpu {
         self.r[LR]
     }
 
+    /// El desfase que el **pipeline de 3 etapas** añade al `PC` visible según el
+    /// estado de ejecución actual: [`PC_AHEAD_ARM`] (8) en ARM y
+    /// [`PC_AHEAD_THUMB`] (4) en THUMB.
+    ///
+    /// El procesador no ejecuta una instrucción de forma aislada: mientras
+    /// ejecuta la de la dirección N, ya ha *fetcheado* la N+2. Por eso `r15`,
+    /// leído como operando, vale dos instrucciones por delante. Lo consulta
+    /// [`Cpu::reg`] al leer `r15`.
+    pub fn pipeline_offset(&self) -> u32 {
+        if self.cpsr.thumb() {
+            PC_AHEAD_THUMB
+        } else {
+            PC_AHEAD_ARM
+        }
+    }
+
     /// **Fetch**: lee la instrucción ARM (32 bits) a la que apunta el `PC`, en
     /// little-endian, a través del bus. Es la primera etapa del ciclo
     /// Fetch→Decode→Execute (Mini-Hito 2.1b).
     ///
-    /// No avanza ni modifica el `PC`: es una lectura pura. El avance del puntero
-    /// llega con el bucle de ejecución (2.2a) y el desfase de pipeline con el
-    /// 2.1e.
+    /// No avanza ni modifica el `PC`: es una lectura pura, y usa el `PC` **crudo**
+    /// ([`Cpu::pc`]), no el adelantado por el pipeline —el fetch lee justo la
+    /// instrucción a la que apunta `PC`—. El avance del puntero llega con el
+    /// bucle de ejecución (Mini-Hito 2.2a).
     ///
     /// De momento siempre lee 4 bytes (modo ARM). El Mini-Hito 2.3a añadirá la
     /// rama THUMB: leer 2 bytes cuando el bit `T` del CPSR esté activo.
@@ -610,9 +656,12 @@ mod tests {
         assert!(!cpu.cpsr().thumb(), "arranca en estado ARM, no THUMB");
         assert!(cpu.cpsr().irq_disabled());
         assert!(cpu.cpsr().fiq_disabled());
-        for i in 0..NUM_REGISTERS {
+        // r0..=r14 a cero. r15 también es 0 en crudo (`pc()`); `reg(PC)` no se
+        // comprueba aquí porque le añade el desfase de pipeline (+8 en ARM).
+        for i in 0..PC {
             assert_eq!(cpu.reg(i), 0);
         }
+        assert_eq!(cpu.pc(), 0);
     }
 
     #[test]
@@ -621,8 +670,54 @@ mod tests {
         cpu.set_reg(0, 0xDEAD_BEEF);
         cpu.set_pc(0x0800_0000);
         assert_eq!(cpu.reg(0), 0xDEAD_BEEF);
+        // `pc()` da el valor crudo; `reg(PC)` lo ve adelantado por el pipeline
+        // (+8 en ARM, el estado de reset). Ver `el_pipeline_adelanta_r15_en_arm`.
         assert_eq!(cpu.pc(), 0x0800_0000);
-        assert_eq!(cpu.reg(PC), 0x0800_0000);
+        assert_eq!(cpu.reg(PC), 0x0800_0008);
+    }
+
+    #[test]
+    fn el_pipeline_adelanta_r15_en_arm() {
+        // En estado ARM (el de reset), leer r15 como operando ve PC + 8.
+        let mut cpu = Cpu::new();
+        assert!(!cpu.cpsr().thumb());
+        cpu.set_pc(0x0800_0000);
+        assert_eq!(cpu.pipeline_offset(), PC_AHEAD_ARM);
+        assert_eq!(cpu.pc(), 0x0800_0000, "pc() no lleva desfase");
+        assert_eq!(cpu.reg(PC), 0x0800_0008, "reg(PC) va dos instrucciones por delante");
+    }
+
+    #[test]
+    fn el_pipeline_adelanta_r15_en_thumb() {
+        // En THUMB las instrucciones son de 2 bytes: el desfase es +4.
+        let mut cpu = Cpu::new();
+        cpu.cpsr_mut().set_thumb(true);
+        cpu.set_pc(0x0800_0000);
+        assert_eq!(cpu.pipeline_offset(), PC_AHEAD_THUMB);
+        assert_eq!(cpu.pc(), 0x0800_0000);
+        assert_eq!(cpu.reg(PC), 0x0800_0004);
+    }
+
+    #[test]
+    fn escribir_r15_guarda_el_valor_crudo() {
+        // Escribir r15 (p. ej. un salto) fija la dirección destino sin desfase;
+        // el desfase solo aparece al LEERlo de vuelta como operando.
+        let mut cpu = Cpu::new();
+        cpu.set_reg(PC, 0x0800_1000);
+        assert_eq!(cpu.pc(), 0x0800_1000);
+        assert_eq!(cpu.reg(PC), 0x0800_1008); // +8 ARM al releer
+    }
+
+    #[test]
+    fn los_demas_registros_no_llevan_desfase() {
+        // El desfase es exclusivo de r15; r0..=r14 se leen tal cual.
+        let mut cpu = Cpu::new();
+        for i in 0..PC {
+            cpu.set_reg(i, 0x1000 + i as u32);
+        }
+        for i in 0..PC {
+            assert_eq!(cpu.reg(i), 0x1000 + i as u32);
+        }
     }
 
     #[test]

@@ -61,6 +61,18 @@ fn main() {
                 demo.execute_data_processing(0xE3A0_0005);
                 println!("  Ejecución «MOV R0, #5» → R0 = {}", demo.reg(0));
 
+                // Mini-Hito 2.1e — Pipeline de 3 etapas: al leer r15, una
+                // instrucción ve el PC adelantado (+8 en ARM), no la dirección
+                // donde está. Lo mostramos sobre una CPU situada en 0x08000000.
+                let mut demo_pc = Cpu::new();
+                demo_pc.set_pc(0x0800_0000);
+                println!(
+                    "  Pipeline: PC real {:#010X} → r15 visible {:#010X} (+{} en ARM)",
+                    demo_pc.pc(),
+                    demo_pc.reg(15),
+                    demo_pc.reg(15) - demo_pc.pc()
+                );
+
                 gba
             }
             Err(e) => {
@@ -127,7 +139,7 @@ fn run_window(gba: Gba) {
     let mut buffer: Vec<u32> = vec![0; SCREEN_WIDTH * SCREEN_HEIGHT];
 
     let mut window = Window::new(
-        "EmulaRUST — GBA (Fase 2.1d · ESC para salir)",
+        "EmulaRUST — GBA (Fase 2.1e · ESC para salir)",
         SCREEN_WIDTH,
         SCREEN_HEIGHT,
         WindowOptions {

@@ -9,7 +9,7 @@
 //! sustituir el frontend de escritorio por uno de Android, iOS o WASM sin tocar
 //! una sola línea del núcleo.
 //!
-//! ## Estado actual (Fase 2.1d)
+//! ## Estado actual (Fase 2.1e)
 //!
 //! Además de cargar y validar el cartucho (Fase 1), el núcleo tiene el
 //! esqueleto del hardware: la CPU ARM7TDMI ([`Cpu`]) con sus registros y modos,
@@ -22,6 +22,8 @@
 //! un decoder separado). El **"Execute"** acaba de empezar:
 //! [`Cpu::execute_data_processing`] ejecuta la primera familia de instrucciones
 //! (procesamiento de datos con operando inmediato), alterando registros y flags.
+//! Y el **pipeline de 3 etapas** (Mini-Hito 2.1e) ya está modelado: leer `r15`
+//! devuelve el `PC` adelantado (+8 en ARM, +4 en THUMB), como el hardware real.
 //! Falta el bucle que encadene fetch→decode→execute (Mini-Hito 2.2a). La
 //! frontera con el frontend —entregar un buffer RGBA— no cambiará.
 
