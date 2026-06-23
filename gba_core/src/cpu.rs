@@ -1,7 +1,7 @@
 //! La CPU **ARM7TDMI** de la Game Boy Advance: registros, estado y modos.
 //!
 //! Este módulo modela el estado de la CPU y, sobre él, el ciclo
-//! Fetch→Decode→Execute tal como está implementado hasta el Mini-Hito 2.2f. De
+//! Fetch→Decode→Execute tal como está implementado hasta el Mini-Hito 2.2g. De
 //! momento cubre:
 //!
 //! - Los **16 registros visibles** `r0`–`r15` (`r13` = SP, `r14` = LR,
@@ -12,8 +12,9 @@
 //! - El **Fetch** ([`Cpu::fetch`]), el **Decode** de ARM ([`Cpu::decode_arm`]) y
 //!   THUMB ([`Cpu::decode_thumb`]), y el **Execute** del procesamiento de datos
 //!   completo ([`Cpu::execute_data_processing`]: operando inmediato y de registro
-//!   por el *barrel shifter*, incluido `Rd = r15`, Mini-Hito 2.2f) y de los
-//!   saltos `B`/`BL`/`BX` (Mini-Hito 2.2e).
+//!   por el *barrel shifter*, incluido `Rd = r15`, Mini-Hito 2.2f), de la
+//!   transferencia de PSR `MRS`/`MSR` ([`Cpu::execute_psr_transfer`], Mini-Hito
+//!   2.2g) y de los saltos `B`/`BL`/`BX` (Mini-Hito 2.2e).
 //! - El **desfase del pipeline** de 3 etapas: al leer `r15`, una instrucción ve
 //!   el `PC` adelantado (+8 en ARM, +4 en THUMB), ver [`Cpu::reg`] y
 //!   [`Cpu::pipeline_offset`].
@@ -62,6 +63,13 @@ pub const PC_AHEAD_ARM: u32 = 8;
 /// Desfase del `PC` por el pipeline en estado **THUMB**: + 4, dos instrucciones
 /// de 2 bytes por delante (Mini-Hito 2.1e).
 pub const PC_AHEAD_THUMB: u32 = 4;
+
+/// Bits **realmente implementados** de un PSR en el ARM7TDMI: los flags de
+/// condición `NZCV` (31-28) y el byte de control `I`/`F`/`T` + modo (7-0). Los
+/// bits 27-8 son reservados: se leen como 0 y `MSR` no puede escribirlos. Lo usa
+/// `MSR` (Mini-Hito 2.2g) para no dejar basura en bits que el hardware no tiene,
+/// de modo que un `MRS` posterior lea exactamente lo que leería la consola real.
+const PSR_VALID: u32 = 0xF000_00FF;
 
 /// Número de "bancos" de registros distintos. Cada banco agrupa los modos que
 /// comparten el mismo `r13`/`r14`. User y System comparten banco, así que hay 6:
@@ -700,6 +708,126 @@ impl Cpu {
         }
     }
 
+    // ===== Transferencia de PSR: MRS / MSR (Mini-Hito 2.2g) =================
+
+    /// Ejecuta una **transferencia con el registro de estado** (Mini-Hito 2.2g):
+    /// leer el `CPSR`/`SPSR` a un registro (`MRS`) o escribirlo desde un registro
+    /// o un inmediato (`MSR`).
+    ///
+    /// El bit 22 (`R`) elige entre `CPSR` (0) y `SPSR` (1); el bit 21 distingue
+    /// `MRS` (0) de `MSR` (1) —el decode ya garantizó que esto es PSR-transfer y
+    /// no un `BX` ni una comparación—. Ninguna de las dos salta: devuelven
+    /// [`Executed::Continue`] (cuestan 1S, ya contabilizado por el fetch).
+    pub fn execute_psr_transfer(&mut self, instr: u32) -> Executed {
+        let use_spsr = (instr & (1 << 22)) != 0;
+        let is_msr = (instr & (1 << 21)) != 0;
+        if is_msr {
+            self.execute_msr(instr, use_spsr);
+        } else {
+            self.execute_mrs(instr, use_spsr);
+        }
+        Executed::Continue { extra_cycles: 0 }
+    }
+
+    /// `MRS Rd, <PSR>`: copia el `CPSR` (o el `SPSR` del modo actual) a `Rd`.
+    ///
+    /// En User/System no existe `SPSR`; leerlo es impredecible en el hardware, así
+    /// que como salvaguarda devolvemos el `CPSR` en vez de un valor basura.
+    fn execute_mrs(&mut self, instr: u32, from_spsr: bool) {
+        let rd = ((instr >> 12) & 0xF) as usize;
+        let value = if from_spsr {
+            self.spsr().unwrap_or_else(|| self.cpsr.bits())
+        } else {
+            self.cpsr.bits()
+        };
+        self.set_reg(rd, value);
+    }
+
+    /// `MSR <PSR>_<campos>, Rm`/`#imm`: escribe el `CPSR`/`SPSR` respetando la
+    /// **máscara de campos** del encoding (bits 19-16, un bit por byte del PSR).
+    ///
+    /// El operando fuente es un registro `Rm` o un inmediato de 8 bits rotado
+    /// (bit 25 = 1), exactamente como en el procesamiento de datos. En modo
+    /// **User** solo se permiten los flags de condición: los bits de control
+    /// (modo, `I`, `F`, `T`) son de solo lectura ahí.
+    fn execute_msr(&mut self, instr: u32, to_spsr: bool) {
+        // Operando fuente: inmediato rotado (bit 25 = 1) o registro `Rm`.
+        let value = if (instr & (1 << 25)) != 0 {
+            let rotate = ((instr >> 8) & 0xF) * 2;
+            (instr & 0xFF).rotate_right(rotate)
+        } else {
+            self.reg((instr & 0xF) as usize)
+        };
+
+        // Máscara de campos (bits 19-16): cada bit habilita un byte del PSR.
+        let fields = (instr >> 16) & 0xF;
+        let mut mask = 0;
+        if fields & 0b0001 != 0 {
+            mask |= 0x0000_00FF; // c: byte de control (modo, I, F, T)
+        }
+        if fields & 0b0010 != 0 {
+            mask |= 0x0000_FF00; // x: extensión (reservado en ARMv4T)
+        }
+        if fields & 0b0100 != 0 {
+            mask |= 0x00FF_0000; // s: estado (reservado en ARMv4T)
+        }
+        if fields & 0b1000 != 0 {
+            mask |= 0xFF00_0000; // f: byte de flags (NZCV)
+        }
+        // Recorta a los bits que el ARM7TDMI implementa de verdad (el resto es
+        // reservado y no se puede escribir).
+        mask &= PSR_VALID;
+
+        if to_spsr {
+            self.write_spsr_masked(value, mask);
+        } else {
+            // En modo User solo se pueden cambiar los flags, nunca los de control.
+            let mask = if self.mode() == CpuMode::User {
+                mask & 0xF000_0000
+            } else {
+                mask
+            };
+            self.write_cpsr_masked(value, mask);
+        }
+    }
+
+    /// Escribe el `CPSR` aplicando `mask` sobre `value`. Si la escritura cambia
+    /// los **bits de modo**, el cambio se enruta por [`Cpu::set_mode`] para
+    /// intercambiar los bancos de `r13`/`r14` (y de `r8`–`r12` al cruzar FIQ);
+    /// hacerlo "a mano" dejaría los registros visibles incoherentes con el modo.
+    fn write_cpsr_masked(&mut self, value: u32, mask: u32) {
+        let old = self.cpsr.bits();
+        let new = (old & !mask) | (value & mask);
+        if (new ^ old) & Cpsr::MODE_MASK != 0 {
+            match CpuMode::from_bits(new as u8) {
+                // set_mode intercambia bancos y fija los bits de modo; después
+                // aplicamos el resto del PSR (flags, I/F/T).
+                Some(new_mode) => {
+                    self.set_mode(new_mode);
+                    self.cpsr = Cpsr::from_bits(new);
+                }
+                // Modo inválido (impredecible en hardware): conservamos el modo
+                // actual y aplicamos solo los demás bits, sin corromper los bancos.
+                None => {
+                    debug_assert!(false, "MSR escribió bits de modo inválidos");
+                    self.cpsr =
+                        Cpsr::from_bits((new & !Cpsr::MODE_MASK) | (old & Cpsr::MODE_MASK));
+                }
+            }
+        } else {
+            self.cpsr = Cpsr::from_bits(new);
+        }
+    }
+
+    /// Escribe el `SPSR` del modo actual aplicando `mask`. A diferencia del
+    /// `CPSR`, no tiene restricción de privilegio ni cambia bancos. En User/System
+    /// no hay `SPSR`: la escritura se descarta, como en el hardware.
+    fn write_spsr_masked(&mut self, value: u32, mask: u32) {
+        if let Some(old) = self.spsr() {
+            self.set_spsr((old & !mask) | (value & mask));
+        }
+    }
+
     // ===== Bucle de ejecución (Mini-Hito 2.2a) ==============================
 
     /// El tamaño en bytes de la instrucción actual según el estado: 4 en ARM, 2
@@ -730,9 +858,10 @@ impl Cpu {
     /// Solo se ejecuta el set **ARM** (el fetch THUMB de 2 bytes llega en el
     /// 2.3a). De ARM están implementados el **procesamiento de datos completo**
     /// (Mini-Hito 2.2f: inmediato y registro por el barrel shifter, incluido
-    /// `Rd = r15`) y los **saltos** `B`/`BL`/`BX` (Mini-Hito 2.2e); ante cualquier
-    /// otra instrucción la CPU se detiene con [`StepResult::Halted`], **sin**
-    /// avanzar el `PC` (queda en la instrucción culpable, para inspeccionarla).
+    /// `Rd = r15`), la **transferencia de PSR** `MRS`/`MSR` (Mini-Hito 2.2g) y los
+    /// **saltos** `B`/`BL`/`BX` (Mini-Hito 2.2e); ante cualquier otra instrucción
+    /// la CPU se detiene con [`StepResult::Halted`], **sin** avanzar el `PC`
+    /// (queda en la instrucción culpable, para inspeccionarla).
     pub fn step(&mut self, bus: &Bus) -> StepResult {
         let pc = self.pc();
 
@@ -836,6 +965,9 @@ impl Cpu {
             // `Rd = r15`. La propia ejecución decide si fue un salto y sus ciclos
             // extra. Ver [`Cpu::execute_data_processing`].
             ArmInstruction::DataProcessing => self.execute_data_processing(instr),
+            // Transferencia de PSR `MRS`/`MSR` (Mini-Hito 2.2g): leer/escribir el
+            // CPSR/SPSR. No es un salto. Ver [`Cpu::execute_psr_transfer`].
+            ArmInstruction::PsrTransfer => self.execute_psr_transfer(instr),
             // Saltos relativos `B`/`BL` (Mini-Hito 2.2e).
             ArmInstruction::Branch { link } => {
                 self.execute_branch(instr, link);
@@ -1804,5 +1936,127 @@ mod tests {
         cpu.set_reg(0, base + 0x40);
         assert_eq!(cpu.step(&bus), StepResult::Stepped);
         assert_eq!(cpu.pc(), base + 0x40, "el PC quedó en el destino del salto");
+    }
+
+    // ===== Transferencia de PSR: MRS / MSR (Mini-Hito 2.2g) ================
+
+    #[test]
+    fn mrs_lee_el_cpsr_a_un_registro() {
+        // MRS r0, CPSR (0xE10F0000): r0 recibe el CPSR completo, flags incluidos.
+        let mut cpu = Cpu::new(); // Supervisor + I + F = 0x0000_00D3
+        cpu.cpsr_mut().set_n(true); // → 0x8000_00D3
+        cpu.execute_psr_transfer(0xE10F_0000);
+        assert_eq!(cpu.reg(0), 0x8000_00D3);
+    }
+
+    #[test]
+    fn mrs_lee_el_spsr_del_modo_actual() {
+        // En IRQ (que sí tiene SPSR), MRS r1, SPSR (0xE14F1000) lo copia a r1.
+        let mut cpu = Cpu::new();
+        cpu.set_mode(CpuMode::Irq);
+        cpu.set_spsr(0x8000_0010); // N=1, modo User guardado
+        cpu.execute_psr_transfer(0xE14F_1000);
+        assert_eq!(cpu.reg(1), 0x8000_0010);
+    }
+
+    #[test]
+    fn msr_inmediato_cambia_los_flags_y_afecta_a_la_condicion() {
+        // MSR CPSR_f, #0xF0000000 (0xE328F20F): pone N,Z,C,V. Es la "Prueba" del
+        // plan: cambiar flags vía MSR afecta a las condiciones.
+        let mut cpu = Cpu::new();
+        cpu.execute_psr_transfer(0xE328_F20F);
+        assert!(cpu.cpsr().n() && cpu.cpsr().z() && cpu.cpsr().c() && cpu.cpsr().v());
+        // Y una condición que dependa de esos flags ahora se cumple.
+        assert!(crate::arm::Condition::Eq.passes(cpu.cpsr()), "Z=1 → EQ pasa");
+    }
+
+    #[test]
+    fn msr_campo_de_flags_no_toca_el_byte_de_control() {
+        // MSR CPSR_f, r0 (0xE128F000) solo escribe el byte de flags: modo/I/F intactos.
+        let mut cpu = Cpu::new(); // Supervisor + I + F
+        let modo_antes = cpu.cpsr().mode_bits();
+        cpu.set_reg(0, 0xF000_0000);
+        cpu.execute_psr_transfer(0xE128_F000);
+        assert!(cpu.cpsr().n());
+        assert_eq!(cpu.cpsr().mode_bits(), modo_antes, "el modo no cambia con el campo f");
+        assert!(cpu.cpsr().irq_disabled(), "el bit I sigue como estaba");
+    }
+
+    #[test]
+    fn msr_campo_de_control_cambia_de_modo_e_intercambia_bancos() {
+        // MSR CPSR_c, r0 (0xE121F000) con r0 = modo System: cambia de modo y,
+        // como pasa por set_mode, intercambia el banco de SP correctamente.
+        let mut cpu = Cpu::new(); // Supervisor
+        cpu.set_reg(SP, 0x1111_1111); // SP del Supervisor
+        cpu.set_mode(CpuMode::System);
+        cpu.set_reg(SP, 0x2222_2222); // SP de System/User
+        cpu.set_mode(CpuMode::Supervisor); // volvemos; vemos el SP del SVC
+
+        cpu.set_reg(0, CpuMode::System.bits() as u32); // 0x1F
+        cpu.execute_psr_transfer(0xE121_F000);
+        assert_eq!(cpu.mode(), CpuMode::System, "el byte de control cambió el modo");
+        assert_eq!(cpu.sp(), 0x2222_2222, "set_mode intercambió el banco de SP");
+    }
+
+    #[test]
+    fn msr_en_modo_user_solo_cambia_los_flags() {
+        // En User, MSR CPSR_fc, r0 intenta tocar flags Y control; solo los flags
+        // deben cambiar (los de control son de solo lectura en User).
+        let mut cpu = Cpu::new(); // Supervisor, I=1
+        cpu.set_mode(CpuMode::User); // sigue con I=1
+        assert!(cpu.cpsr().irq_disabled());
+        // r0 pide N,Z,C,V=1 y, en el byte de control, modo Supervisor con I=0.
+        cpu.set_reg(0, 0xF000_0013);
+        cpu.execute_psr_transfer(0xE129_F000); // MSR CPSR_fc, r0
+        assert!(cpu.cpsr().n(), "los flags SÍ cambian en User");
+        assert_eq!(cpu.mode(), CpuMode::User, "el modo NO cambia en User");
+        assert!(cpu.cpsr().irq_disabled(), "el bit I (control) NO cambia en User");
+    }
+
+    #[test]
+    fn msr_escribe_el_spsr_del_modo_actual() {
+        // En IRQ, MSR SPSR_f, r0 (0xE168F000) escribe solo el byte de flags del SPSR.
+        let mut cpu = Cpu::new();
+        cpu.set_mode(CpuMode::Irq);
+        cpu.set_spsr(0x0000_0010); // modo User guardado, sin flags
+        cpu.set_reg(0, 0xF000_0000);
+        cpu.execute_psr_transfer(0xE168_F000);
+        assert_eq!(cpu.spsr(), Some(0xF000_0010), "solo cambió el byte de flags del SPSR");
+    }
+
+    #[test]
+    fn msr_a_spsr_en_user_se_descarta_sin_panicar() {
+        // User no tiene SPSR: MSR SPSR_*, r0 no debe hacer nada ni panicar.
+        let mut cpu = Cpu::new();
+        cpu.set_mode(CpuMode::User);
+        cpu.set_reg(0, 0xFFFF_FFFF);
+        cpu.execute_psr_transfer(0xE168_F000);
+        assert_eq!(cpu.spsr(), None);
+    }
+
+    #[test]
+    fn msr_no_escribe_los_bits_reservados() {
+        // MSR CPSR_fsxc, r0 (0xE12FF000) con casi todos los bits a 1: los bits
+        // reservados (27-8) deben quedar a 0; solo NZCV y el byte de control existen.
+        let mut cpu = Cpu::new();
+        cpu.set_reg(0, 0xFFFF_FF13); // flags + reservados + control = Supervisor
+        cpu.execute_psr_transfer(0xE12F_F000);
+        assert_eq!(cpu.cpsr().bits() & !PSR_VALID, 0, "los bits reservados siguen a 0");
+        assert!(cpu.cpsr().n(), "pero los flags sí se escriben");
+        assert_eq!(cpu.mode(), CpuMode::Supervisor, "y el modo pedido (0x13) se respeta");
+    }
+
+    #[test]
+    fn psr_transfer_se_ejecuta_en_el_bucle() {
+        // Por el step completo: MSR CPSR_f, #0x40000000 (0xE328F101) pone Z; el
+        // decode lo identifica como PsrTransfer y lo ejecuta (antes se detenía).
+        let base = crate::bus::IWRAM_START;
+        let mut bus = Bus::new(vec![0u8; 4]);
+        bus.write_u32(base, 0xE328_F101);
+        let mut cpu = Cpu::new();
+        cpu.set_pc(base);
+        assert_eq!(cpu.step(&bus), StepResult::Stepped);
+        assert!(cpu.cpsr().z(), "MSR puso Z");
+        assert_eq!(cpu.pc(), base + 4, "MRS/MSR avanzan el PC como una instrucción normal");
     }
 }

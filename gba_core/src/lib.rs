@@ -9,7 +9,7 @@
 //! sustituir el frontend de escritorio por uno de Android, iOS o WASM sin tocar
 //! una sola línea del núcleo.
 //!
-//! ## Estado actual (Fase 2.2f)
+//! ## Estado actual (Fase 2.2g)
 //!
 //! Además de cargar y validar el cartucho (Fase 1), el núcleo tiene el
 //! esqueleto del hardware: la CPU ARM7TDMI ([`Cpu`]) con sus registros y modos,
@@ -37,9 +37,13 @@
 //! integra en el bucle porque aún no hay eventos reales que disparar.
 //! Los **saltos** `B`/`BL`/`BX` (Mini-Hito 2.2e) ya se ejecutan: la CPU recorre
 //! el código en vez de pararse en el primer salto, y `BX` puede pasar a estado
-//! THUMB (cuya ejecución llega después). Seguir con el resto del set ARM
-//! (cargas, multiplicación...) es lo que viene. La frontera con el frontend
-//! —entregar un buffer RGBA— no cambia.
+//! THUMB (cuya ejecución llega después). La **transferencia de PSR** `MRS`/`MSR`
+//! (Mini-Hito 2.2g) ya permite leer y escribir el `CPSR`/`SPSR` desde el código,
+//! respetando las máscaras de campos y que en modo User solo se toquen los flags
+//! —es el prerrequisito de las rutinas que cambian de modo y de la entrada/salida
+//! de IRQ y `SWI`—. Seguir con el resto del set ARM (cargas, multiplicación...)
+//! es lo que viene. La frontera con el frontend —entregar un buffer RGBA— no
+//! cambia.
 
 pub mod arm;
 pub mod bus;
