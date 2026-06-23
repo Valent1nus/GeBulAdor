@@ -1,7 +1,7 @@
 //! La CPU **ARM7TDMI** de la Game Boy Advance: registros, estado y modos.
 //!
 //! Este módulo modela el estado de la CPU y, sobre él, el ciclo
-//! Fetch→Decode→Execute tal como está implementado hasta el Mini-Hito 2.1e. De
+//! Fetch→Decode→Execute tal como está implementado hasta el Mini-Hito 2.2f. De
 //! momento cubre:
 //!
 //! - Los **16 registros visibles** `r0`–`r15` (`r13` = SP, `r14` = LR,
@@ -10,9 +10,10 @@
 //! - Los **modos de operación** del procesador y, lo más importante, el
 //!   *banking* de registros entre modos.
 //! - El **Fetch** ([`Cpu::fetch`]), el **Decode** de ARM ([`Cpu::decode_arm`]) y
-//!   THUMB ([`Cpu::decode_thumb`]), y el inicio del **Execute**
-//!   ([`Cpu::execute_data_processing`]: la primera familia de instrucciones, el
-//!   procesamiento de datos con operando inmediato).
+//!   THUMB ([`Cpu::decode_thumb`]), y el **Execute** del procesamiento de datos
+//!   completo ([`Cpu::execute_data_processing`]: operando inmediato y de registro
+//!   por el *barrel shifter*, incluido `Rd = r15`, Mini-Hito 2.2f) y de los
+//!   saltos `B`/`BL`/`BX` (Mini-Hito 2.2e).
 //! - El **desfase del pipeline** de 3 etapas: al leer `r15`, una instrucción ve
 //!   el `PC` adelantado (+8 en ARM, +4 en THUMB), ver [`Cpu::reg`] y
 //!   [`Cpu::pipeline_offset`].
@@ -383,13 +384,23 @@ pub enum RunStop {
     StepLimit,
 }
 
-/// Efecto de ejecutar una instrucción sobre el `PC` (uso interno de [`Cpu::step`]).
-enum Executed {
-    /// Ejecutada; el `PC` avanza a la siguiente instrucción.
-    Continue,
+/// Efecto de ejecutar una instrucción (lo decide [`Cpu::try_execute_arm`] y lo
+/// consume [`Cpu::step`]): cómo queda el `PC` y cuántos ciclos internos extra
+/// consumió, más allá del fetch del opcode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Executed {
+    /// Ejecutada; el `PC` avanza a la siguiente instrucción. `extra_cycles` son
+    /// los ciclos internos añadidos (p. ej. el I-cycle del shift por registro).
+    Continue {
+        /// Ciclos internos extra sobre el fetch del opcode.
+        extra_cycles: u64,
+    },
     /// Ejecutada y el `PC` quedó fijado a un destino (un salto): no se avanza y
     /// el pipeline se vacía (el siguiente fetch es no secuencial).
-    Branched,
+    Branched {
+        /// Ciclos internos extra, como en [`Executed::Continue`].
+        extra_cycles: u64,
+    },
     /// Esa instrucción —o esa variante— aún no está implementada.
     Unimplemented,
 }
@@ -523,91 +534,169 @@ impl Cpu {
         ThumbInstruction::decode(instr)
     }
 
-    /// Ejecuta una instrucción de **procesamiento de datos** en su forma con
-    /// operando inmediato (Mini-Hito 2.1d). Es la primera instrucción que altera
-    /// el estado de la CPU: calcula el resultado de la operación de la ALU
-    /// (`MOV`, `ADD`, `SUB`, `AND`...), lo escribe en `Rd` salvo para las
-    /// comparaciones (`TST`/`TEQ`/`CMP`/`CMN`) y actualiza los flags `N/Z/C/V` si
-    /// el bit `S` (20) está activo.
+    /// Ejecuta una instrucción de **procesamiento de datos** completa (Mini-Hito
+    /// 2.2f): calcula el resultado de la ALU (`MOV`, `ADD`, `SUB`, `AND`...), lo
+    /// escribe en `Rd` salvo en las comparaciones (`TST`/`TEQ`/`CMP`/`CMN`) y
+    /// actualiza los flags `N/Z/C/V` si el bit `S` (20) está activo.
     ///
-    /// Se asume que la condición de la instrucción ya se evaluó (vía
-    /// [`Cpu::decode_arm`]) y se cumple. **Solo** está implementada la forma con
-    /// operando inmediato; la forma con registro desplazado (*barrel shifter*) y
-    /// los casos especiales con `Rd = r15` (PC) llegan en hitos posteriores.
-    pub fn execute_data_processing(&mut self, instr: u32) {
-        // Capturamos el CPSR de ENTRADA: el carry previo lo necesitan ADC/SBC y
-        // el carry del shifter, y debe leerse antes de actualizar los flags.
-        let cpsr_before = self.cpsr();
+    /// Cubre las **dos formas** del operando 2:
+    /// - **Inmediato** (bit 25 = 1): un valor de 8 bits rotado a la derecha.
+    /// - **Registro** (bit 25 = 0): `Rm` pasado por el *barrel shifter*
+    ///   (`LSL`/`LSR`/`ASR`/`ROR`), con la cantidad o bien inmediata (bits 11-7)
+    ///   o bien en un registro `Rs` (bit 4 = 1). El shifter produce además el
+    ///   **carry** que usan las operaciones lógicas; ver [`shift_by_immediate`] y
+    ///   [`shift_by_register`].
+    ///
+    /// Y el caso especial **`Rd = r15`**: la operación se vuelve un salto (devuelve
+    /// [`Executed::Branched`], que hace a [`Cpu::step`] vaciar el pipeline); si
+    /// además `S = 1`, restaura el `CPSR` desde el `SPSR` del modo actual —el
+    /// retorno de excepción, p. ej. `MOVS pc, lr`—, que puede cambiar de modo y de
+    /// estado ARM/THUMB.
+    ///
+    /// Se asume que la condición ya se evaluó (vía [`Cpu::decode_arm`]) y se
+    /// cumple. Devuelve el [`Executed`] con los ciclos extra (el I-cycle del shift
+    /// por registro) y el efecto sobre el `PC`.
+    pub fn execute_data_processing(&mut self, instr: u32) -> Executed {
+        // El carry de ENTRADA lo necesitan ADC/SBC/RSC y el carry del shifter:
+        // hay que leerlo antes de tocar los flags.
+        let carry_in = self.cpsr().c();
 
-        // --- Operando 2 (solo forma inmediata, bit 25 = 1) ----------------
-        // Un valor de 8 bits rotado a la derecha por un campo de 4 bits (×2).
         let is_immediate = (instr & (1 << 25)) != 0;
-        debug_assert!(
-            is_immediate,
-            "data-processing con operando de registro aún no implementado (barrel shifter)"
-        );
-        if !is_immediate {
-            return;
-        }
-        let rotate = ((instr >> 8) & 0xF) * 2;
-        let imm8 = instr & 0xFF;
-        let operand2 = imm8.rotate_right(rotate);
-        // Carry del shifter (para las operaciones lógicas): con rotación 0 se
-        // conserva el C actual; con rotación, es el bit 31 del resultado.
-        let shifter_carry = if rotate == 0 {
-            cpsr_before.c()
+        // Shift cuya cantidad vive en un registro (solo forma de registro, bit 4).
+        let register_shift = !is_immediate && (instr & (1 << 4)) != 0;
+
+        // Operando 1 (Rn). ⚠️ Trampa del pipeline: con shift por registro, leer
+        // r15 da PC+12 (no +8), por el ciclo interno extra que añade ese shift.
+        let rn = ((instr >> 16) & 0xF) as usize;
+        let a = self.reg_operand(rn, register_shift);
+
+        // Operando 2 (b) y carry del shifter.
+        let (b, shifter_carry) = if is_immediate {
+            // Inmediato: 8 bits rotados a la derecha por (bits 11-8)×2.
+            let rotate = ((instr >> 8) & 0xF) * 2;
+            let value = (instr & 0xFF).rotate_right(rotate);
+            // Con rotación 0 el carry se conserva; con rotación, es el bit 31.
+            let carry = if rotate == 0 { carry_in } else { bit(value, 31) };
+            (value, carry)
         } else {
-            (operand2 & 0x8000_0000) != 0
+            let rm = (instr & 0xF) as usize;
+            let value = self.reg_operand(rm, register_shift);
+            let ty = ShiftType::from_bits(instr >> 5);
+            if register_shift {
+                // Cantidad = byte bajo de Rs (bits 11-8).
+                let rs = ((instr >> 8) & 0xF) as usize;
+                let amount = self.reg(rs) & 0xFF;
+                shift_by_register(ty, amount, value, carry_in)
+            } else {
+                // Cantidad inmediata (bits 11-7, 0..=31).
+                let amount = (instr >> 7) & 0x1F;
+                shift_by_immediate(ty, amount, value, carry_in)
+            }
         };
 
-        // --- Operandos y opcode -------------------------------------------
-        let rn = ((instr >> 16) & 0xF) as usize;
-        let rd = ((instr >> 12) & 0xF) as usize;
         let opcode = (instr >> 21) & 0xF;
         let sets_flags = (instr & (1 << 20)) != 0;
-        let a = self.reg(rn);
-        let b = operand2;
-        let carry_in = cpsr_before.c();
+        let rd = ((instr >> 12) & 0xF) as usize;
 
         // --- Operación de la ALU ------------------------------------------
         // Las lógicas dejan V sin tocar (`None`) y usan el carry del shifter;
         // las aritméticas obtienen carry/overflow de la suma. La resta se modela
         // como `a + !b + 1`, así que [`alu_add`] cubre todos los casos.
         let (result, carry, overflow): (u32, bool, Option<bool>) = match opcode {
-            0x0 => (a & b, shifter_carry, None),    // AND
-            0x1 => (a ^ b, shifter_carry, None),    // EOR
-            0x2 => with_v(alu_add(a, !b, true)),    // SUB
-            0x3 => with_v(alu_add(b, !a, true)),    // RSB
-            0x4 => with_v(alu_add(a, b, false)),    // ADD
-            0x5 => with_v(alu_add(a, b, carry_in)), // ADC
+            0x0 => (a & b, shifter_carry, None),     // AND
+            0x1 => (a ^ b, shifter_carry, None),     // EOR
+            0x2 => with_v(alu_add(a, !b, true)),     // SUB
+            0x3 => with_v(alu_add(b, !a, true)),     // RSB
+            0x4 => with_v(alu_add(a, b, false)),     // ADD
+            0x5 => with_v(alu_add(a, b, carry_in)),  // ADC
             0x6 => with_v(alu_add(a, !b, carry_in)), // SBC
             0x7 => with_v(alu_add(b, !a, carry_in)), // RSC
-            0x8 => (a & b, shifter_carry, None),    // TST
-            0x9 => (a ^ b, shifter_carry, None),    // TEQ
-            0xA => with_v(alu_add(a, !b, true)),    // CMP
-            0xB => with_v(alu_add(a, b, false)),    // CMN
-            0xC => (a | b, shifter_carry, None),    // ORR
-            0xD => (b, shifter_carry, None),        // MOV
-            0xE => (a & !b, shifter_carry, None),   // BIC
-            0xF => (!b, shifter_carry, None),       // MVN
+            0x8 => (a & b, shifter_carry, None),     // TST
+            0x9 => (a ^ b, shifter_carry, None),     // TEQ
+            0xA => with_v(alu_add(a, !b, true)),     // CMP
+            0xB => with_v(alu_add(a, b, false)),     // CMN
+            0xC => (a | b, shifter_carry, None),     // ORR
+            0xD => (b, shifter_carry, None),         // MOV
+            0xE => (a & !b, shifter_carry, None),    // BIC
+            0xF => (!b, shifter_carry, None),        // MVN
             _ => unreachable!("opcode = (instr >> 21) & 0xF está en 0..=15"),
         };
 
-        // --- Flags (solo si S = 1) ----------------------------------------
-        if sets_flags {
-            let cpsr = self.cpsr_mut();
-            cpsr.set_n((result & 0x8000_0000) != 0);
-            cpsr.set_z(result == 0);
-            cpsr.set_c(carry);
-            if let Some(v) = overflow {
-                cpsr.set_v(v);
-            }
-        }
+        // El shift por registro añade un ciclo interno (I-cycle); ver [`Cpu::step`].
+        let extra_cycles = u64::from(register_shift);
 
-        // --- Escritura del resultado --------------------------------------
-        // Las comparaciones (TST/TEQ/CMP/CMN, opcodes 0x8..=0xB) no escriben Rd.
-        if !matches!(opcode, 0x8..=0xB) {
+        // --- Flags y escritura del resultado ------------------------------
+        if matches!(opcode, 0x8..=0xB) {
+            // Comparaciones (TST/TEQ/CMP/CMN): siempre fijan flags, nunca escriben
+            // Rd y nunca son un salto (el campo Rd se ignora).
+            self.write_flags(result, carry, overflow);
+            Executed::Continue { extra_cycles }
+        } else if rd == PC {
+            // Rd = r15: la operación es un salto. Con S=1 es además un retorno de
+            // excepción (restaura el CPSR desde el SPSR).
+            if sets_flags {
+                self.restore_cpsr_from_spsr();
+            }
+            // Alinea el destino al ancho del estado resultante (THUMB: ½ palabra).
+            let target = if self.cpsr().thumb() {
+                result & !1
+            } else {
+                result & !3
+            };
+            self.set_pc(target);
+            Executed::Branched { extra_cycles }
+        } else {
+            if sets_flags {
+                self.write_flags(result, carry, overflow);
+            }
             self.set_reg(rd, result);
+            Executed::Continue { extra_cycles }
+        }
+    }
+
+    /// Lee un registro como **operando** de una instrucción, con la trampa del
+    /// pipeline para `r15` cuando la cantidad de shift vive en un registro: en ese
+    /// caso el `PC` visible va +12 (no +8), por el ciclo interno extra que añade
+    /// el shift por registro. Para el resto de casos equivale a [`Cpu::reg`].
+    fn reg_operand(&self, index: usize, register_shift: bool) -> u32 {
+        let base = self.reg(index);
+        if register_shift && index == PC {
+            base.wrapping_add(4)
+        } else {
+            base
+        }
+    }
+
+    /// Vuelca el resultado de la ALU en los flags `N/Z/C/V`. Un `overflow == None`
+    /// (operaciones lógicas) deja `V` intacto.
+    fn write_flags(&mut self, result: u32, carry: bool, overflow: Option<bool>) {
+        let cpsr = self.cpsr_mut();
+        cpsr.set_n(bit(result, 31));
+        cpsr.set_z(result == 0);
+        cpsr.set_c(carry);
+        if let Some(v) = overflow {
+            cpsr.set_v(v);
+        }
+    }
+
+    /// Restaura el `CPSR` desde el `SPSR` del modo actual: el **retorno de
+    /// excepción** que dispara un data-processing con `Rd = r15` y `S = 1`. Como
+    /// el `SPSR` lleva sus propios bits de modo, esto puede cambiar de modo —con
+    /// el intercambio de bancos de [`Cpu::set_mode`]— y de estado ARM/THUMB.
+    ///
+    /// En User/System no hay `SPSR` (caso indefinido del hardware): no se toca el
+    /// `CPSR`.
+    fn restore_cpsr_from_spsr(&mut self) {
+        let spsr = match self.spsr() {
+            Some(spsr) => spsr,
+            None => return,
+        };
+        match CpuMode::from_bits((spsr & 0x1F) as u8) {
+            Some(new_mode) => {
+                self.set_mode(new_mode); // intercambia los bancos al nuevo modo
+                self.cpsr = Cpsr::from_bits(spsr); // y restaura el CPSR completo
+            }
+            None => debug_assert!(false, "SPSR con bits de modo inválidos al restaurar"),
         }
     }
 
@@ -639,10 +728,11 @@ impl Cpu {
     /// (Mini-Hito 2.2a), sumando sus ciclos (2.2c) y avanzando o saltando el `PC`.
     ///
     /// Solo se ejecuta el set **ARM** (el fetch THUMB de 2 bytes llega en el
-    /// 2.3a). De ARM están implementados el procesamiento de datos inmediato y
-    /// los **saltos** `B`/`BL`/`BX` (Mini-Hito 2.2e); ante cualquier otra
-    /// instrucción la CPU se detiene con [`StepResult::Halted`], **sin** avanzar
-    /// el `PC` (queda en la instrucción culpable, para poder inspeccionarla).
+    /// 2.3a). De ARM están implementados el **procesamiento de datos completo**
+    /// (Mini-Hito 2.2f: inmediato y registro por el barrel shifter, incluido
+    /// `Rd = r15`) y los **saltos** `B`/`BL`/`BX` (Mini-Hito 2.2e); ante cualquier
+    /// otra instrucción la CPU se detiene con [`StepResult::Halted`], **sin**
+    /// avanzar el `PC` (queda en la instrucción culpable, para inspeccionarla).
     pub fn step(&mut self, bus: &Bus) -> StepResult {
         let pc = self.pc();
 
@@ -674,19 +764,20 @@ impl Cpu {
                 StepResult::Halted(Halt::InfiniteLoop { pc, instr })
             }
             Decoded::Execute(kind) => match self.try_execute_arm(kind, instr) {
-                Executed::Continue => {
+                Executed::Continue { extra_cycles } => {
                     self.advance_pc();
-                    self.account_step(fetch_cycles);
+                    self.account_step(fetch_cycles + extra_cycles);
                     StepResult::Stepped
                 }
-                Executed::Branched => {
+                Executed::Branched { extra_cycles } => {
                     // El salto ya fijó el `PC`. Coste del ARM7TDMI = 2S + 1N: el
                     // fetch del salto, el prefetch secuencial descartado y el
                     // fetch del destino (que cuenta el próximo paso como N, por el
-                    // flush). Vaciamos el pipeline → el siguiente fetch es N.
+                    // flush). Vaciamos el pipeline → el siguiente fetch es N. Un
+                    // shift por registro que escribe el PC suma además su I-cycle.
                     let discarded =
                         bus.access_cycles(pc.wrapping_add(4), AccessWidth::Word, true) as u64;
-                    self.cycles += fetch_cycles + discarded;
+                    self.cycles += fetch_cycles + discarded + extra_cycles;
                     self.seq_fetch_addr = None;
                     StepResult::Stepped
                 }
@@ -740,29 +831,20 @@ impl Cpu {
     /// A medida que se implementen instrucciones, este `match` ganará ramas.
     fn try_execute_arm(&mut self, kind: ArmInstruction, instr: u32) -> Executed {
         match kind {
-            ArmInstruction::DataProcessing => {
-                // Solo la forma con operando inmediato (bit 25) y destino distinto
-                // de `r15`. La forma con registro desplazado (barrel shifter) y
-                // escribir el `PC` llegan más adelante; hasta entonces se tratan
-                // como no implementadas en vez de ejecutarse a medias.
-                let is_immediate = (instr & (1 << 25)) != 0;
-                let rd = (instr >> 12) & 0xF;
-                if is_immediate && rd != PC as u32 {
-                    self.execute_data_processing(instr);
-                    Executed::Continue
-                } else {
-                    Executed::Unimplemented
-                }
-            }
+            // Procesamiento de datos completo (Mini-Hito 2.2f): ambas formas del
+            // operando 2 (inmediato y registro por el barrel shifter) y el caso
+            // `Rd = r15`. La propia ejecución decide si fue un salto y sus ciclos
+            // extra. Ver [`Cpu::execute_data_processing`].
+            ArmInstruction::DataProcessing => self.execute_data_processing(instr),
             // Saltos relativos `B`/`BL` (Mini-Hito 2.2e).
             ArmInstruction::Branch { link } => {
                 self.execute_branch(instr, link);
-                Executed::Branched
+                Executed::Branched { extra_cycles: 0 }
             }
             // `BX`: salto a registro con posible cambio de estado ARM/THUMB.
             ArmInstruction::BranchExchange => {
                 self.execute_bx(instr);
-                Executed::Branched
+                Executed::Branched { extra_cycles: 0 }
             }
             _ => Executed::Unimplemented,
         }
@@ -910,6 +992,132 @@ fn alu_add(a: u32, b: u32, carry_in: bool) -> (u32, bool, bool) {
 /// el flag V).
 fn with_v(t: (u32, bool, bool)) -> (u32, bool, Option<bool>) {
     (t.0, t.1, Some(t.2))
+}
+
+/// `true` si el bit `n` (0 = el menos significativo) de `value` está a 1. `n`
+/// debe ser `< 32` (los llamadores lo garantizan).
+#[inline]
+fn bit(value: u32, n: u32) -> bool {
+    ((value >> n) & 1) != 0
+}
+
+/// Tipo de desplazamiento del *barrel shifter* (bits 6-5 de una instrucción de
+/// procesamiento de datos con operando de registro).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShiftType {
+    /// Lógico a la izquierda (`LSL`): rellena con ceros por la derecha.
+    Lsl,
+    /// Lógico a la derecha (`LSR`): rellena con ceros por la izquierda.
+    Lsr,
+    /// Aritmético a la derecha (`ASR`): replica el bit de signo por la izquierda.
+    Asr,
+    /// Rotación a la derecha (`ROR`): los bits que salen por la derecha vuelven a
+    /// entrar por la izquierda.
+    Ror,
+}
+
+impl ShiftType {
+    /// Interpreta los 2 bits de tipo de shift (los más bajos de `bits`).
+    fn from_bits(bits: u32) -> ShiftType {
+        match bits & 0b11 {
+            0 => ShiftType::Lsl,
+            1 => ShiftType::Lsr,
+            2 => ShiftType::Asr,
+            3 => ShiftType::Ror,
+            _ => unreachable!("bits & 0b11 está en 0..=3"),
+        }
+    }
+}
+
+/// Aplica un desplazamiento por **cantidad inmediata** (`amount` ∈ 0..=31) y
+/// devuelve `(resultado, carry_out)`.
+///
+/// ⚠️ Las **codificaciones especiales de cantidad 0** del ARM7TDMI son la trampa
+/// clásica del shifter:
+/// - `LSL #0`: el valor pasa intacto y el carry se conserva (es el "sin shift").
+/// - `LSR #0` significa en realidad `LSR #32`: todo se desplaza fuera (resultado
+///   0) y el carry es el bit 31.
+/// - `ASR #0` significa `ASR #32`: el resultado es el bit de signo replicado y el
+///   carry, también el bit 31.
+/// - `ROR #0` es `RRX`: rota 1 bit a la derecha **a través del carry** (el carry
+///   entra por el bit 31 y sale el bit 0).
+fn shift_by_immediate(ty: ShiftType, amount: u32, value: u32, carry_in: bool) -> (u32, bool) {
+    match ty {
+        ShiftType::Lsl => {
+            if amount == 0 {
+                (value, carry_in)
+            } else {
+                (value << amount, bit(value, 32 - amount))
+            }
+        }
+        ShiftType::Lsr => {
+            if amount == 0 {
+                (0, bit(value, 31)) // LSR #0 ≡ LSR #32
+            } else {
+                (value >> amount, bit(value, amount - 1))
+            }
+        }
+        ShiftType::Asr => {
+            if amount == 0 {
+                // ASR #0 ≡ ASR #32: el signo se replica a los 32 bits.
+                let sign = bit(value, 31);
+                (if sign { 0xFFFF_FFFF } else { 0 }, sign)
+            } else {
+                ((value as i32 >> amount) as u32, bit(value, amount - 1))
+            }
+        }
+        ShiftType::Ror => {
+            if amount == 0 {
+                // ROR #0 ≡ RRX: rota 1 bit a través del carry.
+                (((carry_in as u32) << 31) | (value >> 1), bit(value, 0))
+            } else {
+                (value.rotate_right(amount), bit(value, amount - 1))
+            }
+        }
+    }
+}
+
+/// Aplica un desplazamiento por **cantidad en registro** (`amount` = byte bajo de
+/// `Rs`, ∈ 0..=255) y devuelve `(resultado, carry_out)`.
+///
+/// A diferencia del inmediato, la cantidad 0 **no** tiene codificación especial:
+/// deja el valor y el carry intactos. Y modela las cantidades `>= 32`, donde el
+/// resultado se satura (todo desplazado fuera, o el signo replicado en `ASR`).
+fn shift_by_register(ty: ShiftType, amount: u32, value: u32, carry_in: bool) -> (u32, bool) {
+    if amount == 0 {
+        return (value, carry_in);
+    }
+    match ty {
+        ShiftType::Lsl => match amount {
+            1..=31 => (value << amount, bit(value, 32 - amount)),
+            32 => (0, bit(value, 0)),
+            _ => (0, false), // > 32: todo fuera, carry 0
+        },
+        ShiftType::Lsr => match amount {
+            1..=31 => (value >> amount, bit(value, amount - 1)),
+            32 => (0, bit(value, 31)),
+            _ => (0, false),
+        },
+        ShiftType::Asr => {
+            if amount >= 32 {
+                let sign = bit(value, 31);
+                (if sign { 0xFFFF_FFFF } else { 0 }, sign)
+            } else {
+                ((value as i32 >> amount) as u32, bit(value, amount - 1))
+            }
+        }
+        ShiftType::Ror => {
+            // ROR por más de 32 equivale a ROR por (amount mód 32). Si el módulo
+            // es 0 (amount múltiplo de 32), el valor queda igual y el carry es el
+            // bit 31.
+            let r = amount & 0x1F;
+            if r == 0 {
+                (value, bit(value, 31))
+            } else {
+                (value.rotate_right(r), bit(value, r - 1))
+            }
+        }
+    }
 }
 
 /// Decodifica el desplazamiento de un salto ARM `B`/`BL`: los 24 bits bajos son
@@ -1249,15 +1457,17 @@ mod tests {
     }
 
     #[test]
-    fn data_processing_con_registro_aun_no_se_ejecuta() {
-        // MOV r0, r1 (forma con registro, bit 25 = 0): 0xE1A00001. Todavía no
-        // implementada → el paso se detiene en vez de "ejecutar" en silencio.
+    fn data_processing_con_registro_se_ejecuta() {
+        // MOV r0, r1 (forma con registro, bit 25 = 0): 0xE1A00001. Desde el
+        // Mini-Hito 2.2f ya se ejecuta (barrel shifter), en vez de detener el bucle.
         let mut rom = vec![0u8; 8];
         rom[0..4].copy_from_slice(&0xE1A0_0001u32.to_le_bytes());
         let bus = Bus::new(rom);
         let mut cpu = Cpu::new();
         cpu.set_pc(crate::bus::ROM_START);
-        assert!(matches!(cpu.step(&bus), StepResult::Halted(_)));
+        cpu.set_reg(1, 0x1234_5678);
+        assert_eq!(cpu.step(&bus), StepResult::Stepped);
+        assert_eq!(cpu.reg(0), 0x1234_5678);
     }
 
     #[test]
@@ -1414,7 +1624,7 @@ mod tests {
         let mut bus = Bus::new(vec![0u8; 4]);
         bus.write_u32(crate::bus::IWRAM_START, 0xE3A0_0000); // MOV r0, #0
         bus.write_u32(crate::bus::IWRAM_START + 4, 0xE3A0_1001); // MOV r1, #1
-        bus.write_u32(crate::bus::IWRAM_START + 8, 0xE1A0_0001); // MOV r0, r1 (reg): no impl.
+        bus.write_u32(crate::bus::IWRAM_START + 8, 0xE590_2000); // LDR r2, [r0]: no impl.
         let mut cpu = Cpu::new();
         cpu.set_pc(crate::bus::IWRAM_START);
 
@@ -1425,5 +1635,174 @@ mod tests {
             report.stop,
             RunStop::Halted(Halt::Unimplemented { .. })
         ));
+    }
+
+    // ===== Barrel shifter (Mini-Hito 2.2f) =================================
+
+    #[test]
+    fn shifter_lsl_inmediato() {
+        // LSL #4: carry = bit (32-4) = bit 28.
+        assert_eq!(shift_by_immediate(ShiftType::Lsl, 4, 0x0000_000F, false), (0xF0, false));
+        // LSL #0: valor y carry intactos (es el "sin shift").
+        assert_eq!(shift_by_immediate(ShiftType::Lsl, 0, 0x8000_0000, true), (0x8000_0000, true));
+        // LSL #1 de 0x8000_0000: sale el bit 31 → carry = 1, resultado 0.
+        assert_eq!(shift_by_immediate(ShiftType::Lsl, 1, 0x8000_0000, false), (0, true));
+    }
+
+    #[test]
+    fn shifter_lsr_inmediato_y_el_cero_es_32() {
+        // LSR #4 de 0xFF → 0x0F, carry = bit 3 = 1.
+        assert_eq!(shift_by_immediate(ShiftType::Lsr, 4, 0x0000_00FF, false), (0x0F, true));
+        // LSR #0 ≡ LSR #32: todo fuera (0), carry = bit 31.
+        assert_eq!(shift_by_immediate(ShiftType::Lsr, 0, 0x8000_0000, false), (0, true));
+        assert_eq!(shift_by_immediate(ShiftType::Lsr, 0, 0x7FFF_FFFF, true), (0, false));
+    }
+
+    #[test]
+    fn shifter_asr_inmediato_replica_signo_y_el_cero_es_32() {
+        // ASR #4 de 0x8000_0000 → 0xF800_0000 (signo replicado), carry = bit 3 = 0.
+        assert_eq!(shift_by_immediate(ShiftType::Asr, 4, 0x8000_0000, false), (0xF800_0000, false));
+        // ASR #0 ≡ ASR #32: el bit de signo se replica a los 32 bits.
+        assert_eq!(shift_by_immediate(ShiftType::Asr, 0, 0x8000_0000, false), (0xFFFF_FFFF, true));
+        assert_eq!(shift_by_immediate(ShiftType::Asr, 0, 0x4000_0000, false), (0, false));
+    }
+
+    #[test]
+    fn shifter_ror_inmediato_y_rrx() {
+        // ROR #4 de 0x0000_000F → 0xF000_0000, carry = bit 3 = 1.
+        assert_eq!(shift_by_immediate(ShiftType::Ror, 4, 0x0000_000F, false), (0xF000_0000, true));
+        // ROR #0 ≡ RRX: el carry entra por el bit 31 y sale el bit 0.
+        assert_eq!(shift_by_immediate(ShiftType::Ror, 0, 0x0000_0001, false), (0, true));
+        assert_eq!(shift_by_immediate(ShiftType::Ror, 0, 0x0000_0000, true), (0x8000_0000, false));
+    }
+
+    #[test]
+    fn shifter_por_registro_cantidad_cero_no_cambia_nada() {
+        // A diferencia del inmediato, la cantidad 0 por registro no tiene
+        // codificación especial: valor y carry intactos, sea cual sea el tipo.
+        assert_eq!(shift_by_register(ShiftType::Lsl, 0, 0x1234_5678, true), (0x1234_5678, true));
+        assert_eq!(shift_by_register(ShiftType::Ror, 0, 0x1234_5678, false), (0x1234_5678, false));
+    }
+
+    #[test]
+    fn shifter_por_registro_casos_limite_de_32_y_mas() {
+        // LSL 32: 0, carry = bit 0. LSL > 32: 0, carry 0.
+        assert_eq!(shift_by_register(ShiftType::Lsl, 32, 0x0000_0001, false), (0, true));
+        assert_eq!(shift_by_register(ShiftType::Lsl, 33, 0xFFFF_FFFF, true), (0, false));
+        // LSR 32: 0, carry = bit 31.
+        assert_eq!(shift_by_register(ShiftType::Lsr, 32, 0x8000_0000, false), (0, true));
+        // ASR >= 32: signo replicado, carry = bit 31.
+        assert_eq!(shift_by_register(ShiftType::Asr, 50, 0x8000_0000, false), (0xFFFF_FFFF, true));
+        assert_eq!(shift_by_register(ShiftType::Asr, 50, 0x0000_0001, false), (0, false));
+        // ROR 32: valor intacto, carry = bit 31. ROR 36 ≡ ROR 4.
+        assert_eq!(shift_by_register(ShiftType::Ror, 32, 0x8000_0000, false), (0x8000_0000, true));
+        assert_eq!(shift_by_register(ShiftType::Ror, 36, 0x0000_000F, false), (0xF000_0000, true));
+    }
+
+    // ===== Procesamiento de datos con operando de registro (2.2f) ==========
+
+    #[test]
+    fn mov_con_registro_desplazado_por_inmediato() {
+        // MOV r0, r1, LSL #4 (0xE1A00201): r1 = 0x12 → r0 = 0x120.
+        let mut cpu = Cpu::new();
+        cpu.set_reg(1, 0x12);
+        cpu.execute_data_processing(0xE1A0_0201);
+        assert_eq!(cpu.reg(0), 0x120);
+    }
+
+    #[test]
+    fn movs_lsr_actualiza_el_carry_desde_el_shifter() {
+        // MOVS r0, r1, LSR #1 (0xE1B000A1): r1 = 1 → r0 = 0, el bit 0 que sale va
+        // al carry, y Z = 1.
+        let mut cpu = Cpu::new();
+        cpu.set_reg(1, 0x0000_0001);
+        cpu.execute_data_processing(0xE1B0_00A1);
+        assert_eq!(cpu.reg(0), 0);
+        assert!(cpu.cpsr().c(), "el bit que sale por LSR #1 va al carry");
+        assert!(cpu.cpsr().z());
+    }
+
+    #[test]
+    fn add_con_operando_de_registro() {
+        // ADD r0, r1, r2 (0xE0810002): 10 + 20 = 30.
+        let mut cpu = Cpu::new();
+        cpu.set_reg(1, 10);
+        cpu.set_reg(2, 20);
+        cpu.execute_data_processing(0xE081_0002);
+        assert_eq!(cpu.reg(0), 30);
+    }
+
+    #[test]
+    fn shift_por_registro_cuesta_un_i_cycle_extra() {
+        // En IWRAM (1 ciclo/fetch): la forma por inmediato cuesta 1; la forma por
+        // registro, 1 (fetch) + 1 (I-cycle) = 2.
+        let mut bus = Bus::new(vec![0u8; 4]);
+        bus.write_u32(crate::bus::IWRAM_START, 0xE1A0_0081); // MOV r0, r1, LSL #1
+        let mut por_inmediato = Cpu::new();
+        por_inmediato.set_pc(crate::bus::IWRAM_START);
+        por_inmediato.step(&bus);
+        assert_eq!(por_inmediato.cycles(), 1);
+
+        bus.write_u32(crate::bus::IWRAM_START, 0xE1A0_0211); // MOV r0, r1, LSL r2
+        let mut por_registro = Cpu::new();
+        por_registro.set_pc(crate::bus::IWRAM_START);
+        por_registro.step(&bus);
+        assert_eq!(por_registro.cycles(), 2, "el shift por registro añade un I-cycle");
+    }
+
+    #[test]
+    fn r15_como_operando_va_mas_lejos_con_shift_por_registro() {
+        // En ARM, r15 leído como operando es PC+8; pero si la cantidad de shift
+        // está en un registro, es PC+12 (el I-cycle adelanta un fetch más).
+        let mut cpu = Cpu::new();
+        cpu.set_pc(0x0800_0000);
+        assert_eq!(cpu.reg_operand(PC, false), 0x0800_0008, "PC+8 normal");
+        assert_eq!(cpu.reg_operand(PC, true), 0x0800_000C, "PC+12 con shift por registro");
+        // Los registros normales no se ven afectados.
+        cpu.set_reg(0, 0xAA);
+        assert_eq!(cpu.reg_operand(0, true), 0xAA);
+    }
+
+    #[test]
+    fn mov_a_pc_es_un_salto_que_alinea_a_palabra() {
+        // MOV pc, r0 (0xE1A0F000): el PC pasa a r0 alineado a palabra (ARM) y la
+        // ejecución lo reporta como salto (Branched).
+        let mut cpu = Cpu::new();
+        cpu.set_reg(0, 0x0800_1236); // bits bajos sucios a propósito
+        let efecto = cpu.execute_data_processing(0xE1A0_F000);
+        assert_eq!(cpu.pc(), 0x0800_1234, "destino alineado a palabra en ARM");
+        assert!(matches!(efecto, Executed::Branched { .. }));
+    }
+
+    #[test]
+    fn movs_a_pc_restaura_el_cpsr_desde_el_spsr() {
+        // Retorno de excepción: en IRQ con un SPSR que apunta a User (ARM, Z=1),
+        // MOVS pc, lr (0xE1B0F00E) vuelve a User, restaura los flags y salta a LR.
+        let mut cpu = Cpu::new(); // arranca en Supervisor
+        cpu.set_mode(CpuMode::Irq);
+        let spsr = (CpuMode::User.bits() as u32) | (1 << 30); // modo User + Z, T=0
+        cpu.set_spsr(spsr);
+        cpu.set_reg(LR, 0x0800_2000);
+
+        cpu.execute_data_processing(0xE1B0_F00E);
+        assert_eq!(cpu.pc(), 0x0800_2000, "salta a LR");
+        assert_eq!(cpu.mode(), CpuMode::User, "vuelve al modo guardado en el SPSR");
+        assert!(cpu.cpsr().z(), "restaura los flags del SPSR");
+        assert!(!cpu.cpsr().thumb(), "el SPSR estaba en estado ARM");
+    }
+
+    #[test]
+    fn salto_via_pc_vacia_el_pipeline_en_el_bucle() {
+        // ADD pc, pc, r0 con shift cero: salto calculado. Verifica que el step lo
+        // trata como salto (no avanza secuencialmente) y deja el PC en el destino.
+        let base = crate::bus::IWRAM_START;
+        let mut bus = Bus::new(vec![0u8; 4]);
+        // MOV pc, r0 (forma de registro): salta a r0.
+        bus.write_u32(base, 0xE1A0_F000);
+        let mut cpu = Cpu::new();
+        cpu.set_pc(base);
+        cpu.set_reg(0, base + 0x40);
+        assert_eq!(cpu.step(&bus), StepResult::Stepped);
+        assert_eq!(cpu.pc(), base + 0x40, "el PC quedó en el destino del salto");
     }
 }

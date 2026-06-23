@@ -9,7 +9,7 @@
 //! sustituir el frontend de escritorio por uno de Android, iOS o WASM sin tocar
 //! una sola línea del núcleo.
 //!
-//! ## Estado actual (Fase 2.2e)
+//! ## Estado actual (Fase 2.2f)
 //!
 //! Además de cargar y validar el cartucho (Fase 1), el núcleo tiene el
 //! esqueleto del hardware: la CPU ARM7TDMI ([`Cpu`]) con sus registros y modos,
@@ -19,17 +19,17 @@
 //! —leer la instrucción a la que apunta el `PC`— y el **"Decode"** identifica el
 //! tipo de instrucción: [`Gba::decode_arm`] para el modo ARM (flujo de dos pasos
 //! condición → opcode) y [`Gba::decode_thumb`] para el modo THUMB (16 bits, con
-//! un decoder separado). El **"Execute"** acaba de empezar:
-//! [`Cpu::execute_data_processing`] ejecuta la primera familia de instrucciones
-//! (procesamiento de datos con operando inmediato), alterando registros y flags.
+//! un decoder separado). El **"Execute"** ya cubre el **procesamiento de datos
+//! completo** (Mini-Hito 2.2f): forma inmediata y forma de registro pasada por el
+//! *barrel shifter* (`LSL`/`LSR`/`ASR`/`ROR`), incluido el caso `Rd = r15` que
+//! convierte la operación en un salto y, con `S=1`, restaura el `CPSR`.
 //! Y el **pipeline de 3 etapas** (Mini-Hito 2.1e) ya está modelado: leer `r15`
 //! devuelve el `PC` adelantado (+8 en ARM, +4 en THUMB), como el hardware real.
 //! Sobre todo eso, el **bucle de ejecución** (Mini-Hito 2.2a) ya encadena
 //! fetch→decode→execute paso a paso ([`Gba::run`] / [`Gba::step`]): avanza el
 //! `PC` y se detiene limpiamente al llegar a una instrucción todavía no
-//! implementada. Como por ahora solo se ejecuta el procesamiento de datos
-//! inmediato, una ROM real se detiene en su primer salto. El **contador de
-//! ciclos** (Mini-Hito 2.2c) ya está: cada instrucción ejecutada suma su coste
+//! implementada. El **contador de ciclos** (Mini-Hito 2.2c) ya está: cada
+//! instrucción ejecutada suma su coste
 //! según la región de memoria y si el acceso es secuencial (S) o no (N). Y el
 //! **scheduler** (Mini-Hito 2.2d) ya existe como pieza de infraestructura: una
 //! cola de eventos ordenada por ciclo ([`Scheduler`]) que será la base de la
