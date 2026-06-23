@@ -9,7 +9,7 @@
 //! sustituir el frontend de escritorio por uno de Android, iOS o WASM sin tocar
 //! una sola línea del núcleo.
 //!
-//! ## Estado actual (Fase 2.2c)
+//! ## Estado actual (Fase 2.2d)
 //!
 //! Además de cargar y validar el cartucho (Fase 1), el núcleo tiene el
 //! esqueleto del hardware: la CPU ARM7TDMI ([`Cpu`]) con sus registros y modos,
@@ -30,7 +30,11 @@
 //! implementada. Como por ahora solo se ejecuta el procesamiento de datos
 //! inmediato, una ROM real se detiene en su primer salto. El **contador de
 //! ciclos** (Mini-Hito 2.2c) ya está: cada instrucción ejecutada suma su coste
-//! según la región de memoria y si el acceso es secuencial (S) o no (N).
+//! según la región de memoria y si el acceso es secuencial (S) o no (N). Y el
+//! **scheduler** (Mini-Hito 2.2d) ya existe como pieza de infraestructura: una
+//! cola de eventos ordenada por ciclo ([`Scheduler`]) que será la base de la
+//! sincronización de timers/PPU y del Lockstep de la Fase 4; todavía no se
+//! integra en el bucle porque aún no hay eventos reales que disparar.
 //! Implementar más instrucciones —empezando por los saltos— es lo que sigue. La
 //! frontera con el frontend —entregar un buffer RGBA— no cambia.
 
@@ -39,6 +43,7 @@ pub mod bus;
 pub mod cartridge;
 pub mod cpu;
 pub mod header;
+pub mod scheduler;
 pub mod thumb;
 
 pub use arm::{ArmInstruction, Condition, Decoded};
@@ -46,6 +51,7 @@ pub use bus::{AccessWidth, Bus};
 pub use cartridge::{Cartridge, CartridgeError, MAX_ROM_SIZE, MIN_ROM_SIZE};
 pub use cpu::{Cpu, CpuMode, Cpsr, Halt, RunReport, RunStop, StepResult};
 pub use header::Header;
+pub use scheduler::Scheduler;
 pub use thumb::ThumbInstruction;
 
 /// Anchura de la pantalla de la GBA, en píxeles.
@@ -63,8 +69,10 @@ pub const FRAMEBUFFER_SIZE: usize = SCREEN_WIDTH * SCREEN_HEIGHT * BYTES_PER_PIX
 /// Estado completo de una GBA emulada.
 ///
 /// Agrupa la CPU ([`Cpu`]), el bus de memoria ([`Bus`]) y el framebuffer. En
-/// fases posteriores sumará la PPU, el scheduler, etc. El frontend interactúa
-/// con la emulación únicamente a través de este tipo.
+/// fases posteriores sumará la PPU y, cuando existan eventos reales que disparar
+/// (timers en 2.3e, PPU en 2.4b), integrará el [`Scheduler`] —ya disponible como
+/// módulo desde el 2.2d—. El frontend interactúa con la emulación únicamente a
+/// través de este tipo.
 pub struct Gba {
     /// La CPU ARM7TDMI con sus registros, modos y estado.
     cpu: Cpu,
