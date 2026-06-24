@@ -9,7 +9,7 @@
 //!
 //! | Región | Dirección base | Tamaño | Notas |
 //! |---|---|---|---|
-//! | BIOS   | `0x0000_0000` | 16 KiB | solo lectura; se carga en el Hito 2.3a |
+//! | BIOS   | `0x0000_0000` | 16 KiB | solo lectura; cargada en el Hito 2.3a (opcional) |
 //! | EWRAM  | `0x0200_0000` | 256 KiB | RAM de trabajo externa (más lenta) |
 //! | IWRAM  | `0x0300_0000` | 32 KiB | RAM interna (rápida) |
 //! | I/O    | `0x0400_0000` | 1 KiB | registros de hardware |
@@ -108,8 +108,10 @@ pub struct Bus {
 impl Bus {
     /// Crea un bus con todas las RAM internas a cero y la `rom` dada en su sitio.
     ///
-    /// La BIOS queda a cero por ahora; el Mini-Hito 2.3a la cargará de verdad
-    /// para arrancar como el hardware real.
+    /// La BIOS arranca a cero; si se dispone de `gba_bios.bin` (la BIOS real,
+    /// opcional —es propietaria—), [`Bus::load_bios`] la vuelca en su región para
+    /// arrancar como el hardware (Mini-Hito 2.3a). Sin ella, la región queda a
+    /// cero y la consola usa el atajo "skip BIOS".
     pub fn new(rom: Vec<u8>) -> Self {
         Bus {
             bios: vec![0; BIOS_SIZE],
@@ -121,6 +123,17 @@ impl Bus {
             oam: vec![0; OAM_SIZE],
             rom,
         }
+    }
+
+    /// Vuelca el firmware de la BIOS en su región (`0x0`), reemplazando los ceros
+    /// con que arranca [`Bus::new`] (Mini-Hito 2.3a). Copia hasta [`BIOS_SIZE`]
+    /// bytes sin cambiar el tamaño del buffer: si llegara una BIOS más corta —no
+    /// debería, [`crate::Bios`] exige 16 KiB exactos— el resto se queda a cero, y
+    /// una más larga se trunca; en ningún caso panica. Lo invoca
+    /// [`crate::Gba::with_cartridge_and_bios`].
+    pub fn load_bios(&mut self, bios: &[u8]) {
+        let n = bios.len().min(BIOS_SIZE);
+        self.bios[..n].copy_from_slice(&bios[..n]);
     }
 
     /// Acceso de solo lectura a los bytes de la ROM cargada.

@@ -9,7 +9,7 @@
 //! sustituir el frontend de escritorio por uno de Android, iOS o WASM sin tocar
 //! una sola línea del núcleo.
 //!
-//! ## Estado actual (Fase 2.2i)
+//! ## Estado actual (Fase 2.3a)
 //!
 //! Además de cargar y validar el cartucho (Fase 1), el núcleo tiene el
 //! esqueleto del hardware: la CPU ARM7TDMI ([`Cpu`]) con sus registros y modos,
@@ -48,11 +48,18 @@
 //! 2.2i) ya mueve datos entre registros y memoria, con todos sus modos de
 //! direccionamiento (offset inmediato/registro, pre/post-indexado, write-back) y
 //! las rotaciones del acceso desalineado; por eso el bus se presta ahora como
-//! `&mut` al ejecutar. Seguir con el resto del set ARM (bloque `LDM`/`STM`,
-//! `SWP`, `SWI`...) es lo que viene. La frontera con el frontend —entregar un
-//! buffer RGBA— no cambia.
+//! `&mut` al ejecutar. Con eso, el **set ARM** quedó completo —bloque `LDM`/`STM`
+//! (2.2j), `SWP`/`SWPB` (2.2k) y las excepciones `SWI`/indefinida (2.2l)— y se
+//! sumó el **set THUMB** entero (2.2m). El Mini-Hito **2.3a** cierra por fin el
+//! atajo "skip BIOS": si se aporta un `gba_bios.bin` válido (la **BIOS real**,
+//! [`Bios`], opcional porque es propietaria), [`Gba::with_cartridge_and_bios`] la
+//! carga en `0x0` y arranca el `PC` ahí como el hardware; si no, se mantiene el
+//! atajo [`Gba::with_cartridge`]. Y el `fetch` ([`Cpu::fetch`]) ya lee 2 bytes en
+//! estado THUMB y 4 en ARM. La frontera con el frontend —entregar un buffer
+//! RGBA— no cambia.
 
 pub mod arm;
+pub mod bios;
 pub mod bus;
 pub mod cartridge;
 pub mod cpu;
@@ -61,6 +68,7 @@ pub mod scheduler;
 pub mod thumb;
 
 pub use arm::{ArmInstruction, Condition, Decoded};
+pub use bios::{Bios, BiosError};
 pub use bus::{AccessWidth, Bus};
 pub use cartridge::{Cartridge, CartridgeError, MAX_ROM_SIZE, MIN_ROM_SIZE};
 pub use cpu::{Cpu, CpuMode, Cpsr, Halt, RunReport, RunStop, StepResult};
@@ -115,20 +123,39 @@ impl Gba {
     /// Construye la consola a partir de un cartucho ya validado y la deja lista
     /// para ejecutar: vuelca la ROM en el bus y coloca el `PC` en el arranque.
     ///
-    /// ## ⚠️ Atajo temporal de desarrollo ("skip BIOS")
+    /// ## Atajo "skip BIOS" (fallback cuando no hay `gba_bios.bin`)
     ///
     /// La GBA real arranca en `0x0000_0000` (BIOS), y es la BIOS la que salta al
-    /// cartucho. Hasta integrar la BIOS (Mini-Hito 2.3a), apuntamos el `PC`
-    /// directamente al inicio de la ROM (`0x0800_0000`) y reproducimos a mano el
-    /// **estado post-BIOS** (modo System y stack pointers montados, ver
-    /// [`Cpu::skip_bios_init`]) para poder ejecutar ya el código del juego.
-    /// **Estas dos líneas desaparecen en el 2.3a**, donde el arranque pasará a
-    /// ser el real desde la BIOS.
+    /// cartucho. Cuando **no** se dispone de la BIOS real (que es propietaria y no
+    /// se distribuye, ver [`Bios`]), este atajo apunta el `PC` directamente al
+    /// inicio de la ROM (`0x0800_0000`) y reproduce a mano el **estado post-BIOS**
+    /// (modo System y stack pointers montados, ver [`Cpu::skip_bios_init`]) para
+    /// poder ejecutar ya el código del juego. Con la BIOS real disponible, usa
+    /// [`Gba::with_cartridge_and_bios`], que arranca de forma fiel desde `0x0`
+    /// (Mini-Hito 2.3a).
     pub fn with_cartridge(cart: Cartridge) -> Self {
         let mut cpu = Cpu::new();
-        cpu.set_pc(bus::ROM_START); // atajo skip-BIOS (temporal, ver 2.3a)
+        cpu.set_pc(bus::ROM_START); // atajo skip-BIOS (sin BIOS real)
         cpu.skip_bios_init(); // estado post-BIOS: modo System + pila montada
         Self::with_hardware(cpu, Bus::new(cart.into_rom()))
+    }
+
+    /// Construye la consola con la **BIOS real** cargada en `0x0` y arranca como
+    /// el hardware (Mini-Hito 2.3a): vuelca la BIOS en su región, deja el `PC` en
+    /// `0x0000_0000` y **no** aplica el atajo "skip BIOS".
+    ///
+    /// El `PC` no se toca a propósito: [`Cpu::new`] ya deja `r15 = 0` en el estado
+    /// de reset exacto (modo Supervisor, ARM, IRQ/FIQ enmascaradas) desde el que
+    /// arranca la BIOS. Es la propia BIOS la que inicializa el hardware, monta los
+    /// stack pointers y acaba saltando al cartucho (`0x0800_0000`) de forma
+    /// natural —cerrando el atajo del Mini-Hito 2.1b—.
+    ///
+    /// La BIOS es **opcional**: si el frontend no consigue un `gba_bios.bin`
+    /// válido, debe usar [`Gba::with_cartridge`] (el atajo) en su lugar.
+    pub fn with_cartridge_and_bios(cart: Cartridge, bios: Bios) -> Self {
+        let mut bus = Bus::new(cart.into_rom());
+        bus.load_bios(bios.as_bytes());
+        Self::with_hardware(Cpu::new(), bus)
     }
 
     /// Constructor común: monta la consola con la CPU y el bus dados y pinta el
@@ -314,5 +341,51 @@ mod tests {
             report.stop,
             RunStop::Halted(Halt::Unimplemented { .. })
         ));
+    }
+
+    /// Escribe una instrucción de 32 bits (little-endian) en `buf` en `offset`.
+    fn poner(buf: &mut [u8], offset: usize, instr: u32) {
+        buf[offset..offset + 4].copy_from_slice(&instr.to_le_bytes());
+    }
+
+    #[test]
+    fn con_bios_arranca_en_0x0_y_salta_a_la_rom() {
+        // BIOS **sintética** de test (NO la de Nintendo, que es propietaria):
+        // 16 KiB con un mini-programa ARM en 0x0 que carga la dirección de la ROM
+        // y salta ahí, como hace la BIOS real al ceder el control (Mini-Hito 2.3a).
+        let mut bios = vec![0u8; crate::bus::BIOS_SIZE];
+        poner(&mut bios, 0x00, 0xE3A0_0408); // MOV r0, #0x0800_0000 (inicio de la ROM)
+        poner(&mut bios, 0x04, 0xE12F_FF10); // BX r0 → salta a la ROM en estado ARM
+        let bios = Bios::from_bytes(bios).expect("16 KiB es una BIOS válida");
+
+        // ROM: marca su ejecución (r2 = 42) y termina en el bucle «b .».
+        let mut rom = vec![0u8; MIN_ROM_SIZE];
+        poner(&mut rom, 0x00, 0xE3A0_202A); // MOV r2, #42
+        poner(&mut rom, 0x04, 0xEAFF_FFFE); // b . (fin que el bucle detecta)
+        let cart = Cartridge::from_bytes(rom).unwrap();
+
+        let mut gba = Gba::with_cartridge_and_bios(cart, bios);
+
+        // El cierre del atajo del 2.1b: el PC arranca en 0x0 (BIOS), no en la ROM.
+        assert_eq!(gba.pc(), 0x0000_0000);
+
+        let report = gba.run(100);
+        // La BIOS se ejecutó (r0) y, tras su salto, también el cartucho (r2).
+        assert_eq!(gba.reg(0), 0x0800_0000, "la BIOS se ejecutó desde 0x0");
+        assert_eq!(gba.reg(2), 42, "saltó al cartucho y ejecutó su código");
+        assert!(
+            matches!(report.stop, RunStop::Halted(Halt::InfiniteLoop { .. })),
+            "se detiene en el «b .» final de la ROM"
+        );
+    }
+
+    #[test]
+    fn sin_bios_el_atajo_skip_bios_arranca_en_la_rom() {
+        // El mismo cartucho, pero sin BIOS: el atajo "skip BIOS" arranca el PC en
+        // la ROM (0x0800_0000), no en 0x0.
+        let mut rom = vec![0u8; MIN_ROM_SIZE];
+        poner(&mut rom, 0x00, 0xEAFF_FFFE); // b .
+        let gba = Gba::with_cartridge(Cartridge::from_bytes(rom).unwrap());
+        assert_eq!(gba.pc(), crate::bus::ROM_START);
     }
 }

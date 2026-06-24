@@ -9,10 +9,10 @@
 //! Toda la lógica de emulación —y la decisión de qué es un cartucho válido—
 //! vive en el núcleo; aquí solo hay I/O de plataforma y pintado.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use gba_core::{
-    Cartridge, Cpu, Decoded, Gba, Halt, RunStop, MAX_ROM_SIZE, SCREEN_HEIGHT, SCREEN_WIDTH,
+    Bios, Cartridge, Cpu, Decoded, Gba, Halt, RunStop, MAX_ROM_SIZE, SCREEN_HEIGHT, SCREEN_WIDTH,
 };
 use minifb::{Key, Scale, Window, WindowOptions};
 
@@ -44,10 +44,11 @@ fn main() {
                 println!("  Título:       «{}»", header.title);
                 println!("  Código juego: «{}»", header.game_code);
 
-                // Mini-Hitos 2.1b/2.1c — Fetch + Decode: montamos la consola con
-                // el cartucho (lo que coloca el PC en la ROM), leemos la primera
-                // instrucción y la clasificamos (sin ejecutar su lógica todavía).
-                let mut gba = Gba::with_cartridge(cart);
+                // Mini-Hitos 2.1b/2.1c/2.3a — Fetch + Decode: montamos la consola
+                // con el cartucho (usando la BIOS real si está disponible, ver
+                // `build_gba`), leemos la primera instrucción y la clasificamos
+                // (sin ejecutar su lógica todavía).
+                let mut gba = build_gba(cart);
                 let instr = gba.fetch();
                 println!(
                     "  Primera instrucción ARM @ {:#010X}: {:#010X}",
@@ -155,7 +156,7 @@ fn run_test_rom(path: &Path) {
 
     // Tope de seguridad: una suite de test cabe de sobra; si se supera, algo va mal.
     const MAX_STEPS: u64 = 50_000_000;
-    let mut gba = Gba::with_cartridge(cart);
+    let mut gba = build_gba(cart);
     let report = gba.run(MAX_STEPS);
     println!(
         "Instrucciones ejecutadas: {} ({} ciclos)",
@@ -215,6 +216,62 @@ fn load_cartridge(path: &Path) -> Result<Cartridge, Box<dyn std::error::Error>> 
     Ok(cart)
 }
 
+/// Monta la consola con el cartucho, usando la **BIOS real** si está disponible
+/// —arranque fiel desde `0x0`— o el atajo "skip BIOS" si no (Mini-Hito 2.3a).
+///
+/// La BIOS es opcional porque `gba_bios.bin` es propietaria de Nintendo y no se
+/// distribuye con el emulador; el usuario aporta su propio volcado. En cualquiera
+/// de los dos modos imprime por consola cuál se ha usado.
+fn build_gba(cart: Cartridge) -> Gba {
+    match try_load_bios() {
+        Some(bios) => {
+            println!("  BIOS real detectada: arranque desde 0x0 (PC = 0x00000000).");
+            Gba::with_cartridge_and_bios(cart, bios)
+        }
+        None => {
+            println!(
+                "  Sin gba_bios.bin: atajo «skip BIOS» (PC → ROM). Para el arranque \
+                 real, coloca una BIOS de 16 KiB como «gba_bios.bin» en el directorio \
+                 actual o indica su ruta con la variable de entorno GBA_BIOS."
+            );
+            Gba::with_cartridge(cart)
+        }
+    }
+}
+
+/// Intenta localizar y cargar `gba_bios.bin` (la BIOS real, opcional). Orden de
+/// búsqueda: la variable de entorno `GBA_BIOS` (ruta explícita) y, si no está, un
+/// `gba_bios.bin` en el directorio de trabajo.
+///
+/// Devuelve `None` —con un aviso por `stderr`— si no se encuentra o no es válida,
+/// para que [`build_gba`] caiga limpiamente al atajo "skip BIOS" en vez de
+/// abortar: un usuario sin BIOS debe poder seguir usando el emulador.
+fn try_load_bios() -> Option<Bios> {
+    let path = std::env::var_os("GBA_BIOS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("gba_bios.bin"));
+
+    if !path.exists() {
+        return None;
+    }
+
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Aviso: no se pudo leer la BIOS «{}»: {e}.", path.display());
+            return None;
+        }
+    };
+
+    match Bios::from_bytes(bytes) {
+        Ok(bios) => Some(bios),
+        Err(e) => {
+            eprintln!("Aviso: «{}» no es una BIOS válida: {e}.", path.display());
+            None
+        }
+    }
+}
+
 /// Da formato legible a un tamaño en bytes (KiB / MiB).
 fn human_size(bytes: usize) -> String {
     const KIB: usize = 1024;
@@ -237,7 +294,7 @@ fn run_window(gba: Gba) {
     let mut buffer: Vec<u32> = vec![0; SCREEN_WIDTH * SCREEN_HEIGHT];
 
     let mut window = Window::new(
-        "EmulaRUST — GBA (Fase 2.2a · ESC para salir)",
+        "EmulaRUST — GBA (Fase 2.3a · ESC para salir)",
         SCREEN_WIDTH,
         SCREEN_HEIGHT,
         WindowOptions {

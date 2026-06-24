@@ -425,10 +425,12 @@ impl Cpu {
     /// Crea una CPU en su estado de **reset** del ARM7TDMI: modo Supervisor,
     /// estado ARM, IRQ y FIQ deshabilitadas, y todos los registros a cero.
     ///
-    /// (El `PC` de arranque lo coloca quien construye la consola:
-    /// [`crate::Gba::with_cartridge`] lo apunta a la ROM como atajo "skip BIOS"
-    /// (Mini-Hito 2.1b), y el 2.3a lo cambiará para arrancar de verdad desde la
-    /// BIOS en `0x0`. De momento esto es solo un punto de partida coherente.)
+    /// Este es **exactamente el estado de reset** desde el que arranca la BIOS
+    /// real, incluido `r15 = 0` (todos los registros a cero): por eso, con la
+    /// BIOS cargada, [`crate::Gba::with_cartridge_and_bios`] no toca el `PC` y la
+    /// CPU empieza a ejecutar en `0x0` (Mini-Hito 2.3a). Sin BIOS,
+    /// [`crate::Gba::with_cartridge`] usa el atajo "skip BIOS" (Mini-Hito 2.1b):
+    /// apunta el `PC` a la ROM y llama a [`Cpu::skip_bios_init`].
     pub fn new() -> Self {
         let mut cpsr = Cpsr::from_bits(0);
         // El procesador real arranca en Supervisor, en ARM, con las
@@ -452,9 +454,10 @@ impl Cpu {
         }
     }
 
-    /// Configura el estado **post-BIOS** que el atajo "skip BIOS" debe emular
-    /// hasta que el Mini-Hito 2.3a arranque desde la BIOS real (lo invoca
-    /// [`crate::Gba::with_cartridge`]).
+    /// Configura el estado **post-BIOS** que el atajo "skip BIOS" emula **cuando
+    /// no se dispone de la BIOS real** (lo invoca [`crate::Gba::with_cartridge`]).
+    /// Con la BIOS cargada ([`crate::Gba::with_cartridge_and_bios`], Mini-Hito
+    /// 2.3a) este atajo **no** se usa: es la propia BIOS la que monta los stacks.
     ///
     /// La BIOS de la GBA, justo antes de ceder el control al cartucho, deja la
     /// CPU en modo **System** con los tres stack pointers que **todo** juego da
@@ -553,10 +556,16 @@ impl Cpu {
     /// instrucción a la que apunta `PC`—. El avance del puntero llega con el
     /// bucle de ejecución (Mini-Hito 2.2a).
     ///
-    /// De momento siempre lee 4 bytes (modo ARM). El Mini-Hito 2.3a añadirá la
-    /// rama THUMB: leer 2 bytes cuando el bit `T` del CPSR esté activo.
+    /// Lee **4 bytes en estado ARM** y, desde el Mini-Hito 2.3a, **2 bytes en
+    /// estado THUMB** (cuando el bit `T` del CPSR está activo), devueltos en los
+    /// 16 bits bajos. Así una sola fachada sirve para ambos estados; el bucle
+    /// interno ([`Cpu::step_thumb`]) lee el halfword directamente por eficiencia.
     pub fn fetch(&self, bus: &Bus) -> u32 {
-        bus.read_u32(self.pc())
+        if self.cpsr.thumb() {
+            u32::from(bus.read_u16(self.pc()))
+        } else {
+            bus.read_u32(self.pc())
+        }
     }
 
     /// **Decode** en modo ARM (Mini-Hito 2.1c): clasifica la instrucción `instr`
@@ -2557,6 +2566,25 @@ mod tests {
         assert_eq!(cpu.pipeline_offset(), PC_AHEAD_THUMB);
         assert_eq!(cpu.pc(), 0x0800_0000);
         assert_eq!(cpu.reg(PC), 0x0800_0004);
+    }
+
+    #[test]
+    fn fetch_lee_dos_bytes_en_thumb_y_cuatro_en_arm() {
+        // Una palabra conocida en IWRAM (región escribible).
+        let mut bus = Bus::new(Vec::new());
+        bus.write_u32(0x0300_0000, 0xAABB_CCDD);
+
+        let mut cpu = Cpu::new();
+        cpu.set_pc(0x0300_0000);
+
+        // ARM (estado de reset): el fetch lee la palabra completa de 32 bits.
+        assert!(!cpu.cpsr().thumb());
+        assert_eq!(cpu.fetch(&bus), 0xAABB_CCDD);
+
+        // THUMB (Mini-Hito 2.3a): el fetch lee solo el halfword de 16 bits,
+        // devuelto en los bits bajos.
+        cpu.cpsr_mut().set_thumb(true);
+        assert_eq!(cpu.fetch(&bus), 0x0000_CCDD);
     }
 
     #[test]
