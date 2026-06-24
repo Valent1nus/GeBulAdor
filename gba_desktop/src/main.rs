@@ -294,7 +294,7 @@ fn run_window(gba: Gba) {
     let mut buffer: Vec<u32> = vec![0; SCREEN_WIDTH * SCREEN_HEIGHT];
 
     let mut window = Window::new(
-        "EmulaRUST — GBA (Fase 2.3a · ESC para salir)",
+        "EmulaRUST — GBA (Fase 2.3a-bis · ESC para salir)",
         SCREEN_WIDTH,
         SCREEN_HEIGHT,
         WindowOptions {

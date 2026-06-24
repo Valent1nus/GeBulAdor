@@ -482,6 +482,20 @@ impl Cpu {
         self.bank_sp[CpuMode::Irq.bank()] = 0x0300_7FA0; // SP_irq (en su banco)
     }
 
+    /// Reinicia la CPU como la deja la BIOS tras un **`SoftReset`** (SWI 0x00; su
+    /// HLE vive en el módulo `bios_hle`, Mini-Hito 2.3a-bis): vuelve al estado de
+    /// reset con los stacks montados y en modo System ([`Cpu::skip_bios_init`]), y
+    /// deja el `PC` en `entry` (la ROM o la EWRAM, según el byte de control que
+    /// mira el HLE). **Conserva el contador de ciclos**: un *soft reset* reinicia
+    /// el programa emulado, no el reloj del emulador.
+    pub fn enter_soft_reset(&mut self, entry: u32) {
+        let cycles = self.cycles;
+        *self = Cpu::new();
+        self.skip_bios_init();
+        self.set_pc(entry);
+        self.cycles = cycles;
+    }
+
     /// Lee un registro visible por índice (`0`–`15`), **con la semántica de
     /// pipeline para `r15`**.
     ///
@@ -1371,20 +1385,19 @@ impl Cpu {
 
     /// Ejecuta **un paso**: fetch → decode → execute de una sola instrucción
     /// (Mini-Hito 2.2a), sumando sus ciclos (2.2c) y avanzando o saltando el `PC`.
+    /// Según el bit `T` del CPSR despacha a [`Cpu::step_arm`] o [`Cpu::step_thumb`].
     ///
-    /// Solo se ejecuta el set **ARM** (el fetch THUMB de 2 bytes llega en el
-    /// 2.3a). De ARM están implementados el **procesamiento de datos completo**
-    /// (Mini-Hito 2.2f: inmediato y registro por el barrel shifter, incluido
-    /// `Rd = r15`), la **transferencia de PSR** `MRS`/`MSR` (Mini-Hito 2.2g), la
-    /// **multiplicación** `MUL`/`MLA`/largas (Mini-Hito 2.2h), la **carga/almacén
-    /// simple** `LDR`/`STR`/`LDRB`/`STRB` y de media palabra/byte con signo
-    /// `LDRH`/`STRH`/`LDRSB`/`LDRSH` (Mini-Hito 2.2i), la **carga/almacén en
-    /// bloque** `LDM`/`STM` (Mini-Hito 2.2j), el **intercambio atómico** `SWP`/
-    /// `SWPB` (Mini-Hito 2.2k), los **saltos** `B`/`BL`/`BX` (Mini-Hito 2.2e) y
-    /// las **excepciones** `SWI`/instrucción indefinida (Mini-Hito 2.2l). Lo que
-    /// queda sin ejecutar —las de **coprocesador** (la GBA no lo tiene) y todo el
-    /// set **THUMB** (2.2m)— detiene la CPU con [`StepResult::Halted`], **sin**
-    /// avanzar el `PC` (queda en la instrucción culpable, para inspeccionarla).
+    /// El set **ARM** está completo: **procesamiento de datos** (Mini-Hito 2.2f,
+    /// incluido `Rd = r15`), **transferencia de PSR** `MRS`/`MSR` (2.2g),
+    /// **multiplicación** `MUL`/`MLA`/largas (2.2h), **carga/almacén simple**
+    /// `LDR`/`STR`/`LDRB`/`STRB` y de media palabra/byte con signo (2.2i), **en
+    /// bloque** `LDM`/`STM` (2.2j), **intercambio atómico** `SWP`/`SWPB` (2.2k),
+    /// **saltos** `B`/`BL`/`BX` (2.2e) y las **excepciones** `SWI`/indefinida
+    /// (2.2l). El `SWI` se resuelve además por **HLE** sin BIOS real (2.3a-bis,
+    /// ver `Cpu::execute_swi_hle`). El set **THUMB** entero también se ejecuta
+    /// (2.2m). Solo las instrucciones de **coprocesador** (la GBA no lo tiene)
+    /// detienen la CPU con [`StepResult::Halted`], **sin** avanzar el `PC` (queda
+    /// en la instrucción culpable, para inspeccionarla).
     pub fn step(&mut self, bus: &mut Bus) -> StepResult {
         if self.cpsr.thumb() {
             self.step_thumb(bus)
@@ -1571,10 +1584,18 @@ impl Cpu {
                 self.execute_bx(instr);
                 Executed::Branched { extra_cycles: 0 }
             }
-            // `SWI` (Mini-Hito 2.2l): excepción de software → modo Supervisor por
-            // el vector `0x08`. En la GBA es la vía de llamada a la BIOS.
+            // `SWI`: la vía de llamada a la BIOS. Con **BIOS real** cargada (LLE,
+            // Mini-Hito 2.2l) entra por el vector `0x08` para que la ejecute la
+            // BIOS; **sin BIOS** se intercepta y se ejecuta el **HLE** de la
+            // función (Mini-Hito 2.3a-bis), que es el camino por defecto del
+            // emulador. En ARM el número de función son los **bits 23-16** del
+            // comentario de 24 bits.
             ArmInstruction::SoftwareInterrupt => {
-                self.enter_exception(CpuMode::Supervisor, 0x0000_0008)
+                if bus.has_bios() {
+                    self.enter_exception(CpuMode::Supervisor, 0x0000_0008)
+                } else {
+                    self.execute_swi_hle(((instr >> 16) & 0xFF) as u8, bus)
+                }
             }
             // Instrucción **indefinida** (Mini-Hito 2.2l): excepción → modo
             // Undefined por el vector `0x04`.
@@ -1610,8 +1631,16 @@ impl Cpu {
             T::PushPop => self.thumb_push_pop(instr, bus),
             T::MultipleLoadStore => self.thumb_multiple_load_store(instr, bus),
             T::ConditionalBranch => self.thumb_conditional_branch(instr),
-            // SWI THUMB: misma excepción que en ARM (modo Supervisor, vector 0x08).
-            T::SoftwareInterrupt => self.enter_exception(CpuMode::Supervisor, 0x0000_0008),
+            // SWI THUMB: como en ARM, LLE por el vector `0x08` con BIOS real o
+            // **HLE** sin ella (Mini-Hito 2.3a-bis). En THUMB el número de función
+            // es el `imm8` (bits 7-0).
+            T::SoftwareInterrupt => {
+                if bus.has_bios() {
+                    self.enter_exception(CpuMode::Supervisor, 0x0000_0008)
+                } else {
+                    self.execute_swi_hle((instr & 0xFF) as u8, bus)
+                }
+            }
             T::UnconditionalBranch => self.thumb_unconditional_branch(instr),
             T::LongBranchWithLink => self.thumb_long_branch_with_link(instr),
             // Indefinida THUMB: excepción de instrucción indefinida (vector 0x04).
@@ -2171,6 +2200,17 @@ impl Cpu {
         self.cpsr.set_thumb(false); // y siempre en estado ARM
         self.set_pc(vector);
         Executed::Branched { extra_cycles: 0 }
+    }
+
+    /// Ejecuta un `SWI` en **modo HLE** (sin BIOS real): despacha la función
+    /// `number` a su implementación nativa en [`crate::bios_hle`] y deja que la
+    /// CPU continúe, **sin entrar al vector `0x08`** (Mini-Hito 2.3a-bis). Es el
+    /// camino por defecto del emulador —el que no necesita `gba_bios.bin`—; con
+    /// BIOS real cargada se usa en su lugar [`Cpu::enter_exception`]. El `number`
+    /// ya lo extrajo el llamante (bits 23-16 del comentario en ARM, `imm8` en
+    /// THUMB).
+    fn execute_swi_hle(&mut self, number: u8, bus: &mut Bus) -> Executed {
+        crate::bios_hle::dispatch(self, bus, number)
     }
 
     /// El CPSR actual (copia; es `Copy`).
@@ -3970,6 +4010,10 @@ mod tests {
     fn swi_entra_en_supervisor_por_el_vector_8() {
         let base = crate::bus::IWRAM_START;
         let mut bus = Bus::new(vec![0u8; 4]);
+        // Con BIOS real cargada el SWI entra por el vector 0x08 (camino LLE); sin
+        // ella se interceptaría en HLE (Mini-Hito 2.3a-bis). Este test valida el
+        // mecanismo de excepción, que es justo el del modo LLE.
+        bus.load_bios(&[0u8; crate::bus::BIOS_SIZE]);
         bus.write_u32(base, 0xEF00_0000); // SWI #0
         let mut cpu = Cpu::new();
         cpu.set_pc(base);
@@ -4008,12 +4052,14 @@ mod tests {
 
     #[test]
     fn swi_y_retorno_con_movs_pc_lr_vuelve_al_flujo() {
-        // Integración entrada+retorno: el SWI entra en el handler y el retorno
-        // típico `MOVS pc, lr` restaura el CPSR desde el SPSR (modo y flags
-        // previos) y vuelve a la instrucción siguiente al SWI. No hay BIOS en
-        // skip-BIOS, así que simulamos el retorno aplicando el `MOVS` a mano.
+        // Integración entrada+retorno (modo LLE, con BIOS real cargada): el SWI
+        // entra en el handler y el retorno típico `MOVS pc, lr` restaura el CPSR
+        // desde el SPSR (modo y flags previos) y vuelve a la instrucción siguiente
+        // al SWI. La BIOS sintética es todo ceros (no hay handler real), así que
+        // simulamos su retorno aplicando el `MOVS` a mano.
         let base = crate::bus::IWRAM_START;
         let mut bus = Bus::new(vec![0u8; 4]);
+        bus.load_bios(&[0u8; crate::bus::BIOS_SIZE]); // modo LLE: SWI → vector 0x08
         bus.write_u32(base, 0xEF00_0000); // SWI #0
         let mut cpu = Cpu::new();
         cpu.set_pc(base);
@@ -4028,6 +4074,50 @@ mod tests {
         assert_eq!(cpu.mode(), CpuMode::System, "el retorno restaura el modo previo");
         assert_eq!(cpu.cpsr().bits(), cpsr_previo, "y el CPSR completo");
         assert_eq!(cpu.pc(), base + 4, "vuelve a la instrucción siguiente al SWI");
+    }
+
+    // ===== HLE de la BIOS: despacho del SWI (Mini-Hito 2.3a-bis) =============
+
+    #[test]
+    fn swi_sin_bios_ejecuta_el_hle_y_continua_arm() {
+        // SWI #0x060000 = Div (la función es el byte 23-16). Sin BIOS, se
+        // intercepta en HLE: divide r0/r1 y CONTINÚA, sin entrar al vector 0x08.
+        let base = crate::bus::IWRAM_START;
+        let mut bus = Bus::new(vec![0u8; 4]); // sin load_bios → modo HLE
+        bus.write_u32(base, 0xEF06_0000); // SWI #0x060000 (Div)
+        let mut cpu = Cpu::new();
+        cpu.set_pc(base);
+        cpu.set_mode(CpuMode::System);
+        cpu.set_reg(0, 100);
+        cpu.set_reg(1, 7);
+
+        let efecto = cpu.step(&mut bus);
+        assert_eq!(efecto, StepResult::Stepped);
+        assert_eq!(cpu.mode(), CpuMode::System, "el HLE no cambia de modo");
+        assert_eq!(cpu.pc(), base + 4, "continúa a la instrucción siguiente al SWI");
+        assert_eq!(cpu.reg(0), 14, "cociente 100/7");
+        assert_eq!(cpu.reg(1), 2, "resto 100%7");
+    }
+
+    #[test]
+    fn swi_sin_bios_ejecuta_el_hle_y_continua_thumb() {
+        // En THUMB el número de función es el imm8: 0xDF06 = SWI 6 (Div).
+        let base = crate::bus::IWRAM_START;
+        let mut bus = Bus::new(vec![0u8; 4]); // modo HLE
+        bus.write_u16(base, 0xDF06); // SWI 6 (THUMB)
+        let mut cpu = Cpu::new();
+        cpu.set_pc(base);
+        cpu.set_mode(CpuMode::System);
+        cpu.cpsr_mut().set_thumb(true);
+        cpu.set_reg(0, 20);
+        cpu.set_reg(1, 6);
+
+        cpu.step(&mut bus);
+        assert_eq!(cpu.mode(), CpuMode::System, "sigue en System (no entra al vector)");
+        assert!(cpu.cpsr().thumb(), "sigue en estado THUMB");
+        assert_eq!(cpu.pc(), base + 2, "avanza 2 bytes (siguiente instrucción THUMB)");
+        assert_eq!(cpu.reg(0), 3, "cociente 20/6");
+        assert_eq!(cpu.reg(1), 2, "resto 20%6");
     }
 
     // ===== Ejecución THUMB (Mini-Hito 2.2m) =================================

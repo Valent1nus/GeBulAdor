@@ -103,6 +103,12 @@ pub struct Bus {
     vram: Vec<u8>,
     oam: Vec<u8>,
     rom: Vec<u8>,
+
+    /// `true` si se ha cargado la **BIOS real** ([`Bus::load_bios`]). Es la fuente
+    /// de verdad de "¿hay BIOS?" y decide el camino del `SWI`: con BIOS real se
+    /// salta al vector `0x08` (LLE, Mini-Hito 2.2l); sin ella se intercepta y se
+    /// ejecuta el **HLE** de la función (Mini-Hito 2.3a-bis). Ver [`Bus::has_bios`].
+    bios_loaded: bool,
 }
 
 impl Bus {
@@ -122,6 +128,7 @@ impl Bus {
             vram: vec![0; VRAM_SIZE],
             oam: vec![0; OAM_SIZE],
             rom,
+            bios_loaded: false,
         }
     }
 
@@ -134,6 +141,15 @@ impl Bus {
     pub fn load_bios(&mut self, bios: &[u8]) {
         let n = bios.len().min(BIOS_SIZE);
         self.bios[..n].copy_from_slice(&bios[..n]);
+        self.bios_loaded = true;
+    }
+
+    /// `true` si se ha cargado la **BIOS real** (firmware de Nintendo) con
+    /// [`Bus::load_bios`]. Lo consulta el despacho del `SWI`: con BIOS real, la
+    /// llamada va al vector `0x08` para que la ejecute la BIOS (LLE); sin ella,
+    /// se intercepta y se ejecuta el **HLE** en Rust (Mini-Hito 2.3a-bis).
+    pub fn has_bios(&self) -> bool {
+        self.bios_loaded
     }
 
     /// Acceso de solo lectura a los bytes de la ROM cargada.
@@ -392,6 +408,16 @@ mod tests {
         assert_eq!(v0, 7);
         assert_eq!(v1, 7);
         assert_eq!(v2, 7);
+    }
+
+    #[test]
+    fn has_bios_distingue_el_modo_hle_del_lle() {
+        // Sin cargar BIOS, el bus declara que no hay (camino HLE del SWI).
+        let mut bus = bus_de_prueba();
+        assert!(!bus.has_bios(), "un bus recién creado no tiene BIOS real");
+        // Tras cargar una, pasa a modo LLE (el SWI irá al vector 0x08).
+        bus.load_bios(&[0u8; BIOS_SIZE]);
+        assert!(bus.has_bios(), "load_bios marca que hay BIOS real");
     }
 
     #[test]

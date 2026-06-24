@@ -9,7 +9,7 @@
 //! sustituir el frontend de escritorio por uno de Android, iOS o WASM sin tocar
 //! una sola línea del núcleo.
 //!
-//! ## Estado actual (Fase 2.3a)
+//! ## Estado actual (Fase 2.3a-bis)
 //!
 //! Además de cargar y validar el cartucho (Fase 1), el núcleo tiene el
 //! esqueleto del hardware: la CPU ARM7TDMI ([`Cpu`]) con sus registros y modos,
@@ -55,11 +55,17 @@
 //! [`Bios`], opcional porque es propietaria), [`Gba::with_cartridge_and_bios`] la
 //! carga en `0x0` y arranca el `PC` ahí como el hardware; si no, se mantiene el
 //! atajo [`Gba::with_cartridge`]. Y el `fetch` ([`Cpu::fetch`]) ya lee 2 bytes en
-//! estado THUMB y 4 en ARM. La frontera con el frontend —entregar un buffer
+//! estado THUMB y 4 en ARM. El Mini-Hito **2.3a-bis** completa ese camino sin
+//! BIOS con el **HLE** de los `SWI` (módulo interno `bios_hle`): cuando no hay
+//! BIOS real ([`Bus::has_bios`] es `false`), el `SWI` se intercepta y se ejecuta en Rust la
+//! función equivalente (división, `CpuSet`, descompresión, matrices afines...) en
+//! vez de descarrilar en el vector `0x08`, de modo que el emulador funciona **sin
+//! requerir `gba_bios.bin`**. La frontera con el frontend —entregar un buffer
 //! RGBA— no cambia.
 
 pub mod arm;
 pub mod bios;
+pub(crate) mod bios_hle;
 pub mod bus;
 pub mod cartridge;
 pub mod cpu;
