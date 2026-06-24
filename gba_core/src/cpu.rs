@@ -452,6 +452,33 @@ impl Cpu {
         }
     }
 
+    /// Configura el estado **post-BIOS** que el atajo "skip BIOS" debe emular
+    /// hasta que el Mini-Hito 2.3a arranque desde la BIOS real (lo invoca
+    /// [`crate::Gba::with_cartridge`]).
+    ///
+    /// La BIOS de la GBA, justo antes de ceder el control al cartucho, deja la
+    /// CPU en modo **System** con los tres stack pointers que **todo** juego da
+    /// por hechos (la BIOS los monta; el código del cartucho nunca los
+    /// inicializa):
+    /// - `SP_usr/sys` = `0x0300_7F00`
+    /// - `SP_irq`     = `0x0300_7FA0`
+    /// - `SP_svc`     = `0x0300_7FE0`
+    ///
+    /// Sin esto, el primer `PUSH`/`POP` de cualquier ROM real (incluidas las
+    /// gba-tests) escribe en memoria no mapeada con `SP = 0` y, al retornar,
+    /// el `POP {..., pc}` lee basura y salta a `0x0000_0000`. Es un prerequisito
+    /// del arnés de validación (Mini-Hito 2.2b): sin pila, no se llega a ningún
+    /// test.
+    pub fn skip_bios_init(&mut self) {
+        // Arrancamos en Supervisor (estado de reset). Fijamos su SP, pasamos a
+        // System (el modo en que la BIOS entrega el control) y fijamos el SP de
+        // System; el de IRQ se deja directamente en su banco.
+        self.set_reg(SP, 0x0300_7FE0); // SP_svc (visible en Supervisor)
+        self.set_mode(CpuMode::System); // guarda SP_svc en su banco y entra a System
+        self.set_reg(SP, 0x0300_7F00); // SP_usr/sys (visible en System)
+        self.bank_sp[CpuMode::Irq.bank()] = 0x0300_7FA0; // SP_irq (en su banco)
+    }
+
     /// Lee un registro visible por índice (`0`–`15`), **con la semántica de
     /// pipeline para `r15`**.
     ///
@@ -1107,6 +1134,185 @@ impl Cpu {
         Executed::Accessed { extra_cycles: extra }
     }
 
+    /// Ejecuta una **transferencia en bloque** `LDM`/`STM` (Mini-Hito 2.2j): carga
+    /// o almacena una lista de registros (`r0`–`r15`) de/hacia memoria. Es la base
+    /// de `PUSH`/`POP` y de los prólogos/epílogos de función.
+    ///
+    /// Encoding: `cccc 100P USWL nnnn rrrr rrrr rrrr rrrr`. `Rn` (19-16) es la
+    /// base; los 16 bits bajos son la **lista de registros** (bit *i* = registro
+    /// *i*). Los bits de control:
+    /// - `P` (24) pre/post: ajusta la dirección **antes** (`IB`/`DB`) o **después**
+    ///   (`IA`/`DA`) de cada transferencia.
+    /// - `U` (23) up/down: direcciones **ascendentes** (`I`) o **descendentes** (`D`).
+    /// - `W` (21) write-back: deja en `Rn` la dirección final del bloque.
+    /// - `L` (20) load/store: `1` = `LDM`, `0` = `STM`.
+    /// - `S` (22): con `r15` en la lista de un `LDM` es un retorno de excepción
+    ///   (restaura el `CPSR` desde el `SPSR`); en otro caso seleccionaría el banco
+    ///   de registros de **User** (ver nota de pendientes).
+    ///
+    /// **Orden invariante:** sea cual sea el modo, el registro de **menor índice
+    /// va a la dirección más baja**. Por eso se calcula la dirección más baja del
+    /// bloque y se recorre la lista de `r0` a `r15` en orden ascendente.
+    ///
+    /// **Quirks del ARM7TDMI cubiertos:**
+    /// - `STM` con la base en la lista: si `Rn` es el **primero** que se almacena,
+    ///   se guarda su valor **original**; si no, el ya actualizado por write-back.
+    /// - `LDM` con la base en la lista: el dato cargado manda (el write-back no
+    ///   pisa el valor recién leído).
+    /// - `STM` de `r15`: almacena la dirección de la instrucción **+12** (vía
+    ///   [`Cpu::store_value`]).
+    /// - `LDM` a `r15`: es un **salto** (alineado a palabra); con `S=1` restaura
+    ///   además el `CPSR` (lo que puede pasar a THUMB).
+    ///
+    /// *(Pendiente de una revisión posterior: la transferencia del banco **User**
+    /// con `S=1` sin `r15`, y el caso de **lista vacía**. En User/System —donde las
+    /// gba-tests pasan la mayor parte del tiempo— el banco User es el actual, así
+    /// que la aproximación coincide.)*
+    pub fn execute_block_data_transfer(&mut self, instr: u32, bus: &mut Bus) -> Executed {
+        let pre = (instr & (1 << 24)) != 0; // P
+        let add = (instr & (1 << 23)) != 0; // U
+        let s_bit = (instr & (1 << 22)) != 0; // S (restaurar CPSR / banco User)
+        let write_back = (instr & (1 << 21)) != 0; // W
+        let load = (instr & (1 << 20)) != 0; // L
+        let rn = ((instr >> 16) & 0xF) as usize;
+        let list = instr & 0xFFFF;
+
+        let n = list.count_ones();
+        let block_bytes = 4 * n;
+        let base = self.reg(rn);
+
+        // Dirección más baja del bloque y valor final de la base. Como siempre se
+        // transfiere en orden ascendente de dirección, basta con situar esa
+        // primera dirección: `U` decide arriba/abajo y `P` si el ajuste va antes.
+        let lowest = if add {
+            if pre {
+                base.wrapping_add(4) // IB
+            } else {
+                base // IA
+            }
+        } else {
+            let down = base.wrapping_sub(block_bytes);
+            if pre {
+                down // DB
+            } else {
+                down.wrapping_add(4) // DA
+            }
+        };
+        let writeback_value = if add {
+            base.wrapping_add(block_bytes)
+        } else {
+            base.wrapping_sub(block_bytes)
+        };
+
+        // ¿Es `Rn` el registro de menor índice de la lista? (No hay ningún bit por
+        // debajo de `rn` activo.) Decide el quirk del `STM` con la base en la lista.
+        let rn_is_first = (list & (1 << rn)) != 0 && (list & ((1 << rn) - 1)) == 0;
+
+        let mut addr = lowest;
+        let mut extra = 0u64;
+        let mut first = true;
+        let mut branch_target: Option<u32> = None;
+
+        for reg in 0..16usize {
+            if list & (1 << reg) == 0 {
+                continue;
+            }
+            // LDM/STM fuerza alineación a palabra (ignora los 2 bits bajos); no
+            // hay rotación de desalineado como en `LDR`. Primer acceso N, resto S.
+            let aligned = addr & !3;
+            extra += u64::from(bus.access_cycles(aligned, AccessWidth::Word, !first));
+
+            if load {
+                let value = bus.read_u32(aligned);
+                if reg == PC {
+                    branch_target = Some(value); // se resuelve al final (salto)
+                } else {
+                    self.set_reg(reg, value);
+                }
+            } else {
+                // `STM`. Si la base va en la lista y NO es la primera, se guarda ya
+                // con el write-back aplicado; si es la primera (o no hay write-back),
+                // su valor original. `r15` se almacena como instrucción+12.
+                let value = if reg == rn && write_back && !rn_is_first {
+                    writeback_value
+                } else {
+                    self.store_value(reg)
+                };
+                bus.write_u32(aligned, value);
+            }
+
+            addr = addr.wrapping_add(4);
+            first = false;
+        }
+
+        // Write-back de la base. En `LDM`, si la base estaba en la lista, el dato
+        // cargado prevalece: no se vuelve a escribir encima.
+        if write_back && !(load && (list & (1 << rn)) != 0) {
+            self.set_reg(rn, writeback_value);
+        }
+
+        // `LDM` con `r15` en la lista: salto. Con `S=1`, retorno de excepción.
+        if let Some(target) = branch_target {
+            if s_bit {
+                self.restore_cpsr_from_spsr();
+            }
+            let aligned = if self.cpsr().thumb() {
+                target & !1
+            } else {
+                target & !3
+            };
+            self.set_pc(aligned);
+            extra += 1; // I-cycle de la carga
+            return Executed::Branched { extra_cycles: extra };
+        }
+
+        if load {
+            extra += 1; // el `LDM` añade un I-cycle (el último dato no llega a tiempo)
+        }
+        Executed::Accessed { extra_cycles: extra }
+    }
+
+    /// Ejecuta un **intercambio atómico** `SWP`/`SWPB` (Mini-Hito 2.2k): lee una
+    /// palabra (o byte, con `B=1`) de la dirección de `Rn`, escribe `Rm` en esa
+    /// misma dirección y deja en `Rd` el valor leído — todo de forma indivisible.
+    /// Es la primitiva de exclusión mutua del ARM7TDMI.
+    ///
+    /// Encoding: `cccc 0001 0B00 nnnn dddd 0000 1001 mmmm`. No hay offset ni
+    /// modos de direccionamiento: la dirección es exactamente `Rn`. La lectura de
+    /// palabra **rota** si la dirección está desalineada (igual que `LDR`, ver
+    /// [`Bus::read_u32`] y el Mini-Hito 2.1a); la escritura alinea (como `STR`).
+    ///
+    /// El valor de `Rm` se captura **antes** de tocar memoria, así que `SWP Rd,
+    /// Rd, [Rn]` (mismo registro de fuente y destino) intercambia correctamente el
+    /// registro con la memoria.
+    pub fn execute_single_data_swap(&mut self, instr: u32, bus: &mut Bus) -> Executed {
+        let byte = (instr & (1 << 22)) != 0; // B
+        let rn = ((instr >> 16) & 0xF) as usize;
+        let rd = ((instr >> 12) & 0xF) as usize;
+        let rm = (instr & 0xF) as usize;
+
+        let address = self.reg(rn);
+        let source = self.reg(rm); // capturado antes de escribir (por si Rd == Rm)
+
+        let width = if byte { AccessWidth::Byte } else { AccessWidth::Word };
+        // Dos accesos de datos no secuenciales (N): la lectura y la escritura.
+        let mut extra = u64::from(bus.access_cycles(address, width, false));
+        extra += u64::from(bus.access_cycles(address, width, false));
+        extra += 1; // más un I-cycle interno
+
+        if byte {
+            let loaded = u32::from(bus.read_u8(address));
+            bus.write_u8(address, source as u8);
+            self.set_reg(rd, loaded);
+        } else {
+            let loaded = bus.read_u32(address); // rota si está desalineada (como LDR)
+            bus.write_u32(address, source); // el bus alinea la dirección (como STR)
+            self.set_reg(rd, loaded);
+        }
+
+        Executed::Accessed { extra_cycles: extra }
+    }
+
     /// El valor con el que un registro `Rd` participa como **fuente de un
     /// almacén**. Idéntico a [`Cpu::reg`] salvo para `r15`: al almacenar, el
     /// ARM7TDMI escribe la dirección de la instrucción **+12**; como `reg(PC)` ya
@@ -1163,10 +1369,13 @@ impl Cpu {
     /// `Rd = r15`), la **transferencia de PSR** `MRS`/`MSR` (Mini-Hito 2.2g), la
     /// **multiplicación** `MUL`/`MLA`/largas (Mini-Hito 2.2h), la **carga/almacén
     /// simple** `LDR`/`STR`/`LDRB`/`STRB` y de media palabra/byte con signo
-    /// `LDRH`/`STRH`/`LDRSB`/`LDRSH` (Mini-Hito 2.2i) y los **saltos** `B`/`BL`/`BX`
-    /// (Mini-Hito 2.2e); ante cualquier otra instrucción la CPU se detiene con
-    /// [`StepResult::Halted`], **sin** avanzar el `PC` (queda en la instrucción
-    /// culpable, para inspeccionarla).
+    /// `LDRH`/`STRH`/`LDRSB`/`LDRSH` (Mini-Hito 2.2i), la **carga/almacén en
+    /// bloque** `LDM`/`STM` (Mini-Hito 2.2j), el **intercambio atómico** `SWP`/
+    /// `SWPB` (Mini-Hito 2.2k), los **saltos** `B`/`BL`/`BX` (Mini-Hito 2.2e) y
+    /// las **excepciones** `SWI`/instrucción indefinida (Mini-Hito 2.2l). Lo que
+    /// queda sin ejecutar —las de **coprocesador** (la GBA no lo tiene) y todo el
+    /// set **THUMB** (2.2m)— detiene la CPU con [`StepResult::Halted`], **sin**
+    /// avanzar el `PC` (queda en la instrucción culpable, para inspeccionarla).
     pub fn step(&mut self, bus: &mut Bus) -> StepResult {
         let pc = self.pc();
 
@@ -1292,6 +1501,11 @@ impl Cpu {
             // Carga/almacén de media palabra y byte con signo `LDRH`/`STRH`/
             // `LDRSB`/`LDRSH` (Mini-Hito 2.2i). Ver [`Cpu::execute_halfword_transfer`].
             ArmInstruction::HalfwordTransfer => self.execute_halfword_transfer(instr, bus),
+            // Carga/almacén en bloque `LDM`/`STM` (Mini-Hito 2.2j): base de
+            // `PUSH`/`POP`. Ver [`Cpu::execute_block_data_transfer`].
+            ArmInstruction::BlockDataTransfer => self.execute_block_data_transfer(instr, bus),
+            // Intercambio atómico `SWP`/`SWPB` (Mini-Hito 2.2k).
+            ArmInstruction::SingleDataSwap => self.execute_single_data_swap(instr, bus),
             // Saltos relativos `B`/`BL` (Mini-Hito 2.2e).
             ArmInstruction::Branch { link } => {
                 self.execute_branch(instr, link);
@@ -1302,6 +1516,16 @@ impl Cpu {
                 self.execute_bx(instr);
                 Executed::Branched { extra_cycles: 0 }
             }
+            // `SWI` (Mini-Hito 2.2l): excepción de software → modo Supervisor por
+            // el vector `0x08`. En la GBA es la vía de llamada a la BIOS.
+            ArmInstruction::SoftwareInterrupt => {
+                self.enter_exception(CpuMode::Supervisor, 0x0000_0008)
+            }
+            // Instrucción **indefinida** (Mini-Hito 2.2l): excepción → modo
+            // Undefined por el vector `0x04`.
+            ArmInstruction::Undefined => self.enter_exception(CpuMode::Undefined, 0x0000_0004),
+            // Coprocesador: la GBA no tiene, así que no se implementa (queda como
+            // "no implementada" para el bucle; podría tratarse como indefinida).
             _ => Executed::Unimplemented,
         }
     }
@@ -1330,6 +1554,31 @@ impl Cpu {
         self.cpsr.set_thumb(to_thumb);
         let aligned = if to_thumb { target & !1 } else { target & !3 };
         self.set_pc(aligned);
+    }
+
+    /// Entra en una **excepción** del ARM7TDMI (Mini-Hito 2.2l): el mecanismo
+    /// común a `SWI`, la instrucción indefinida y (más adelante) IRQ/abortos.
+    /// Cambia al modo privilegiado que la atiende, preservando lo justo para
+    /// poder volver con un `MOVS pc, lr`:
+    /// 1. Calcula la dirección de retorno (la instrucción siguiente a la actual).
+    /// 2. Cambia de modo —lo que banca `SP`/`LR`— y guarda el `CPSR` previo en el
+    ///    `SPSR` de ese modo.
+    /// 3. Deja el retorno en `LR`, enmascara las `IRQ` (`I=1`) y fuerza estado ARM.
+    /// 4. Salta al **vector** de la excepción.
+    ///
+    /// (El `SWI` lleva un comentario de 24 bits con el número de función de BIOS;
+    /// el hardware lo ignora y aquí también — el HLE/LLE de esas funciones es
+    /// cosa del Mini-Hito 2.2l/2.3a, no del mecanismo de entrada.)
+    fn enter_exception(&mut self, mode: CpuMode, vector: u32) -> Executed {
+        let return_addr = self.pc().wrapping_add(self.instruction_size());
+        let saved_cpsr = self.cpsr.bits();
+        self.set_mode(mode); // banca SP/LR al modo de la excepción
+        self.set_spsr(saved_cpsr); // SPSR_<mode> = CPSR previo (para el retorno)
+        self.set_reg(LR, return_addr); // LR_<mode> = dirección de retorno
+        self.cpsr.set_irq_disabled(true); // las excepciones entran con IRQ enmascarada
+        self.cpsr.set_thumb(false); // y siempre en estado ARM
+        self.set_pc(vector);
+        Executed::Branched { extra_cycles: 0 }
     }
 
     /// El CPSR actual (copia; es `Copy`).
@@ -1939,8 +2188,9 @@ mod tests {
     #[test]
     fn el_bucle_ejecuta_hasta_una_no_implementada() {
         use crate::arm::ArmInstruction;
-        // MOV r0,#5 ; ADD r0,r0,#1 ; STMFD sp!,{r0,r1,lr} (bloque: aún sin implementar).
-        let programa = [0xE3A0_0005u32, 0xE280_0001, 0xE92D_4003];
+        // MOV r0,#5 ; ADD r0,r0,#1 ; CDP (coprocesador: la GBA no lo tiene, no se
+        // implementa nunca, así que es un "no implementada" estable para el test).
+        let programa = [0xE3A0_0005u32, 0xE280_0001, 0xEE00_0000];
         let mut rom = vec![0u8; programa.len() * 4];
         for (i, w) in programa.iter().enumerate() {
             rom[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
@@ -1954,13 +2204,13 @@ mod tests {
         assert_eq!(cpu.step(&mut bus), StepResult::Stepped);
         assert_eq!(cpu.reg(0), 6); // ADD r0, r0, #1
 
-        // La tercera (una carga) aún no está implementada → la CPU se detiene.
+        // La tercera (una de coprocesador, que la GBA no implementa) → se detiene.
         let pc_culpable = cpu.pc();
         match cpu.step(&mut bus) {
             StepResult::Halted(Halt::Unimplemented { pc, instr, kind }) => {
                 assert_eq!(pc, crate::bus::ROM_START + 8);
-                assert_eq!(instr, 0xE92D_4003);
-                assert_eq!(kind, ArmInstruction::BlockDataTransfer);
+                assert_eq!(instr, 0xEE00_0000);
+                assert_eq!(kind, ArmInstruction::Coprocessor);
             }
             otro => panic!("esperaba Halted, fue {otro:?}"),
         }
@@ -2136,7 +2386,7 @@ mod tests {
         let mut bus = Bus::new(vec![0u8; 4]);
         bus.write_u32(crate::bus::IWRAM_START, 0xE3A0_0000); // MOV r0, #0
         bus.write_u32(crate::bus::IWRAM_START + 4, 0xE3A0_1001); // MOV r1, #1
-        bus.write_u32(crate::bus::IWRAM_START + 8, 0xE92D_4003); // STMFD sp!,{...}: no impl.
+        bus.write_u32(crate::bus::IWRAM_START + 8, 0xEE00_0000); // CDP (coprocesador): no impl.
         let mut cpu = Cpu::new();
         cpu.set_pc(crate::bus::IWRAM_START);
 
@@ -2918,5 +3168,231 @@ mod tests {
         cpu.step(&mut bus); // MOV: su fetch
         let fetch_mov = cpu.cycles() - tras_str;
         assert_eq!(fetch_mov, 8, "el fetch tras un acceso a memoria es N (8), no S (6)");
+    }
+
+    // ===== Carga/almacén en bloque LDM/STM (Mini-Hito 2.2j) =================
+
+    #[test]
+    fn push_y_pop_preservan_registros_y_saltan() {
+        let mut bus = Bus::new(vec![0u8; 4]);
+        let mut cpu = Cpu::new();
+        let stack_top = crate::bus::IWRAM_START + 0x100;
+        cpu.set_reg(SP, stack_top);
+        cpu.set_reg(0, 0xAAAA_AAAA);
+        cpu.set_reg(1, 0xBBBB_BBBB);
+        cpu.set_reg(LR, 0x0800_1234);
+
+        // PUSH {r0,r1,lr} = STMDB sp!, {r0,r1,lr}
+        cpu.execute_block_data_transfer(0xE92D_4003, &mut bus);
+        assert_eq!(cpu.sp(), stack_top - 12, "PUSH de 3 baja el SP 12");
+        // Menor índice (r0) en la dirección más baja, sea cual sea el modo.
+        assert_eq!(bus.read_u32(stack_top - 12), 0xAAAA_AAAA);
+        assert_eq!(bus.read_u32(stack_top - 8), 0xBBBB_BBBB);
+        assert_eq!(bus.read_u32(stack_top - 4), 0x0800_1234);
+
+        cpu.set_reg(0, 0);
+        cpu.set_reg(1, 0);
+        // POP {r0,r1,pc} = LDMIA sp!, {r0,r1,pc}
+        let efecto = cpu.execute_block_data_transfer(0xE8BD_8003, &mut bus);
+        assert_eq!(cpu.reg(0), 0xAAAA_AAAA);
+        assert_eq!(cpu.reg(1), 0xBBBB_BBBB);
+        assert_eq!(cpu.sp(), stack_top, "POP restaura el SP");
+        assert!(matches!(efecto, Executed::Branched { .. }), "POP con pc es un salto");
+        assert_eq!(cpu.pc(), 0x0800_1234, "salta a la dirección apilada (alineada)");
+    }
+
+    #[test]
+    fn stmia_con_write_back_avanza_la_base() {
+        // El patrón de un bucle de limpieza de memoria: STMIA base!, {r0}. Si el
+        // write-back no avanzara la base, ese bucle no terminaría nunca.
+        let mut bus = Bus::new(vec![0u8; 4]);
+        let mut cpu = Cpu::new();
+        let addr = crate::bus::IWRAM_START;
+        cpu.set_reg(0, 0xDEAD_BEEF);
+        cpu.set_reg(1, addr);
+        let efecto = cpu.execute_block_data_transfer(0xE8A1_0001, &mut bus); // STMIA r1!, {r0}
+        assert_eq!(cpu.reg(1), addr + 4, "STMIA con write-back avanza la base 4");
+        assert_eq!(bus.read_u32(addr), 0xDEAD_BEEF);
+        assert!(matches!(efecto, Executed::Accessed { .. }), "un STM sin pc es Accessed");
+    }
+
+    #[test]
+    fn los_cuatro_modos_situan_el_bloque_donde_toca() {
+        // STM base!, {r0,r1} con base = centro; r0 (menor) siempre en la dirección
+        // más baja. Comprobamos posiciones y write-back de IA/IB/DA/DB.
+        let cases = [
+            // (opcode, off_r0, off_r1, delta_base)
+            (0xE8A2_0003u32, 0i64, 4, 8),   // STMIA r2!, {r0,r1}
+            (0xE9A2_0003, 4, 8, 8),         // STMIB r2!, {r0,r1}
+            (0xE822_0003, -4, 0, -8),       // STMDA r2!, {r0,r1}
+            (0xE922_0003, -8, -4, -8),      // STMDB r2!, {r0,r1}
+        ];
+        for (opcode, off0, off1, delta) in cases {
+            let mut bus = Bus::new(vec![0u8; 4]);
+            let mut cpu = Cpu::new();
+            let base = crate::bus::IWRAM_START + 0x40;
+            cpu.set_reg(0, 0x1111_1111);
+            cpu.set_reg(1, 0x2222_2222);
+            cpu.set_reg(2, base);
+            cpu.execute_block_data_transfer(opcode, &mut bus);
+            let at = |o: i64| (base as i64 + o) as u32;
+            assert_eq!(bus.read_u32(at(off0)), 0x1111_1111, "r0 en {opcode:#X}");
+            assert_eq!(bus.read_u32(at(off1)), 0x2222_2222, "r1 en {opcode:#X}");
+            assert_eq!(cpu.reg(2), at(delta), "write-back en {opcode:#X}");
+        }
+    }
+
+    #[test]
+    fn stm_de_la_base_no_primera_guarda_el_valor_ya_actualizado() {
+        // STMIA r1!, {r0,r1}: r1 es la base y NO es el menor índice, así que se
+        // almacena ya con el write-back aplicado (quirk del ARM7TDMI).
+        let mut bus = Bus::new(vec![0u8; 4]);
+        let mut cpu = Cpu::new();
+        let base = crate::bus::IWRAM_START + 0x40;
+        cpu.set_reg(0, 0x1111_1111);
+        cpu.set_reg(1, base);
+        cpu.execute_block_data_transfer(0xE8A1_0003, &mut bus); // STMIA r1!, {r0,r1}
+        assert_eq!(bus.read_u32(base), 0x1111_1111, "r0 (primero) con su valor");
+        assert_eq!(bus.read_u32(base + 4), base + 8, "r1 (base, no primero) ya actualizado");
+        assert_eq!(cpu.reg(1), base + 8);
+    }
+
+    #[test]
+    fn ldm_de_la_base_en_lista_no_pisa_el_dato_cargado() {
+        // LDMIA r0!, {r0,r1}: la base se carga de memoria; el dato cargado debe
+        // prevalecer sobre el write-back.
+        let mut bus = Bus::new(vec![0u8; 4]);
+        let mut cpu = Cpu::new();
+        let base = crate::bus::IWRAM_START + 0x40;
+        bus.write_u32(base, 0x1111_1111);
+        bus.write_u32(base + 4, 0x2222_2222);
+        cpu.set_reg(0, base);
+        cpu.execute_block_data_transfer(0xE8B0_0003, &mut bus); // LDMIA r0!, {r0,r1}
+        assert_eq!(cpu.reg(0), 0x1111_1111, "la base lleva el dato cargado, no base+8");
+        assert_eq!(cpu.reg(1), 0x2222_2222);
+    }
+
+    // ===== Intercambio atómico SWP/SWPB (Mini-Hito 2.2k) ====================
+
+    #[test]
+    fn swp_intercambia_palabra_con_memoria() {
+        let mut bus = Bus::new(vec![0u8; 4]);
+        let mut cpu = Cpu::new();
+        let addr = crate::bus::IWRAM_START + 0x40;
+        bus.write_u32(addr, 0xCAFE_F00D);
+        cpu.set_reg(2, addr); // Rn = dirección
+        cpu.set_reg(1, 0x1234_5678); // Rm = valor a escribir
+        let efecto = cpu.execute_single_data_swap(0xE102_0091, &mut bus); // SWP r0,r1,[r2]
+        assert_eq!(cpu.reg(0), 0xCAFE_F00D, "Rd recibe lo que había en memoria");
+        assert_eq!(bus.read_u32(addr), 0x1234_5678, "memoria recibe Rm");
+        assert!(matches!(efecto, Executed::Accessed { .. }), "un SWP es Accessed");
+    }
+
+    #[test]
+    fn swpb_intercambia_un_solo_byte() {
+        let mut bus = Bus::new(vec![0u8; 4]);
+        let mut cpu = Cpu::new();
+        let addr = crate::bus::IWRAM_START + 0x40;
+        bus.write_u32(addr, 0xAABB_CCDD);
+        cpu.set_reg(2, addr);
+        cpu.set_reg(1, 0x1234_5611);
+        cpu.execute_single_data_swap(0xE142_0091, &mut bus); // SWPB r0,r1,[r2]
+        assert_eq!(cpu.reg(0), 0x0000_00DD, "Rd recibe el byte bajo, extendido con ceros");
+        assert_eq!(bus.read_u8(addr), 0x11, "memoria recibe el byte bajo de Rm");
+        assert_eq!(bus.read_u8(addr + 1), 0xCC, "los demás bytes no se tocan");
+    }
+
+    #[test]
+    fn swp_con_rd_igual_a_rm_intercambia_atomicamente() {
+        // SWP r0, r0, [r1]: el mismo registro es fuente y destino. El valor de Rm
+        // se captura antes de escribir, así que el intercambio es correcto.
+        let mut bus = Bus::new(vec![0u8; 4]);
+        let mut cpu = Cpu::new();
+        let addr = crate::bus::IWRAM_START + 0x40;
+        bus.write_u32(addr, 0x1111_1111);
+        cpu.set_reg(1, addr); // Rn
+        cpu.set_reg(0, 0x2222_2222); // Rd == Rm == r0
+        cpu.execute_single_data_swap(0xE101_0090, &mut bus); // SWP r0,r0,[r1]
+        assert_eq!(cpu.reg(0), 0x1111_1111, "r0 recibe lo de memoria");
+        assert_eq!(bus.read_u32(addr), 0x2222_2222, "memoria recibe el r0 original");
+    }
+
+    #[test]
+    fn swp_de_palabra_desalineado_rota_como_ldr() {
+        let mut bus = Bus::new(vec![0u8; 4]);
+        let mut cpu = Cpu::new();
+        let base = crate::bus::IWRAM_START + 0x40;
+        bus.write_u32(base, 0xAABB_CCDD);
+        cpu.set_reg(2, base + 1); // dirección no múltiplo de 4
+        cpu.set_reg(1, 0x9999_9999);
+        cpu.execute_single_data_swap(0xE102_0091, &mut bus); // SWP r0,r1,[r2]
+        assert_eq!(cpu.reg(0), 0xDDAA_BBCC, "la lectura rota 8 bits, como LDR desalineado");
+        assert_eq!(bus.read_u32(base), 0x9999_9999, "la escritura alinea a la palabra base");
+    }
+
+    // ===== Excepciones: SWI e instrucción indefinida (Mini-Hito 2.2l) =======
+
+    #[test]
+    fn swi_entra_en_supervisor_por_el_vector_8() {
+        let base = crate::bus::IWRAM_START;
+        let mut bus = Bus::new(vec![0u8; 4]);
+        bus.write_u32(base, 0xEF00_0000); // SWI #0
+        let mut cpu = Cpu::new();
+        cpu.set_pc(base);
+        cpu.set_mode(CpuMode::System); // modo previo conocido (≠ Supervisor)
+        cpu.cpsr_mut().set_irq_disabled(false); // habilitadas, para ver que SWI las enmascara
+        cpu.cpsr_mut().set_c(true); // un flag cualquiera, debe acabar en el SPSR
+        let cpsr_previo = cpu.cpsr().bits();
+
+        let efecto = cpu.step(&mut bus);
+        assert_eq!(efecto, StepResult::Stepped);
+        assert_eq!(cpu.mode(), CpuMode::Supervisor, "SWI entra en Supervisor");
+        assert_eq!(cpu.pc(), 0x0000_0008, "salta al vector SWI");
+        assert_eq!(cpu.reg(LR), base + 4, "LR_svc = instrucción siguiente al SWI");
+        assert_eq!(cpu.spsr(), Some(cpsr_previo), "SPSR_svc = CPSR previo");
+        assert!(!cpu.cpsr().thumb(), "entra en estado ARM");
+        assert!(cpu.cpsr().bits() & (1 << 7) != 0, "SWI enmascara las IRQ (I=1)");
+    }
+
+    #[test]
+    fn instruccion_indefinida_entra_en_modo_undefined_por_el_vector_4() {
+        let base = crate::bus::IWRAM_START;
+        let mut bus = Bus::new(vec![0u8; 4]);
+        // Espacio indefinido: `LDR`/`STR` con offset de registro y bit 4 = 1.
+        bus.write_u32(base, 0xE600_0010);
+        let mut cpu = Cpu::new();
+        cpu.set_pc(base);
+        cpu.set_mode(CpuMode::System);
+        let cpsr_previo = cpu.cpsr().bits();
+
+        cpu.step(&mut bus);
+        assert_eq!(cpu.mode(), CpuMode::Undefined);
+        assert_eq!(cpu.pc(), 0x0000_0004, "salta al vector de instrucción indefinida");
+        assert_eq!(cpu.reg(LR), base + 4, "LR_und = instrucción siguiente");
+        assert_eq!(cpu.spsr(), Some(cpsr_previo), "SPSR_und = CPSR previo");
+    }
+
+    #[test]
+    fn swi_y_retorno_con_movs_pc_lr_vuelve_al_flujo() {
+        // Integración entrada+retorno: el SWI entra en el handler y el retorno
+        // típico `MOVS pc, lr` restaura el CPSR desde el SPSR (modo y flags
+        // previos) y vuelve a la instrucción siguiente al SWI. No hay BIOS en
+        // skip-BIOS, así que simulamos el retorno aplicando el `MOVS` a mano.
+        let base = crate::bus::IWRAM_START;
+        let mut bus = Bus::new(vec![0u8; 4]);
+        bus.write_u32(base, 0xEF00_0000); // SWI #0
+        let mut cpu = Cpu::new();
+        cpu.set_pc(base);
+        cpu.set_mode(CpuMode::System);
+        let cpsr_previo = cpu.cpsr().bits();
+
+        cpu.step(&mut bus); // SWI → modo Supervisor, PC=0x08, LR_svc=base+4
+        assert_eq!(cpu.mode(), CpuMode::Supervisor);
+
+        // Retorno del handler: `MOVS pc, lr` restaura el CPSR desde el SPSR.
+        cpu.execute_data_processing(0xE1B0_F00E);
+        assert_eq!(cpu.mode(), CpuMode::System, "el retorno restaura el modo previo");
+        assert_eq!(cpu.cpsr().bits(), cpsr_previo, "y el CPSR completo");
+        assert_eq!(cpu.pc(), base + 4, "vuelve a la instrucción siguiente al SWI");
     }
 }

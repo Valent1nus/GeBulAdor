@@ -119,12 +119,15 @@ impl Gba {
     ///
     /// La GBA real arranca en `0x0000_0000` (BIOS), y es la BIOS la que salta al
     /// cartucho. Hasta integrar la BIOS (Mini-Hito 2.3a), apuntamos el `PC`
-    /// directamente al inicio de la ROM (`0x0800_0000`) para poder ejecutar ya
-    /// el código del juego. **Esa línea desaparece en el 2.3a**, donde el
-    /// arranque pasará a ser el real desde la BIOS.
+    /// directamente al inicio de la ROM (`0x0800_0000`) y reproducimos a mano el
+    /// **estado post-BIOS** (modo System y stack pointers montados, ver
+    /// [`Cpu::skip_bios_init`]) para poder ejecutar ya el código del juego.
+    /// **Estas dos líneas desaparecen en el 2.3a**, donde el arranque pasará a
+    /// ser el real desde la BIOS.
     pub fn with_cartridge(cart: Cartridge) -> Self {
         let mut cpu = Cpu::new();
         cpu.set_pc(bus::ROM_START); // atajo skip-BIOS (temporal, ver 2.3a)
+        cpu.skip_bios_init(); // estado post-BIOS: modo System + pila montada
         Self::with_hardware(cpu, Bus::new(cart.into_rom()))
     }
 
@@ -295,9 +298,9 @@ mod tests {
 
     #[test]
     fn run_ejecuta_la_rom_hasta_una_no_implementada() {
-        // MOV r0,#1 ; MOV r1,#2 ; STMFD sp!,{r0,r1,lr} (bloque: aún sin implementar):
-        // el bucle ejecuta los dos MOV y se detiene limpiamente en el bloque.
-        let programa = [0xE3A0_0001u32, 0xE3A0_1002, 0xE92D_4003];
+        // MOV r0,#1 ; MOV r1,#2 ; CDP (coprocesador: la GBA no lo tiene, no se
+        // implementa nunca): el bucle ejecuta los dos MOV y se detiene en la CDP.
+        let programa = [0xE3A0_0001u32, 0xE3A0_1002, 0xEE00_0000];
         let mut rom = vec![0u8; MIN_ROM_SIZE];
         for (i, w) in programa.iter().enumerate() {
             rom[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
@@ -306,7 +309,7 @@ mod tests {
         let mut gba = Gba::with_cartridge(cart);
 
         let report = gba.run(1_000);
-        assert_eq!(report.steps, 2, "dos MOV antes de la carga");
+        assert_eq!(report.steps, 2, "dos MOV antes de la CDP");
         assert!(matches!(
             report.stop,
             RunStop::Halted(Halt::Unimplemented { .. })
