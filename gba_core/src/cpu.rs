@@ -1377,14 +1377,17 @@ impl Cpu {
     /// set **THUMB** (2.2m)— detiene la CPU con [`StepResult::Halted`], **sin**
     /// avanzar el `PC` (queda en la instrucción culpable, para inspeccionarla).
     pub fn step(&mut self, bus: &mut Bus) -> StepResult {
-        let pc = self.pc();
-
-        // Tras un `BX` a THUMB el estado cambia, pero la ejecución THUMB aún no
-        // está (2.2m/2.3a): paramos limpiamente en vez de malinterpretar bytes.
         if self.cpsr.thumb() {
-            return StepResult::Halted(Halt::ThumbNotImplemented { pc });
+            self.step_thumb(bus)
+        } else {
+            self.step_arm(bus)
         }
+    }
 
+    /// Un paso en estado **ARM** (32 bits): el flujo de dos pasos condición→opcode
+    /// (Mini-Hito 2.1c).
+    fn step_arm(&mut self, bus: &mut Bus) -> StepResult {
+        let pc = self.pc();
         let instr = self.fetch(bus);
 
         // Coste del fetch del opcode (32 bits en ARM): N o S según haya sido
@@ -1406,37 +1409,80 @@ impl Cpu {
             Decoded::Execute(kind) if is_branch_to_self(kind, instr, pc) => {
                 StepResult::Halted(Halt::InfiniteLoop { pc, instr })
             }
-            Decoded::Execute(kind) => match self.try_execute_arm(kind, instr, bus) {
-                Executed::Continue { extra_cycles } => {
-                    self.advance_pc();
-                    self.account_step(fetch_cycles + extra_cycles);
-                    StepResult::Stepped
-                }
-                Executed::Accessed { extra_cycles } => {
-                    // Como `Continue` (avanza el PC), pero el acceso a datos dejó el
-                    // bus en una dirección ajena al flujo de instrucciones: el
-                    // siguiente fetch es no secuencial (N), no S.
-                    self.advance_pc();
-                    self.cycles += fetch_cycles + extra_cycles;
-                    self.seq_fetch_addr = None;
-                    StepResult::Stepped
-                }
-                Executed::Branched { extra_cycles } => {
-                    // El salto ya fijó el `PC`. Coste del ARM7TDMI = 2S + 1N: el
-                    // fetch del salto, el prefetch secuencial descartado y el
-                    // fetch del destino (que cuenta el próximo paso como N, por el
-                    // flush). Vaciamos el pipeline → el siguiente fetch es N. Un
-                    // shift por registro que escribe el PC suma además su I-cycle.
-                    let discarded =
-                        bus.access_cycles(pc.wrapping_add(4), AccessWidth::Word, true) as u64;
-                    self.cycles += fetch_cycles + discarded + extra_cycles;
-                    self.seq_fetch_addr = None;
-                    StepResult::Stepped
-                }
-                Executed::Unimplemented => {
-                    StepResult::Halted(Halt::Unimplemented { pc, instr, kind })
-                }
-            },
+            Decoded::Execute(kind) => {
+                let executed = self.try_execute_arm(kind, instr, bus);
+                self.finish_step(bus, executed, pc, fetch_cycles, 4, Halt::Unimplemented {
+                    pc,
+                    instr,
+                    kind,
+                })
+            }
+        }
+    }
+
+    /// Un paso en estado **THUMB** (16 bits, Mini-Hito 2.2m): no hay condición
+    /// global, así que el decode clasifica directo (sin el flujo de dos pasos de
+    /// ARM). El fetch es de media palabra.
+    fn step_thumb(&mut self, bus: &mut Bus) -> StepResult {
+        let pc = self.pc();
+        let instr = bus.read_u16(pc);
+
+        let seq = self.seq_fetch_addr == Some(pc);
+        let fetch_cycles = bus.access_cycles(pc, AccessWidth::Half, seq) as u64;
+
+        let kind = self.decode_thumb(instr);
+        // El «b .» de fin de las ROMs de test, ahora en THUMB.
+        if is_thumb_branch_to_self(kind, instr, pc) {
+            return StepResult::Halted(Halt::InfiniteLoop { pc, instr: u32::from(instr) });
+        }
+        let executed = self.try_execute_thumb(kind, instr, bus);
+        self.finish_step(bus, executed, pc, fetch_cycles, 2, Halt::ThumbNotImplemented { pc })
+    }
+
+    /// Contabiliza el efecto de una instrucción ya ejecutada sobre el `PC`, los
+    /// ciclos y la secuencialidad del próximo fetch. Común a ARM y THUMB;
+    /// `instr_size` es 4 (ARM) o 2 (THUMB) y `halt_if_unimpl` es la parada a
+    /// devolver si la instrucción aún no está implementada.
+    fn finish_step(
+        &mut self,
+        bus: &mut Bus,
+        executed: Executed,
+        pc: u32,
+        fetch_cycles: u64,
+        instr_size: u32,
+        halt_if_unimpl: Halt,
+    ) -> StepResult {
+        let width = if instr_size == 2 {
+            AccessWidth::Half
+        } else {
+            AccessWidth::Word
+        };
+        match executed {
+            Executed::Continue { extra_cycles } => {
+                self.advance_pc();
+                self.account_step(fetch_cycles + extra_cycles);
+                StepResult::Stepped
+            }
+            Executed::Accessed { extra_cycles } => {
+                // Como `Continue` (avanza el PC), pero el acceso a datos dejó el
+                // bus en una dirección ajena al flujo de instrucciones: el
+                // siguiente fetch es no secuencial (N), no S.
+                self.advance_pc();
+                self.cycles += fetch_cycles + extra_cycles;
+                self.seq_fetch_addr = None;
+                StepResult::Stepped
+            }
+            Executed::Branched { extra_cycles } => {
+                // El salto ya fijó el `PC`. Coste = 2S + 1N: el fetch del salto, el
+                // prefetch secuencial descartado y el fetch del destino (que cuenta
+                // el próximo paso como N, por el flush del pipeline).
+                let discarded =
+                    bus.access_cycles(pc.wrapping_add(instr_size), width, true) as u64;
+                self.cycles += fetch_cycles + discarded + extra_cycles;
+                self.seq_fetch_addr = None;
+                StepResult::Stepped
+            }
+            Executed::Unimplemented => StepResult::Halted(halt_if_unimpl),
         }
     }
 
@@ -1527,6 +1573,543 @@ impl Cpu {
             // Coprocesador: la GBA no tiene, así que no se implementa (queda como
             // "no implementada" para el bucle; podría tratarse como indefinida).
             _ => Executed::Unimplemented,
+        }
+    }
+
+    // ===== Ejecución THUMB (Mini-Hito 2.2m) =================================
+
+    /// Despacha la ejecución de una instrucción **THUMB** ya clasificada
+    /// (Mini-Hito 2.2m). Cada formato tiene su método; muchos reaprovechan la ALU,
+    /// el *barrel shifter* y las cargas/almacenes de ARM, con las reglas propias
+    /// de THUMB (registros de 3 bits, inmediatos más cortos, flags implícitos).
+    fn try_execute_thumb(&mut self, kind: ThumbInstruction, instr: u16, bus: &mut Bus) -> Executed {
+        use ThumbInstruction as T;
+        match kind {
+            T::MoveShifted => self.thumb_move_shifted(instr),
+            T::AddSubtract => self.thumb_add_subtract(instr),
+            T::MoveCompareAddSubImm => self.thumb_mov_cmp_add_sub_imm(instr),
+            T::AluOperation => self.thumb_alu(instr),
+            T::HiRegisterOpBx => self.thumb_hi_reg_op(instr),
+            T::PcRelativeLoad => self.thumb_pc_relative_load(instr, bus),
+            T::LoadStoreRegOffset => self.thumb_load_store_reg_offset(instr, bus),
+            T::LoadStoreSignExtended => self.thumb_load_store_sign_extended(instr, bus),
+            T::LoadStoreImmOffset => self.thumb_load_store_imm_offset(instr, bus),
+            T::LoadStoreHalfword => self.thumb_load_store_halfword(instr, bus),
+            T::SpRelativeLoadStore => self.thumb_sp_relative_load_store(instr, bus),
+            T::LoadAddress => self.thumb_load_address(instr),
+            T::AddOffsetToSp => self.thumb_add_offset_to_sp(instr),
+            T::PushPop => self.thumb_push_pop(instr, bus),
+            T::MultipleLoadStore => self.thumb_multiple_load_store(instr, bus),
+            T::ConditionalBranch => self.thumb_conditional_branch(instr),
+            // SWI THUMB: misma excepción que en ARM (modo Supervisor, vector 0x08).
+            T::SoftwareInterrupt => self.enter_exception(CpuMode::Supervisor, 0x0000_0008),
+            T::UnconditionalBranch => self.thumb_unconditional_branch(instr),
+            T::LongBranchWithLink => self.thumb_long_branch_with_link(instr),
+            // Indefinida THUMB: excepción de instrucción indefinida (vector 0x04).
+            T::Undefined => self.enter_exception(CpuMode::Undefined, 0x0000_0004),
+        }
+    }
+
+    /// Fija `N`/`Z` según `result` dejando `C` y `V` intactos: el patrón de flags
+    /// de las operaciones lógicas y los `MOV` inmediatos de THUMB.
+    fn set_nz(&mut self, result: u32) {
+        let c = self.cpsr().c();
+        self.write_flags(result, c, None);
+    }
+
+    /// Formato 1: `LSL`/`LSR`/`ASR Rd, Rs, #offset5`. Fija `N/Z/C` (el `C` del
+    /// shifter); `V` intacto.
+    fn thumb_move_shifted(&mut self, instr: u16) -> Executed {
+        let ty = match (instr >> 11) & 0b11 {
+            0 => ShiftType::Lsl,
+            1 => ShiftType::Lsr,
+            2 => ShiftType::Asr,
+            _ => unreachable!("op=3 lo decodifica AddSubtract, no MoveShifted"),
+        };
+        let amount = u32::from((instr >> 6) & 0x1F);
+        let rs = usize::from((instr >> 3) & 0b111);
+        let rd = usize::from(instr & 0b111);
+        let (result, carry) = shift_by_immediate(ty, amount, self.reg(rs), self.cpsr().c());
+        self.set_reg(rd, result);
+        self.write_flags(result, carry, None);
+        Executed::Continue { extra_cycles: 0 }
+    }
+
+    /// Formato 2: `ADD`/`SUB Rd, Rs, Rn|#offset3`. Fija `N/Z/C/V`.
+    fn thumb_add_subtract(&mut self, instr: u16) -> Executed {
+        let immediate = (instr >> 10) & 1 == 1;
+        let sub = (instr >> 9) & 1 == 1;
+        let rn_off = (instr >> 6) & 0b111;
+        let rs = usize::from((instr >> 3) & 0b111);
+        let rd = usize::from(instr & 0b111);
+        let a = self.reg(rs);
+        let b = if immediate {
+            u32::from(rn_off)
+        } else {
+            self.reg(usize::from(rn_off))
+        };
+        let (result, carry, overflow) = if sub {
+            with_v(alu_add(a, !b, true))
+        } else {
+            with_v(alu_add(a, b, false))
+        };
+        self.set_reg(rd, result);
+        self.write_flags(result, carry, overflow);
+        Executed::Continue { extra_cycles: 0 }
+    }
+
+    /// Formato 3: `MOV`/`CMP`/`ADD`/`SUB Rd, #imm8`. `MOV` fija solo `N/Z`; el
+    /// resto, `N/Z/C/V`. `CMP` no escribe `Rd`.
+    fn thumb_mov_cmp_add_sub_imm(&mut self, instr: u16) -> Executed {
+        let op = (instr >> 11) & 0b11;
+        let rd = usize::from((instr >> 8) & 0b111);
+        let imm = u32::from(instr & 0xFF);
+        let a = self.reg(rd);
+        match op {
+            0 => {
+                self.set_reg(rd, imm);
+                self.set_nz(imm);
+            }
+            1 => {
+                let (result, carry, overflow) = with_v(alu_add(a, !imm, true));
+                self.write_flags(result, carry, overflow);
+            }
+            2 => {
+                let (result, carry, overflow) = with_v(alu_add(a, imm, false));
+                self.set_reg(rd, result);
+                self.write_flags(result, carry, overflow);
+            }
+            3 => {
+                let (result, carry, overflow) = with_v(alu_add(a, !imm, true));
+                self.set_reg(rd, result);
+                self.write_flags(result, carry, overflow);
+            }
+            _ => unreachable!("op de 2 bits"),
+        }
+        Executed::Continue { extra_cycles: 0 }
+    }
+
+    /// Formato 4: las 16 operaciones ALU registro-registro (`Rd = Rd op Rs`). Cada
+    /// una fija los flags que le corresponden; los shifts y `MUL` añaden I-cycles.
+    fn thumb_alu(&mut self, instr: u16) -> Executed {
+        let op = (instr >> 6) & 0xF;
+        let rs = usize::from((instr >> 3) & 0b111);
+        let rd = usize::from(instr & 0b111);
+        let a = self.reg(rd);
+        let b = self.reg(rs);
+        let carry_in = self.cpsr().c();
+        let mut extra = 0u64;
+
+        // Helper local para los cuatro shifts por registro (LSL/LSR/ASR/ROR).
+        let do_shift = |cpu: &mut Self, ty: ShiftType| {
+            let (r, c) = shift_by_register(ty, b & 0xFF, a, carry_in);
+            cpu.set_reg(rd, r);
+            cpu.write_flags(r, c, None);
+        };
+
+        match op {
+            0x0 => {
+                let r = a & b;
+                self.set_reg(rd, r);
+                self.set_nz(r);
+            }
+            0x1 => {
+                let r = a ^ b;
+                self.set_reg(rd, r);
+                self.set_nz(r);
+            }
+            0x2 => {
+                do_shift(self, ShiftType::Lsl);
+                extra = 1;
+            }
+            0x3 => {
+                do_shift(self, ShiftType::Lsr);
+                extra = 1;
+            }
+            0x4 => {
+                do_shift(self, ShiftType::Asr);
+                extra = 1;
+            }
+            0x5 => {
+                let (r, c, v) = with_v(alu_add(a, b, carry_in));
+                self.set_reg(rd, r);
+                self.write_flags(r, c, v);
+            }
+            0x6 => {
+                let (r, c, v) = with_v(alu_add(a, !b, carry_in));
+                self.set_reg(rd, r);
+                self.write_flags(r, c, v);
+            }
+            0x7 => {
+                do_shift(self, ShiftType::Ror);
+                extra = 1;
+            }
+            0x8 => {
+                let r = a & b;
+                self.set_nz(r); // TST: solo flags
+            }
+            0x9 => {
+                let (r, c, v) = with_v(alu_add(0, !b, true)); // NEG = 0 - Rs
+                self.set_reg(rd, r);
+                self.write_flags(r, c, v);
+            }
+            0xA => {
+                let (r, c, v) = with_v(alu_add(a, !b, true)); // CMP
+                self.write_flags(r, c, v);
+            }
+            0xB => {
+                let (r, c, v) = with_v(alu_add(a, b, false)); // CMN
+                self.write_flags(r, c, v);
+            }
+            0xC => {
+                let r = a | b;
+                self.set_reg(rd, r);
+                self.set_nz(r);
+            }
+            0xD => {
+                let r = a.wrapping_mul(b); // MUL
+                self.set_reg(rd, r);
+                self.set_nz(r);
+                extra = multiply_internal_cycles(b, true);
+            }
+            0xE => {
+                let r = a & !b; // BIC
+                self.set_reg(rd, r);
+                self.set_nz(r);
+            }
+            0xF => {
+                let r = !b; // MVN
+                self.set_reg(rd, r);
+                self.set_nz(r);
+            }
+            _ => unreachable!("op de 4 bits"),
+        }
+        Executed::Continue { extra_cycles: extra }
+    }
+
+    /// Formato 5: operaciones con registros altos (`r8`–`r15`) y `BX`. `ADD`/`MOV`
+    /// no tocan flags (y con `Rd = r15` son un salto); `CMP` sí; `BX` salta y
+    /// puede cambiar a ARM.
+    fn thumb_hi_reg_op(&mut self, instr: u16) -> Executed {
+        let op = (instr >> 8) & 0b11;
+        let h1 = (instr >> 7) & 1;
+        let h2 = (instr >> 6) & 1;
+        let rs = usize::from(((instr >> 3) & 0b111) | (h2 << 3));
+        let rd = usize::from((instr & 0b111) | (h1 << 3));
+        let a = self.reg(rd);
+        let b = self.reg(rs);
+        match op {
+            0 => {
+                // ADD (sin flags). Con Rd = r15 es un salto (THUMB, alinea a ½).
+                let result = a.wrapping_add(b);
+                if rd == PC {
+                    self.set_pc(result & !1);
+                    return Executed::Branched { extra_cycles: 0 };
+                }
+                self.set_reg(rd, result);
+            }
+            1 => {
+                let (r, c, v) = with_v(alu_add(a, !b, true)); // CMP (sí flags)
+                self.write_flags(r, c, v);
+            }
+            2 => {
+                // MOV (sin flags). Con Rd = r15, salta.
+                if rd == PC {
+                    self.set_pc(b & !1);
+                    return Executed::Branched { extra_cycles: 0 };
+                }
+                self.set_reg(rd, b);
+            }
+            3 => {
+                // BX Rs: salta a Rs y cambia de estado según su bit 0.
+                let to_thumb = (b & 1) != 0;
+                self.cpsr.set_thumb(to_thumb);
+                let aligned = if to_thumb { b & !1 } else { b & !3 };
+                self.set_pc(aligned);
+                return Executed::Branched { extra_cycles: 0 };
+            }
+            _ => unreachable!("op de 2 bits"),
+        }
+        Executed::Continue { extra_cycles: 0 }
+    }
+
+    /// Formato 6: `LDR Rd, [PC, #imm8*4]`. El `PC` se alinea a palabra (su bit 1 se
+    /// fuerza a 0) antes de sumar el offset.
+    fn thumb_pc_relative_load(&mut self, instr: u16, bus: &mut Bus) -> Executed {
+        let rd = usize::from((instr >> 8) & 0b111);
+        let offset = u32::from(instr & 0xFF) * 4;
+        let address = (self.reg(PC) & !2).wrapping_add(offset);
+        self.set_reg(rd, bus.read_u32(address));
+        let extra = u64::from(bus.access_cycles(address, AccessWidth::Word, false)) + 1;
+        Executed::Accessed { extra_cycles: extra }
+    }
+
+    /// Formato 7: `LDR`/`STR`/`LDRB`/`STRB Rd, [Rb, Ro]` (offset de registro).
+    fn thumb_load_store_reg_offset(&mut self, instr: u16, bus: &mut Bus) -> Executed {
+        let load = (instr >> 11) & 1 == 1;
+        let byte = (instr >> 10) & 1 == 1;
+        let ro = usize::from((instr >> 6) & 0b111);
+        let rb = usize::from((instr >> 3) & 0b111);
+        let rd = usize::from(instr & 0b111);
+        let address = self.reg(rb).wrapping_add(self.reg(ro));
+        self.thumb_load_store(load, byte, rd, address, bus)
+    }
+
+    /// Formato 9: `LDR`/`STR`/`LDRB`/`STRB Rd, [Rb, #imm5]`. El offset va en
+    /// palabras (×4) para la forma de palabra y en bytes para la de byte.
+    fn thumb_load_store_imm_offset(&mut self, instr: u16, bus: &mut Bus) -> Executed {
+        let byte = (instr >> 12) & 1 == 1;
+        let load = (instr >> 11) & 1 == 1;
+        let imm5 = u32::from((instr >> 6) & 0x1F);
+        let rb = usize::from((instr >> 3) & 0b111);
+        let rd = usize::from(instr & 0b111);
+        let offset = if byte { imm5 } else { imm5 * 4 };
+        let address = self.reg(rb).wrapping_add(offset);
+        self.thumb_load_store(load, byte, rd, address, bus)
+    }
+
+    /// Núcleo común de las cargas/almacenes de palabra/byte de THUMB (formatos 7 y
+    /// 9): una sola dirección ya calculada, sin write-back.
+    fn thumb_load_store(
+        &mut self,
+        load: bool,
+        byte: bool,
+        rd: usize,
+        address: u32,
+        bus: &mut Bus,
+    ) -> Executed {
+        let width = if byte {
+            AccessWidth::Byte
+        } else {
+            AccessWidth::Word
+        };
+        let mut extra = u64::from(bus.access_cycles(address, width, false));
+        if load {
+            let value = if byte {
+                u32::from(bus.read_u8(address))
+            } else {
+                bus.read_u32(address)
+            };
+            self.set_reg(rd, value);
+            extra += 1;
+        } else {
+            let value = self.reg(rd);
+            if byte {
+                bus.write_u8(address, value as u8);
+            } else {
+                bus.write_u32(address, value);
+            }
+        }
+        Executed::Accessed { extra_cycles: extra }
+    }
+
+    /// Formato 8: carga/almacén con signo `STRH`/`LDRSB`/`LDRH`/`LDRSH` (offset de
+    /// registro). Reaprovecha las rotaciones/extensiones de signo de ARM (2.2i).
+    fn thumb_load_store_sign_extended(&mut self, instr: u16, bus: &mut Bus) -> Executed {
+        let op = (instr >> 10) & 0b11; // 0=STRH,1=LDRSB,2=LDRH,3=LDRSH
+        let ro = usize::from((instr >> 6) & 0b111);
+        let rb = usize::from((instr >> 3) & 0b111);
+        let rd = usize::from(instr & 0b111);
+        let address = self.reg(rb).wrapping_add(self.reg(ro));
+        let mut extra = u64::from(bus.access_cycles(address, AccessWidth::Half, false));
+        match op {
+            0 => bus.write_u16(address, self.reg(rd) as u16),
+            1 => {
+                self.set_reg(rd, i32::from(bus.read_u8(address) as i8) as u32);
+                extra += 1;
+            }
+            2 => {
+                self.set_reg(rd, load_halfword(bus, address));
+                extra += 1;
+            }
+            3 => {
+                self.set_reg(rd, load_signed_halfword(bus, address));
+                extra += 1;
+            }
+            _ => unreachable!("op de 2 bits"),
+        }
+        Executed::Accessed { extra_cycles: extra }
+    }
+
+    /// Formato 10: `LDRH`/`STRH Rd, [Rb, #imm5*2]`.
+    fn thumb_load_store_halfword(&mut self, instr: u16, bus: &mut Bus) -> Executed {
+        let load = (instr >> 11) & 1 == 1;
+        let offset = u32::from((instr >> 6) & 0x1F) * 2;
+        let rb = usize::from((instr >> 3) & 0b111);
+        let rd = usize::from(instr & 0b111);
+        let address = self.reg(rb).wrapping_add(offset);
+        let mut extra = u64::from(bus.access_cycles(address, AccessWidth::Half, false));
+        if load {
+            self.set_reg(rd, load_halfword(bus, address));
+            extra += 1;
+        } else {
+            bus.write_u16(address, self.reg(rd) as u16);
+        }
+        Executed::Accessed { extra_cycles: extra }
+    }
+
+    /// Formato 11: `LDR`/`STR Rd, [SP, #imm8*4]`.
+    fn thumb_sp_relative_load_store(&mut self, instr: u16, bus: &mut Bus) -> Executed {
+        let load = (instr >> 11) & 1 == 1;
+        let rd = usize::from((instr >> 8) & 0b111);
+        let address = self.reg(SP).wrapping_add(u32::from(instr & 0xFF) * 4);
+        let mut extra = u64::from(bus.access_cycles(address, AccessWidth::Word, false));
+        if load {
+            self.set_reg(rd, bus.read_u32(address));
+            extra += 1;
+        } else {
+            bus.write_u32(address, self.reg(rd));
+        }
+        Executed::Accessed { extra_cycles: extra }
+    }
+
+    /// Formato 12: `ADD Rd, PC|SP, #imm8*4` (cálculo de dirección, sin acceso a
+    /// memoria ni flags). Con `PC`, se usa alineado a palabra.
+    fn thumb_load_address(&mut self, instr: u16) -> Executed {
+        let use_sp = (instr >> 11) & 1 == 1;
+        let rd = usize::from((instr >> 8) & 0b111);
+        let offset = u32::from(instr & 0xFF) * 4;
+        let base = if use_sp {
+            self.reg(SP)
+        } else {
+            self.reg(PC) & !2
+        };
+        self.set_reg(rd, base.wrapping_add(offset));
+        Executed::Continue { extra_cycles: 0 }
+    }
+
+    /// Formato 13: `ADD SP, #±imm7*4` (ajuste del puntero de pila, sin flags).
+    fn thumb_add_offset_to_sp(&mut self, instr: u16) -> Executed {
+        let negative = (instr >> 7) & 1 == 1;
+        let offset = u32::from(instr & 0x7F) * 4;
+        let sp = self.reg(SP);
+        let result = if negative {
+            sp.wrapping_sub(offset)
+        } else {
+            sp.wrapping_add(offset)
+        };
+        self.set_reg(SP, result);
+        Executed::Continue { extra_cycles: 0 }
+    }
+
+    /// Formato 14: `PUSH`/`POP` con opción de incluir `LR`/`PC`. `PUSH` es un
+    /// `STMDB sp!` y `POP` un `LDMIA sp!`; el `POP {PC}` salta (sigue en THUMB).
+    fn thumb_push_pop(&mut self, instr: u16, bus: &mut Bus) -> Executed {
+        let pop = (instr >> 11) & 1 == 1;
+        let extra_reg = (instr >> 8) & 1 == 1; // R: LR en PUSH, PC en POP
+        let list = u32::from(instr & 0xFF);
+        let n = list.count_ones() + u32::from(extra_reg);
+        let mut extra = 0u64;
+        let mut first = true;
+
+        if pop {
+            let mut addr = self.reg(SP);
+            for reg in 0..8usize {
+                if list & (1 << reg) != 0 {
+                    extra += u64::from(bus.access_cycles(addr, AccessWidth::Word, !first));
+                    self.set_reg(reg, bus.read_u32(addr));
+                    addr = addr.wrapping_add(4);
+                    first = false;
+                }
+            }
+            if extra_reg {
+                // POP {PC}: salta (alinea a ½ palabra; el ARM7TDMI no cambia a ARM).
+                extra += u64::from(bus.access_cycles(addr, AccessWidth::Word, !first));
+                let target = bus.read_u32(addr);
+                addr = addr.wrapping_add(4);
+                self.set_reg(SP, addr);
+                self.set_pc(target & !1);
+                return Executed::Branched { extra_cycles: extra + 1 };
+            }
+            self.set_reg(SP, addr);
+            extra += 1; // I-cycle del LDM
+        } else {
+            // PUSH: la pila baja n*4; se escribe ascendente desde la dirección más
+            // baja (menor índice abajo), con LR —si procede— en la más alta.
+            let start = self.reg(SP).wrapping_sub(4 * n);
+            let mut addr = start;
+            for reg in 0..8usize {
+                if list & (1 << reg) != 0 {
+                    extra += u64::from(bus.access_cycles(addr, AccessWidth::Word, !first));
+                    bus.write_u32(addr, self.reg(reg));
+                    addr = addr.wrapping_add(4);
+                    first = false;
+                }
+            }
+            if extra_reg {
+                extra += u64::from(bus.access_cycles(addr, AccessWidth::Word, !first));
+                bus.write_u32(addr, self.reg(LR));
+            }
+            self.set_reg(SP, start);
+        }
+        Executed::Accessed { extra_cycles: extra }
+    }
+
+    /// Formato 15: `STMIA`/`LDMIA Rb!, {Rlist}` (siempre con write-back).
+    fn thumb_multiple_load_store(&mut self, instr: u16, bus: &mut Bus) -> Executed {
+        let load = (instr >> 11) & 1 == 1;
+        let rb = usize::from((instr >> 8) & 0b111);
+        let list = u32::from(instr & 0xFF);
+        let mut addr = self.reg(rb);
+        let mut extra = 0u64;
+        let mut first = true;
+        for reg in 0..8usize {
+            if list & (1 << reg) != 0 {
+                extra += u64::from(bus.access_cycles(addr, AccessWidth::Word, !first));
+                if load {
+                    self.set_reg(reg, bus.read_u32(addr));
+                } else {
+                    bus.write_u32(addr, self.reg(reg));
+                }
+                addr = addr.wrapping_add(4);
+                first = false;
+            }
+        }
+        self.set_reg(rb, addr); // write-back de la base
+        if load {
+            extra += 1;
+        }
+        Executed::Accessed { extra_cycles: extra }
+    }
+
+    /// Formato 16: `B<cond>` (el único salto condicional de THUMB). Si la condición
+    /// no se cumple, es un NOP que solo avanza; si se cumple, salta ±256 B.
+    fn thumb_conditional_branch(&mut self, instr: u16) -> Executed {
+        // `Condition::from_instr` lee el código de los bits 31-28; en THUMB vive en
+        // los bits 11-8, así que lo recolocamos allí.
+        let cond = crate::arm::Condition::from_instr(u32::from((instr >> 8) & 0xF) << 28);
+        if !cond.passes(self.cpsr()) {
+            return Executed::Continue { extra_cycles: 0 };
+        }
+        let target = self.reg(PC).wrapping_add(thumb_branch_offset8(instr) as u32);
+        self.set_pc(target & !1);
+        Executed::Branched { extra_cycles: 0 }
+    }
+
+    /// Formato 18: `B` incondicional (±2 KiB), relativo al `PC` adelantado.
+    fn thumb_unconditional_branch(&mut self, instr: u16) -> Executed {
+        let target = self.reg(PC).wrapping_add(thumb_branch_offset11(instr) as u32);
+        self.set_pc(target & !1);
+        Executed::Branched { extra_cycles: 0 }
+    }
+
+    /// Formato 19: `BL` largo, codificado en **dos** medias-palabras. La primera
+    /// deja en `LR` la mitad alta del destino; la segunda completa el salto y deja
+    /// en `LR` la dirección de retorno (con el bit 0 a 1, para volver en THUMB).
+    fn thumb_long_branch_with_link(&mut self, instr: u16) -> Executed {
+        let offset = u32::from(instr & 0x07FF);
+        if (instr >> 11) & 1 == 0 {
+            // Primera mitad: LR = PC_adelantado + signo(offset)<<12.
+            let hi = ((i32::from(instr & 0x07FF) << 21) >> 21) << 12;
+            self.set_reg(LR, self.reg(PC).wrapping_add(hi as u32));
+            Executed::Continue { extra_cycles: 0 }
+        } else {
+            // Segunda mitad: PC = LR + offset*2; LR = retorno (instrucción siguiente).
+            let return_addr = self.pc().wrapping_add(2) | 1;
+            let target = self.reg(LR).wrapping_add(offset << 1);
+            self.set_reg(LR, return_addr);
+            self.set_pc(target & !1);
+            Executed::Branched { extra_cycles: 0 }
         }
     }
 
@@ -1897,6 +2480,29 @@ fn is_branch_to_self(kind: ArmInstruction, instr: u32, pc: u32) -> bool {
         && pc
             .wrapping_add(PC_AHEAD_ARM)
             .wrapping_add(arm_branch_offset(instr) as u32)
+            == pc
+}
+
+/// Offset de un salto incondicional THUMB (`B`, formato 18): 11 bits con signo,
+/// contados en media-palabras (×2).
+fn thumb_branch_offset11(instr: u16) -> i32 {
+    (i32::from(instr & 0x07FF) << 21) >> 20
+}
+
+/// Offset de un salto condicional THUMB (`B<cond>`, formato 16): 8 bits con
+/// signo, en media-palabras (×2).
+fn thumb_branch_offset8(instr: u16) -> i32 {
+    (i32::from(instr & 0x00FF) << 24) >> 23
+}
+
+/// `true` si `instr` es un salto incondicional THUMB cuyo destino es su propia
+/// dirección (`b .`): el bucle de "fin" de las ROMs de test (2.2b), ahora en
+/// THUMB. El destino se calcula sobre el `PC` adelantado por el pipeline (+4).
+fn is_thumb_branch_to_self(kind: ThumbInstruction, instr: u16, pc: u32) -> bool {
+    matches!(kind, ThumbInstruction::UnconditionalBranch)
+        && pc
+            .wrapping_add(PC_AHEAD_THUMB)
+            .wrapping_add(thumb_branch_offset11(instr) as u32)
             == pc
 }
 
@@ -2323,12 +2929,13 @@ mod tests {
     }
 
     #[test]
-    fn bx_a_thumb_cambia_de_estado_y_se_detiene() {
-        // BX a una dirección impar → estado THUMB. Como la ejecución THUMB aún no
-        // existe (2.2m/2.3a), el siguiente paso se detiene limpiamente.
+    fn bx_a_thumb_cambia_de_estado_y_ejecuta() {
+        // BX a una dirección impar → estado THUMB; la siguiente instrucción ya se
+        // ejecuta como THUMB (Mini-Hito 2.2m), avanzando 2 bytes (no 4).
         let base = crate::bus::IWRAM_START;
         let mut bus = Bus::new(vec![0u8; 4]);
         bus.write_u32(base, 0xE12F_FF10); // BX r0
+        bus.write_u16(base + 0x100, 0x0000); // LSL r0,r0,#0 (NOP THUMB) en el destino
         let mut cpu = Cpu::new();
         cpu.set_pc(base);
         cpu.set_reg(0, base + 0x101); // destino impar (bit0=1) → THUMB
@@ -2336,10 +2943,9 @@ mod tests {
         cpu.step(&mut bus); // BX → THUMB, PC = (base+0x101) & !1 = base+0x100
         assert!(cpu.cpsr().thumb());
         assert_eq!(cpu.pc(), base + 0x100);
-        assert!(matches!(
-            cpu.step(&mut bus),
-            StepResult::Halted(Halt::ThumbNotImplemented { .. })
-        ));
+
+        assert_eq!(cpu.step(&mut bus), StepResult::Stepped, "ejecuta THUMB, no se detiene");
+        assert_eq!(cpu.pc(), base + 0x102, "una instrucción THUMB avanza 2 bytes");
     }
 
     #[test]
@@ -3394,5 +4000,265 @@ mod tests {
         assert_eq!(cpu.mode(), CpuMode::System, "el retorno restaura el modo previo");
         assert_eq!(cpu.cpsr().bits(), cpsr_previo, "y el CPSR completo");
         assert_eq!(cpu.pc(), base + 4, "vuelve a la instrucción siguiente al SWI");
+    }
+
+    // ===== Ejecución THUMB (Mini-Hito 2.2m) =================================
+
+    /// Ejecuta **un paso** en estado THUMB con `instr` colocada en IWRAM, tras
+    /// aplicar `setup`. Devuelve la CPU y el bus para inspeccionar el resultado.
+    fn thumb_step(instr: u16, setup: impl FnOnce(&mut Cpu, &mut Bus)) -> (Cpu, Bus) {
+        let base = crate::bus::IWRAM_START;
+        let mut bus = Bus::new(vec![0u8; 4]);
+        bus.write_u16(base, instr);
+        let mut cpu = Cpu::new();
+        cpu.set_pc(base);
+        cpu.cpsr_mut().set_thumb(true);
+        setup(&mut cpu, &mut bus);
+        cpu.step(&mut bus);
+        (cpu, bus)
+    }
+
+    #[test]
+    fn thumb_f1_lsl_desplaza_y_fija_carry() {
+        // LSL r0, r1, #4 (0x0108). r1=0x1000_000F → r0=0x0000_00F0, y el bit 28
+        // que se sale por la izquierda fija C=1.
+        let (cpu, _) = thumb_step(0x0108, |cpu, _| cpu.set_reg(1, 0x1000_000F));
+        assert_eq!(cpu.reg(0), 0x0000_00F0);
+        assert!(cpu.cpsr().c(), "el bit desplazado fuera fija el carry");
+        assert_eq!(cpu.pc(), crate::bus::IWRAM_START + 2, "avanza 2 bytes");
+    }
+
+    #[test]
+    fn thumb_f2_add_y_sub_registro() {
+        // ADD r0, r1, r2 (0x1888): r1=5, r2=3 → r0=8.
+        let (cpu, _) = thumb_step(0x1888, |cpu, _| {
+            cpu.set_reg(1, 5);
+            cpu.set_reg(2, 3);
+        });
+        assert_eq!(cpu.reg(0), 8);
+        // SUB r0, r1, r2 (0x1A88): 5 - 3 = 2, sin borrow (C=1).
+        let (cpu, _) = thumb_step(0x1A88, |cpu, _| {
+            cpu.set_reg(1, 5);
+            cpu.set_reg(2, 3);
+        });
+        assert_eq!(cpu.reg(0), 2);
+        assert!(cpu.cpsr().c(), "resta sin borrow deja C=1");
+    }
+
+    #[test]
+    fn thumb_f3_mov_y_cmp_inmediato() {
+        // MOV r0, #0x42 (0x2042).
+        let (cpu, _) = thumb_step(0x2042, |_, _| {});
+        assert_eq!(cpu.reg(0), 0x42);
+        assert!(!cpu.cpsr().z());
+        // CMP r0, #5 (0x2805) con r0=5 → Z=1.
+        let (cpu, _) = thumb_step(0x2805, |cpu, _| cpu.set_reg(0, 5));
+        assert!(cpu.cpsr().z(), "5 - 5 == 0 → Z");
+    }
+
+    #[test]
+    fn thumb_f4_and_mul_neg() {
+        // AND r0, r1 (0x4008): 0xFF & 0x0F = 0x0F.
+        let (cpu, _) = thumb_step(0x4008, |cpu, _| {
+            cpu.set_reg(0, 0xFF);
+            cpu.set_reg(1, 0x0F);
+        });
+        assert_eq!(cpu.reg(0), 0x0F);
+        // MUL r0, r1 (0x4348): 6 * 7 = 42.
+        let (cpu, _) = thumb_step(0x4348, |cpu, _| {
+            cpu.set_reg(0, 6);
+            cpu.set_reg(1, 7);
+        });
+        assert_eq!(cpu.reg(0), 42);
+        // NEG r0, r1 (0x4248): r0 = 0 - r1 = -5.
+        let (cpu, _) = thumb_step(0x4248, |cpu, _| cpu.set_reg(1, 5));
+        assert_eq!(cpu.reg(0), (-5i32) as u32);
+        assert!(cpu.cpsr().n(), "el resultado negativo fija N");
+    }
+
+    #[test]
+    fn thumb_f5_bx_cambia_a_arm() {
+        // BX r1 (0x4708) con r1 par → estado ARM en esa dirección.
+        let (cpu, _) = thumb_step(0x4708, |cpu, _| {
+            cpu.set_reg(1, crate::bus::IWRAM_START + 0x40);
+        });
+        assert!(!cpu.cpsr().thumb(), "BX a dirección par vuelve a ARM");
+        assert_eq!(cpu.pc(), crate::bus::IWRAM_START + 0x40);
+    }
+
+    #[test]
+    fn thumb_f6_pc_relative_load() {
+        // LDR r0, [PC, #4] (0x4801). Address = (PC & !2) + 4 = base+8.
+        let base = crate::bus::IWRAM_START;
+        let (cpu, _) = thumb_step(0x4801, |_, bus| bus.write_u32(base + 8, 0xCAFE_F00D));
+        assert_eq!(cpu.reg(0), 0xCAFE_F00D);
+    }
+
+    #[test]
+    fn thumb_f7_str_y_ldr_offset_de_registro() {
+        // STR r0, [r1, r2] (0x5088): guarda r0 en r1+r2.
+        let base = crate::bus::IWRAM_START;
+        let (_, bus) = thumb_step(0x5088, |cpu, _| {
+            cpu.set_reg(0, 0x1234_5678);
+            cpu.set_reg(1, base + 0x40);
+            cpu.set_reg(2, 4);
+        });
+        assert_eq!(bus.read_u32(base + 0x44), 0x1234_5678);
+    }
+
+    #[test]
+    fn thumb_f8_strh_y_ldrsb() {
+        let base = crate::bus::IWRAM_START;
+        // STRH r0, [r1, r2] (0x5288).
+        let (_, bus) = thumb_step(0x5288, |cpu, _| {
+            cpu.set_reg(0, 0xABCD);
+            cpu.set_reg(1, base + 0x40);
+            cpu.set_reg(2, 0);
+        });
+        assert_eq!(bus.read_u16(base + 0x40), 0xABCD);
+        // LDRSB r0, [r1, r2] (0x5688): byte 0x80 → extendido con signo.
+        let (cpu, _) = thumb_step(0x5688, |cpu, bus| {
+            bus.write_u8(base + 0x40, 0x80);
+            cpu.set_reg(1, base + 0x40);
+            cpu.set_reg(2, 0);
+        });
+        assert_eq!(cpu.reg(0), 0xFFFF_FF80, "LDRSB extiende el signo");
+    }
+
+    #[test]
+    fn thumb_f9_str_y_ldr_inmediato() {
+        let base = crate::bus::IWRAM_START;
+        // STR r0, [r1, #4] (0x6048).
+        let (_, bus) = thumb_step(0x6048, |cpu, _| {
+            cpu.set_reg(0, 0xDEAD_BEEF);
+            cpu.set_reg(1, base + 0x40);
+        });
+        assert_eq!(bus.read_u32(base + 0x44), 0xDEAD_BEEF);
+        // LDRB r0, [r1, #1] (0x7848): lee el byte en r1+1.
+        let (cpu, _) = thumb_step(0x7848, |cpu, bus| {
+            bus.write_u8(base + 0x41, 0x99);
+            cpu.set_reg(1, base + 0x40);
+        });
+        assert_eq!(cpu.reg(0), 0x99);
+    }
+
+    #[test]
+    fn thumb_f10_strh_y_ldrh_inmediato() {
+        let base = crate::bus::IWRAM_START;
+        // STRH r0, [r1, #2] (0x8048): offset = 1*2.
+        let (_, bus) = thumb_step(0x8048, |cpu, _| {
+            cpu.set_reg(0, 0x1234);
+            cpu.set_reg(1, base + 0x40);
+        });
+        assert_eq!(bus.read_u16(base + 0x42), 0x1234);
+    }
+
+    #[test]
+    fn thumb_f11_sp_relative() {
+        let base = crate::bus::IWRAM_START;
+        // STR r0, [SP, #4] (0x9001).
+        let (_, bus) = thumb_step(0x9001, |cpu, _| {
+            cpu.set_reg(0, 0x5555_AAAA);
+            cpu.set_reg(SP, base + 0x80);
+        });
+        assert_eq!(bus.read_u32(base + 0x84), 0x5555_AAAA);
+    }
+
+    #[test]
+    fn thumb_f12_load_address_desde_sp() {
+        let base = crate::bus::IWRAM_START;
+        // ADD r0, SP, #8 (0xA802 con bit SP=1 → 0xA802? bit11=1). 1010 1 000 00000010.
+        let (cpu, _) = thumb_step(0xA802, |cpu, _| cpu.set_reg(SP, base + 0x100));
+        assert_eq!(cpu.reg(0), base + 0x108);
+    }
+
+    #[test]
+    fn thumb_f13_ajusta_el_sp() {
+        let base = crate::bus::IWRAM_START;
+        // ADD SP, #16 (0xB004): S=0, sword7=4 → +16.
+        let (cpu, _) = thumb_step(0xB004, |cpu, _| cpu.set_reg(SP, base + 0x100));
+        assert_eq!(cpu.reg(SP), base + 0x110);
+        // ADD SP, #-16 (0xB084): S=1 → -16.
+        let (cpu, _) = thumb_step(0xB084, |cpu, _| cpu.set_reg(SP, base + 0x100));
+        assert_eq!(cpu.reg(SP), base + 0xF0);
+    }
+
+    #[test]
+    fn thumb_f14_push_y_pop_con_lr_pc() {
+        let base = crate::bus::IWRAM_START;
+        let top = base + 0x100;
+        // PUSH {r0, r1, lr} (0xB503).
+        let (cpu, bus) = thumb_step(0xB503, |cpu, _| {
+            cpu.set_reg(SP, top);
+            cpu.set_reg(0, 0xAA);
+            cpu.set_reg(1, 0xBB);
+            cpu.set_reg(LR, 0xCC);
+        });
+        assert_eq!(cpu.reg(SP), top - 12, "PUSH de 3 baja el SP 12");
+        assert_eq!(bus.read_u32(top - 12), 0xAA);
+        assert_eq!(bus.read_u32(top - 8), 0xBB);
+        assert_eq!(bus.read_u32(top - 4), 0xCC, "LR va en la dirección más alta");
+
+        // POP {r0, pc} (0xBD01): restaura r0 y salta a la dirección apilada.
+        let (cpu, _) = thumb_step(0xBD01, |cpu, bus| {
+            cpu.set_reg(SP, top - 8);
+            bus.write_u32(top - 8, 0x1122);
+            bus.write_u32(top - 4, base + 0x40);
+        });
+        assert_eq!(cpu.reg(0), 0x1122);
+        assert_eq!(cpu.reg(SP), top, "POP de 2 sube el SP 8");
+        assert_eq!(cpu.pc(), base + 0x40, "POP {{pc}} salta (alineado a ½)");
+        assert!(cpu.cpsr().thumb(), "y sigue en THUMB");
+    }
+
+    #[test]
+    fn thumb_f15_stmia_y_ldmia() {
+        let base = crate::bus::IWRAM_START;
+        // STMIA r2!, {r0, r1} (0xC203).
+        let (cpu, bus) = thumb_step(0xC203, |cpu, _| {
+            cpu.set_reg(0, 0x1111);
+            cpu.set_reg(1, 0x2222);
+            cpu.set_reg(2, base + 0x40);
+        });
+        assert_eq!(bus.read_u32(base + 0x40), 0x1111);
+        assert_eq!(bus.read_u32(base + 0x44), 0x2222);
+        assert_eq!(cpu.reg(2), base + 0x48, "write-back avanza la base 8");
+    }
+
+    #[test]
+    fn thumb_f16_branch_condicional() {
+        let base = crate::bus::IWRAM_START;
+        // BEQ +4 (0xD002): target = PC(base+4) + 2*2 = base+8.
+        let (cpu, _) = thumb_step(0xD002, |cpu, _| cpu.cpsr_mut().set_z(true));
+        assert_eq!(cpu.pc(), base + 8, "con Z=1 el salto se toma");
+        // Con Z=0 no salta: solo avanza 2.
+        let (cpu, _) = thumb_step(0xD002, |cpu, _| cpu.cpsr_mut().set_z(false));
+        assert_eq!(cpu.pc(), base + 2, "con Z=0 es un NOP que avanza");
+    }
+
+    #[test]
+    fn thumb_f18_branch_incondicional() {
+        let base = crate::bus::IWRAM_START;
+        // B +4 (0xE002): target = PC(base+4) + 2*2 = base+8.
+        let (cpu, _) = thumb_step(0xE002, |_, _| {});
+        assert_eq!(cpu.pc(), base + 8);
+    }
+
+    #[test]
+    fn thumb_f19_bl_en_dos_mitades() {
+        // BL hacia delante, codificado en dos medias-palabras consecutivas.
+        let base = crate::bus::IWRAM_START;
+        let mut bus = Bus::new(vec![0u8; 4]);
+        bus.write_u16(base, 0xF000); // 1ª mitad: offset alto = 0
+        bus.write_u16(base + 2, 0xF802); // 2ª mitad: offset bajo = 2 → +4
+        let mut cpu = Cpu::new();
+        cpu.set_pc(base);
+        cpu.cpsr_mut().set_thumb(true);
+
+        cpu.step(&mut bus); // 1ª mitad: LR = PC(base+4) + 0
+        assert_eq!(cpu.reg(LR), base + 4);
+        cpu.step(&mut bus); // 2ª mitad: PC = LR + 2*2 = base+8; LR = retorno|1
+        assert_eq!(cpu.pc(), base + 8, "el BL salta a LR + offset*2");
+        assert_eq!(cpu.reg(LR), (base + 4) | 1, "LR = dirección de retorno con bit THUMB");
     }
 }
