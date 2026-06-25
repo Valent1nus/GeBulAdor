@@ -9,7 +9,7 @@
 //! sustituir el frontend de escritorio por uno de Android, iOS o WASM sin tocar
 //! una sola línea del núcleo.
 //!
-//! ## Estado actual (Fase 2.3a-bis)
+//! ## Estado actual (Fase 2.3b)
 //!
 //! Además de cargar y validar el cartucho (Fase 1), el núcleo tiene el
 //! esqueleto del hardware: la CPU ARM7TDMI ([`Cpu`]) con sus registros y modos,
@@ -60,8 +60,12 @@
 //! BIOS real ([`Bus::has_bios`] es `false`), el `SWI` se intercepta y se ejecuta en Rust la
 //! función equivalente (división, `CpuSet`, descompresión, matrices afines...) en
 //! vez de descarrilar en el vector `0x08`, de modo que el emulador funciona **sin
-//! requerir `gba_bios.bin`**. La frontera con el frontend —entregar un buffer
-//! RGBA— no cambia.
+//! requerir `gba_bios.bin`**. El Mini-Hito **2.3b** añade el **DMA** (módulo
+//! [`dma`]): los cuatro canales DMA0–DMA3 con **copia inmediata**. El bus enruta a
+//! ellos el bloque de registros de I/O del DMA y, al activarse el `enable` de un
+//! canal en modo inmediato, ejecuta la transferencia (los modos por evento
+//! —V-Blank/H-Blank/FIFO— quedan armados a la espera de la PPU/APU). La frontera
+//! con el frontend —entregar un buffer RGBA— no cambia.
 
 pub mod arm;
 pub mod bios;
@@ -69,6 +73,7 @@ pub(crate) mod bios_hle;
 pub mod bus;
 pub mod cartridge;
 pub mod cpu;
+pub mod dma;
 pub mod header;
 pub mod scheduler;
 pub mod thumb;
@@ -77,6 +82,7 @@ pub use arm::{ArmInstruction, Condition, Decoded};
 pub use bios::{Bios, BiosError};
 pub use bus::{AccessWidth, Bus};
 pub use cartridge::{Cartridge, CartridgeError, MAX_ROM_SIZE, MIN_ROM_SIZE};
+pub use dma::{Dma, DmaTransfer, DMA_CHANNELS};
 pub use cpu::{Cpu, CpuMode, Cpsr, Halt, RunReport, RunStop, StepResult};
 pub use header::Header;
 pub use scheduler::Scheduler;
@@ -383,6 +389,43 @@ mod tests {
             matches!(report.stop, RunStop::Halted(Halt::InfiniteLoop { .. })),
             "se detiene en el «b .» final de la ROM"
         );
+    }
+
+    #[test]
+    fn dma_end_to_end_la_cpu_programa_una_copia_y_se_ejecuta() {
+        // Prueba del Mini-Hito 2.3b end-to-end: la CPU ejecuta código ARM real que
+        // configura el DMA0 (EWRAM → IWRAM) y, al escribir el control con enable,
+        // la copia inmediata se dispara dentro del bus. Luego el propio programa
+        // relee el destino en r5 para que el test pueda comprobarlo con `reg`.
+        let programa = [
+            0xE3A0_1402u32, // MOV r1, #0x02000000   (EWRAM: origen del dato)
+            0xE3A0_0042,    // MOV r0, #0x42          (el dato a copiar)
+            0xE581_0000,    // STR r0, [r1]           (EWRAM[0] = 0x42)
+            0xE3A0_4404,    // MOV r4, #0x04000000
+            0xE284_40B0,    // ADD r4, r4, #0xB0      (r4 = 0x040000B0 = DMA0)
+            0xE584_1000,    // STR r1, [r4]           (DMA0SAD = 0x02000000)
+            0xE3A0_2403,    // MOV r2, #0x03000000   (IWRAM: destino)
+            0xE584_2004,    // STR r2, [r4, #4]       (DMA0DAD = 0x03000000)
+            0xE3A0_3001,    // MOV r3, #1
+            0xE1C4_30B8,    // STRH r3, [r4, #8]      (DMA0CNT_L = 1 unidad)
+            0xE3A0_3C84,    // MOV r3, #0x8400        (enable | 32 bits)
+            0xE1C4_30BA,    // STRH r3, [r4, #0xA]    (DMA0CNT_H → dispara la copia)
+            0xE592_5000,    // LDR r5, [r2]           (r5 = IWRAM[0], el resultado)
+            0xEAFF_FFFE,    // b .                    (fin que el bucle detecta)
+        ];
+        let mut rom = vec![0u8; MIN_ROM_SIZE];
+        for (i, w) in programa.iter().enumerate() {
+            poner(&mut rom, i * 4, *w);
+        }
+        let mut gba = Gba::with_cartridge(Cartridge::from_bytes(rom).unwrap());
+
+        let report = gba.run(1_000);
+        assert!(
+            matches!(report.stop, RunStop::Halted(Halt::InfiniteLoop { .. })),
+            "el programa termina en su «b .» final"
+        );
+        // El DMA copió el 0x42 de EWRAM a IWRAM, y el LDR lo trajo a r5.
+        assert_eq!(gba.reg(5), 0x42, "el DMA debe haber copiado el dato");
     }
 
     #[test]

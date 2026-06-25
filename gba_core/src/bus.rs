@@ -37,6 +37,18 @@
 //! Ese comportamiento lo modela aquí [`Bus::read_u32`]/[`Bus::read_u16`]; ver el
 //! comentario de cada uno. Ignorar esto "funciona por accidente" en pruebas
 //! simples y falla de forma muy confusa con ROMs reales que lo aprovechan.
+//!
+//! ## Registros de I/O con comportamiento: el DMA (Mini-Hito 2.3b)
+//!
+//! La región de I/O (`0x04xx_xxxx`) es, por ahora, un buffer crudo: leer y
+//! escribir un registro solo guarda/devuelve su valor. La **excepción** es el
+//! bloque de registros del [`Dma`] (`0x0400_00B0`–`0x0400_00DF`): el bus enruta
+//! sus accesos al controlador de DMA y, tras escribir un control con el `enable`,
+//! ejecuta la **copia inmediata** (ver [`Bus::poll_dma_triggers`]). Es el primer
+//! registro de I/O con semántica real; los timers (2.3e) y el IRQ (2.3c) seguirán
+//! el mismo patrón.
+
+use crate::dma::{Dma, DMA_CHANNELS};
 
 /// Valor devuelto al leer una dirección no mapeada (*open bus*). El hardware
 /// real devuelve patrones más complejos, pero `0` es seguro y suficiente por
@@ -104,6 +116,11 @@ pub struct Bus {
     oam: Vec<u8>,
     rom: Vec<u8>,
 
+    /// El controlador de **DMA** (Mini-Hito 2.3b): la fuente de verdad de los
+    /// registros DMA y de qué copiar. La copia en sí la ejecuta el propio bus (ver
+    /// [`Bus::run_dma_transfer`]), porque es quien accede a la memoria.
+    dma: Dma,
+
     /// `true` si se ha cargado la **BIOS real** ([`Bus::load_bios`]). Es la fuente
     /// de verdad de "¿hay BIOS?" y decide el camino del `SWI`: con BIOS real se
     /// salta al vector `0x08` (LLE, Mini-Hito 2.2l); sin ella se intercepta y se
@@ -128,6 +145,7 @@ impl Bus {
             vram: vec![0; VRAM_SIZE],
             oam: vec![0; OAM_SIZE],
             rom,
+            dma: Dma::new(),
             bios_loaded: false,
         }
     }
@@ -172,9 +190,17 @@ impl Bus {
             // por toda su franja: basta enmascarar con (tamaño - 1).
             0x02 => read_at(&self.ewram, (addr as usize) & (EWRAM_SIZE - 1)),
             0x03 => read_at(&self.iwram, (addr as usize) & (IWRAM_SIZE - 1)),
-            // I/O: por ahora un buffer crudo; la semántica real de cada registro
-            // llega en hitos posteriores (PPU, SIO, timers...).
-            0x04 => read_at(&self.io, (addr & 0x00FF_FFFF) as usize),
+            // I/O: en su mayoría un buffer crudo; la semántica real de cada
+            // registro llega en hitos posteriores (PPU, SIO, timers...). La
+            // excepción es el bloque DMA (2.3b), que se enruta al controlador.
+            0x04 => {
+                let off = addr & 0x00FF_FFFF;
+                if Dma::in_range(off) {
+                    self.dma.read_u8(off)
+                } else {
+                    read_at(&self.io, off as usize)
+                }
+            }
             0x05 => read_at(&self.pram, (addr as usize) & (PRAM_SIZE - 1)),
             // VRAM tiene un espejo peculiar (no es potencia de dos): ver vram_offset.
             0x06 => read_at(&self.vram, vram_offset(addr)),
@@ -226,7 +252,16 @@ impl Bus {
             0x00 => {}
             0x02 => write_at(&mut self.ewram, (addr as usize) & (EWRAM_SIZE - 1), value),
             0x03 => write_at(&mut self.iwram, (addr as usize) & (IWRAM_SIZE - 1), value),
-            0x04 => write_at(&mut self.io, (addr & 0x00FF_FFFF) as usize, value),
+            // I/O: el bloque DMA se enruta al controlador (solo guarda el byte; el
+            // disparo se decide tras la escritura de 16/32 bits). El resto, buffer.
+            0x04 => {
+                let off = addr & 0x00FF_FFFF;
+                if Dma::in_range(off) {
+                    self.dma.write_u8(off, value);
+                } else {
+                    write_at(&mut self.io, off as usize, value);
+                }
+            }
             0x05 => write_at(&mut self.pram, (addr as usize) & (PRAM_SIZE - 1), value),
             0x06 => write_at(&mut self.vram, vram_offset(addr), value),
             0x07 => write_at(&mut self.oam, (addr as usize) & (OAM_SIZE - 1), value),
@@ -245,6 +280,7 @@ impl Bus {
         let aligned = addr & !1;
         self.write_u8(aligned, value as u8);
         self.write_u8(aligned + 1, (value >> 8) as u8);
+        self.after_io_write(aligned, 2);
     }
 
     /// Escribe 32 bits en little-endian. Como `STR`, alinea la dirección a
@@ -255,6 +291,68 @@ impl Bus {
         self.write_u8(aligned + 1, (value >> 8) as u8);
         self.write_u8(aligned + 2, (value >> 16) as u8);
         self.write_u8(aligned + 3, (value >> 24) as u8);
+        self.after_io_write(aligned, 4);
+    }
+
+    // ---- DMA (Mini-Hito 2.3b) -------------------------------------------
+
+    /// Gancho tras una escritura de 16/32 bits: si tocó el bloque de registros DMA,
+    /// sondea posibles disparos. La detección va aquí (y no en [`Bus::write_u8`])
+    /// porque los juegos escriben los registros DMA con accesos de 16/32 bits, y el
+    /// disparo depende del control completo (`CNT_H`), no de un byte suelto.
+    fn after_io_write(&mut self, aligned_addr: u32, width: u32) {
+        if aligned_addr >> 24 == 0x04 && Dma::touches(aligned_addr & 0x00FF_FFFF, width) {
+            self.poll_dma_triggers();
+        }
+    }
+
+    /// Recorre los cuatro canales y ejecuta los que un flanco de `enable` acaba de
+    /// disparar en **modo inmediato** ([`Dma::poll_channel`]).
+    ///
+    /// La **guarda de reentrada** evita que una transferencia que (por una ROM
+    /// rara) escriba sobre un registro DMA dispare otra anidada: si ya hay una en
+    /// curso, no se sondea nada.
+    fn poll_dma_triggers(&mut self) {
+        if self.dma.is_running() {
+            return;
+        }
+        for ch in 0..DMA_CHANNELS {
+            if self.dma.poll_channel(ch) {
+                self.run_dma_transfer(ch);
+            }
+        }
+    }
+
+    /// Ejecuta la copia de un canal de DMA: pide el plan al controlador
+    /// ([`Dma::plan`]) y mueve las unidades de `src` a `dst` a través del propio
+    /// bus (de ahí que la copia viva aquí y no en [`crate::dma`]).
+    ///
+    /// Toda lectura/escritura pasa por `read_*`/`write_*`, que ya hacen *clamp* y
+    /// nunca panican; el conteo está acotado por el hardware (ver [`crate::dma`]),
+    /// así que el bucle no puede dispararse sin control.
+    ///
+    /// ⚠️ El **coste en ciclos** del DMA todavía **no** se contabiliza: se integrará
+    /// cuando el [`crate::Scheduler`] se enchufe al bucle (timers 2.3e, PPU 2.4b).
+    /// El **IRQ de fin** (bit 14 del control) tampoco se genera aún: depende del
+    /// sistema de interrupciones (2.3c).
+    fn run_dma_transfer(&mut self, ch: usize) {
+        let plan = self.dma.plan(ch);
+        self.dma.begin(); // guarda de reentrada activa durante la copia
+        let mut src = plan.src;
+        let mut dst = plan.dst;
+        for _ in 0..plan.count {
+            if plan.word {
+                let value = self.read_u32(src);
+                self.write_u32(dst, value);
+            } else {
+                let value = self.read_u16(src);
+                self.write_u16(dst, value);
+            }
+            src = src.wrapping_add(plan.src_step as u32);
+            dst = dst.wrapping_add(plan.dst_step as u32);
+        }
+        self.dma.end();
+        self.dma.finish_immediate(ch); // inmediato = disparo único: baja el enable
     }
 
     // ---- Temporización (Mini-Hito 2.2c) ---------------------------------
@@ -485,5 +583,124 @@ mod tests {
         assert_eq!(bus.access_cycles(ROM_START, Half, true), 3); //  1 + 2 (S)
         assert_eq!(bus.access_cycles(ROM_START, Word, false), 8); // 5 (N) + 3 (S)
         assert_eq!(bus.access_cycles(ROM_START, Word, true), 6); //  3 (S) + 3 (S)
+    }
+
+    // ---- DMA (Mini-Hito 2.3b) -------------------------------------------
+
+    /// Dirección de I/O del registro `off` (dentro del canal) del canal `ch`.
+    /// `off`: 0=SAD, 4=DAD, 8=CNT_L, 0xA=CNT_H.
+    fn dma_reg(ch: u32, off: u32) -> u32 {
+        IO_START + 0xB0 + ch * 0x0C + off
+    }
+
+    // Bits del control `CNT_H` usados en los tests.
+    const DMA_ENABLE: u16 = 1 << 15;
+    const DMA_WORD: u16 = 1 << 10; // 32 bits (si no, 16)
+
+    #[test]
+    fn dma_copia_inmediata_de_32_bits() {
+        // La "Prueba" del hito: copiar un bloque de memoria vía DMA y verificarlo.
+        let mut bus = Bus::new(Vec::new());
+        // Origen en EWRAM: 4 palabras reconocibles.
+        let datos = [0x1111_1111u32, 0x2222_2222, 0x3333_3333, 0x4444_4444];
+        for (i, w) in datos.iter().enumerate() {
+            bus.write_u32(EWRAM_START + (i as u32) * 4, *w);
+        }
+        // Programar DMA3: EWRAM → IWRAM, 4 palabras de 32 bits, inmediato.
+        bus.write_u32(dma_reg(3, 0), EWRAM_START); // SAD
+        bus.write_u32(dma_reg(3, 4), IWRAM_START); // DAD
+        bus.write_u16(dma_reg(3, 8), 4); // CNT_L = 4 unidades
+        // Escribir el control con enable dispara la copia inmediata aquí mismo.
+        bus.write_u16(dma_reg(3, 0xA), DMA_ENABLE | DMA_WORD);
+
+        // El destino contiene ya las 4 palabras.
+        for (i, w) in datos.iter().enumerate() {
+            assert_eq!(bus.read_u32(IWRAM_START + (i as u32) * 4), *w);
+        }
+        // Y el enable se ha auto-limpiado (inmediato = disparo único).
+        assert_eq!(bus.read_u16(dma_reg(3, 0xA)) & DMA_ENABLE, 0);
+    }
+
+    #[test]
+    fn dma_disparado_por_una_escritura_de_32_bits_al_control() {
+        // Muchos juegos escriben CNT_L+CNT_H de una vez con un STR de 32 bits:
+        // el word a CNT_L (0x...B8) cubre también CNT_H y debe disparar.
+        let mut bus = Bus::new(Vec::new());
+        bus.write_u32(EWRAM_START, 0xCAFE_BABE);
+        bus.write_u32(dma_reg(0, 0), EWRAM_START); // SAD
+        bus.write_u32(dma_reg(0, 4), IWRAM_START); // DAD
+        // count=1 (mitad baja) + control enable|word (mitad alta), en un word.
+        let cnt = 1u32 | ((DMA_ENABLE | DMA_WORD) as u32) << 16;
+        bus.write_u32(dma_reg(0, 8), cnt);
+
+        assert_eq!(bus.read_u32(IWRAM_START), 0xCAFE_BABE);
+    }
+
+    #[test]
+    fn dma_copia_de_16_bits_con_origen_fijo() {
+        // Origen fijo (control de origen = 2) → rellena el destino con un valor,
+        // como hará la FIFO de sonido (que aún no existe). 16 bits.
+        let mut bus = Bus::new(Vec::new());
+        bus.write_u16(EWRAM_START, 0xABCD);
+        bus.write_u32(dma_reg(3, 0), EWRAM_START); // SAD
+        bus.write_u32(dma_reg(3, 4), IWRAM_START); // DAD
+        bus.write_u16(dma_reg(3, 8), 3); // 3 unidades
+        let src_fijo = 2u16 << 7; // control de origen = fija
+        bus.write_u16(dma_reg(3, 0xA), DMA_ENABLE | src_fijo); // 16 bits
+
+        // Los tres halfwords del destino son el mismo valor (origen no avanzó).
+        assert_eq!(bus.read_u16(IWRAM_START), 0xABCD);
+        assert_eq!(bus.read_u16(IWRAM_START + 2), 0xABCD);
+        assert_eq!(bus.read_u16(IWRAM_START + 4), 0xABCD);
+        // Y no escribió una cuarta unidad.
+        assert_eq!(bus.read_u16(IWRAM_START + 6), 0);
+    }
+
+    #[test]
+    fn los_cuatro_canales_copian() {
+        // Cada canal copia una palabra distinta a un destino distinto.
+        let mut bus = Bus::new(Vec::new());
+        for ch in 0..4u32 {
+            let src = EWRAM_START + ch * 4;
+            let dst = IWRAM_START + 0x100 + ch * 4;
+            let valor = 0x1000_0000 * (ch + 1);
+            bus.write_u32(src, valor);
+            bus.write_u32(dma_reg(ch, 0), src);
+            bus.write_u32(dma_reg(ch, 4), dst);
+            bus.write_u16(dma_reg(ch, 8), 1);
+            bus.write_u16(dma_reg(ch, 0xA), DMA_ENABLE | DMA_WORD);
+            assert_eq!(bus.read_u32(dst), valor, "canal {ch} debe copiar");
+        }
+    }
+
+    #[test]
+    fn un_dma_de_vblank_no_copia_inmediatamente() {
+        // Modo de arranque V-Blank (timing 1): queda armado pero NO copia ahora
+        // (su disparador llega con la PPU, 2.4b).
+        let mut bus = Bus::new(Vec::new());
+        bus.write_u32(EWRAM_START, 0xDEAD_BEEF);
+        bus.write_u32(dma_reg(3, 0), EWRAM_START);
+        bus.write_u32(dma_reg(3, 4), IWRAM_START);
+        bus.write_u16(dma_reg(3, 8), 1);
+        let vblank = 1u16 << 12;
+        bus.write_u16(dma_reg(3, 0xA), DMA_ENABLE | DMA_WORD | vblank);
+
+        // El destino sigue a cero: no se disparó.
+        assert_eq!(bus.read_u32(IWRAM_START), 0);
+        // Y el canal sigue armado (enable a 1).
+        assert_ne!(bus.read_u16(dma_reg(3, 0xA)) & DMA_ENABLE, 0);
+    }
+
+    #[test]
+    fn dma_con_direcciones_no_mapeadas_no_panica() {
+        // 🛡️ Seguridad: origen/destino disparatados (los controla la ROM) no deben
+        // colgar el emulador; el bus hace clamp y la copia es inofensiva.
+        let mut bus = Bus::new(Vec::new());
+        bus.write_u32(dma_reg(3, 0), 0x0100_0000); // origen en un hueco
+        bus.write_u32(dma_reg(3, 4), 0x0E00_0000); // destino en SRAM (no implementada)
+        bus.write_u16(dma_reg(3, 8), 16);
+        bus.write_u16(dma_reg(3, 0xA), DMA_ENABLE | DMA_WORD); // no debe panicar
+        // Llegar aquí sin pánico es la prueba.
+        assert_eq!(bus.read_u16(dma_reg(3, 0xA)) & DMA_ENABLE, 0);
     }
 }
