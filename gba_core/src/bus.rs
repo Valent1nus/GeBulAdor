@@ -45,8 +45,9 @@
 //! bloque de registros del [`Dma`] (`0x0400_00B0`–`0x0400_00DF`): el bus enruta
 //! sus accesos al controlador de DMA y, tras escribir un control con el `enable`,
 //! ejecuta la **copia inmediata** (ver [`Bus::poll_dma_triggers`]). Es el primer
-//! registro de I/O con semántica real; los timers (2.3e) y el IRQ (2.3c) seguirán
-//! el mismo patrón.
+//! registro de I/O con semántica real; el IRQ (2.3c), el SIO (2.3d) y los timers
+//! (2.3e) siguen el mismo patrón: un módulo dedicado al que el bus enruta su rango
+//! de direcciones.
 //!
 //! ## Interrupciones (Mini-Hito 2.3c)
 //!
@@ -59,6 +60,7 @@
 
 use crate::dma::{Dma, DMA_CHANNELS};
 use crate::interrupt::{Interrupt, InterruptControl};
+use crate::sio::Sio;
 
 /// Valor devuelto al leer una dirección no mapeada (*open bus*). El hardware
 /// real devuelve patrones más complejos, pero `0` es seguro y suficiente por
@@ -136,6 +138,11 @@ pub struct Bus {
     /// [`Bus::irq_pending`]/[`Bus::irq_raised`].
     irq: InterruptControl,
 
+    /// Los registros del **SIO** / Cable Link (Mini-Hito 2.3d): `SIODATA`/`SIOCNT`/
+    /// `RCNT`. Por ahora solo se almacenan; la lógica de transferencia es de la
+    /// Fase 4.
+    sio: Sio,
+
     /// `true` si se ha cargado la **BIOS real** ([`Bus::load_bios`]). Es la fuente
     /// de verdad de "¿hay BIOS?" y decide el camino del `SWI`: con BIOS real se
     /// salta al vector `0x08` (LLE, Mini-Hito 2.2l); sin ella se intercepta y se
@@ -162,6 +169,7 @@ impl Bus {
             rom,
             dma: Dma::new(),
             irq: InterruptControl::new(),
+            sio: Sio::new(),
             bios_loaded: false,
         }
     }
@@ -215,6 +223,8 @@ impl Bus {
                     self.dma.read_u8(off)
                 } else if InterruptControl::handles(off) {
                     self.irq.read_u8(off)
+                } else if Sio::handles(off) {
+                    self.sio.read_u8(off)
                 } else {
                     read_at(&self.io, off as usize)
                 }
@@ -278,6 +288,8 @@ impl Bus {
                     self.dma.write_u8(off, value);
                 } else if InterruptControl::handles(off) {
                     self.irq.write_u8(off, value);
+                } else if Sio::handles(off) {
+                    self.sio.write_u8(off, value);
                 } else {
                     write_at(&mut self.io, off as usize, value);
                 }
@@ -777,5 +789,46 @@ mod tests {
         bus.write_u16(dma_reg(3, 0xA), DMA_ENABLE | DMA_WORD); // no debe panicar
         // Llegar aquí sin pánico es la prueba.
         assert_eq!(bus.read_u16(dma_reg(3, 0xA)) & DMA_ENABLE, 0);
+    }
+
+    // ---- SIO / Cable Link (Mini-Hito 2.3d) ------------------------------
+
+    #[test]
+    fn los_registros_sio_almacenan_y_devuelven_lo_escrito() {
+        // La "Prueba" del hito: escribir y leer los registros SIO desde el bus
+        // (el camino de la CPU) y comprobar que conservan el valor.
+        let mut bus = Bus::new(Vec::new());
+        bus.write_u32(IO_START + 0x120, 0x1234_5678); // SIODATA32
+        bus.write_u16(IO_START + 0x128, 0x4003); // SIOCNT
+        bus.write_u16(IO_START + 0x12A, 0x00AA); // SIODATA8 / SIOMLT_SEND
+        bus.write_u16(IO_START + 0x134, 0x8000); // RCNT
+
+        assert_eq!(bus.read_u32(IO_START + 0x120), 0x1234_5678);
+        assert_eq!(bus.read_u16(IO_START + 0x128), 0x4003);
+        assert_eq!(bus.read_u16(IO_START + 0x12A), 0x00AA);
+        assert_eq!(bus.read_u16(IO_START + 0x134), 0x8000);
+    }
+
+    #[test]
+    fn los_cuatro_siomulti_son_independientes() {
+        // SIOMULTI0-3 (0x120-0x127): cada consola del Multiplay deja su dato.
+        let mut bus = Bus::new(Vec::new());
+        for i in 0..4u32 {
+            bus.write_u16(IO_START + 0x120 + i * 2, 0x1000 + i as u16);
+        }
+        for i in 0..4u32 {
+            assert_eq!(bus.read_u16(IO_START + 0x120 + i * 2), 0x1000 + i as u16);
+        }
+    }
+
+    #[test]
+    fn el_sio_no_interfiere_con_el_buffer_de_io_vecino() {
+        // Un registro de I/O cualquiera fuera del rango SIO (p. ej. 0x100, TM0CNT
+        // en el futuro) sigue yendo al buffer crudo, no al SIO.
+        let mut bus = Bus::new(Vec::new());
+        bus.write_u16(IO_START + 0x100, 0xBEEF);
+        bus.write_u16(IO_START + 0x128, 0xCAFE); // SIOCNT (SIO)
+        assert_eq!(bus.read_u16(IO_START + 0x100), 0xBEEF, "el buffer de I/O intacto");
+        assert_eq!(bus.read_u16(IO_START + 0x128), 0xCAFE);
     }
 }

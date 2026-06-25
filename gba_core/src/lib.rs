@@ -9,7 +9,7 @@
 //! sustituir el frontend de escritorio por uno de Android, iOS o WASM sin tocar
 //! una sola línea del núcleo.
 //!
-//! ## Estado actual (Fase 2.3c)
+//! ## Estado actual (Fase 2.3d)
 //!
 //! Además de cargar y validar el cartucho (Fase 1), el núcleo tiene el
 //! esqueleto del hardware: la CPU ARM7TDMI ([`Cpu`]) con sus registros y modos,
@@ -70,8 +70,11 @@
 //! ([`Bus::request_interrupt`], ya conectada al "IRQ al terminar" del DMA) y la
 //! **entrada a la excepción de IRQ** en la CPU (vector `0x18`, modo IRQ) cuando hay
 //! una pendiente y habilitada. Con ello, el `SWI Halt` deja de ser stub: la CPU
-//! puede dormir hasta que llegue una interrupción. La frontera con el frontend
-//! —entregar un buffer RGBA— no cambia.
+//! puede dormir hasta que llegue una interrupción. El Mini-Hito **2.3d** suma los
+//! registros del **SIO** / Cable Link (módulo [`sio`]): `SIODATA`/`SIOCNT`/`RCNT`
+//! se almacenan en el bus —**sin** lógica de transferencia, que es de la Fase 4—,
+//! para que los juegos puedan configurarlos. La frontera con el frontend —entregar
+//! un buffer RGBA— no cambia.
 
 pub mod arm;
 pub mod bios;
@@ -83,6 +86,7 @@ pub mod dma;
 pub mod header;
 pub mod interrupt;
 pub mod scheduler;
+pub mod sio;
 pub mod thumb;
 
 pub use arm::{ArmInstruction, Condition, Decoded};
@@ -91,6 +95,7 @@ pub use bus::{AccessWidth, Bus};
 pub use cartridge::{Cartridge, CartridgeError, MAX_ROM_SIZE, MIN_ROM_SIZE};
 pub use dma::{Dma, DmaTransfer, DMA_CHANNELS};
 pub use interrupt::{Interrupt, InterruptControl};
+pub use sio::Sio;
 pub use cpu::{Cpu, CpuMode, Cpsr, Halt, RunReport, RunStop, StepResult};
 pub use header::Header;
 pub use scheduler::Scheduler;
