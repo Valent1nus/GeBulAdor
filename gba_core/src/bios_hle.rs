@@ -32,11 +32,12 @@
 //!   [`RegisterRamReset`](register_ram_reset) (0x01).
 //!
 //! `Halt` (0x02) ya está implementado (Mini-Hito 2.3c): pone la CPU en bajo
-//! consumo hasta que `IE & IF` se hace distinto de cero (ver [`Cpu::halt`]).
-//! Quedan como **stub** (no-op que solo deja continuar la CPU) las que esperan una
-//! IRQ **concreta** que todavía nada genera por tiempo: `Stop` (0x03), `IntrWait`
-//! (0x04) y `VBlankIntrWait` (0x05) —necesitan los timers (2.3e) o la PPU (2.4b)—,
-//! y las de sonido (0x1A+), que esperan a la APU (Fase 2.5).
+//! consumo hasta que `IE & IF` se hace distinto de cero (ver [`Cpu::halt`]). Desde el
+//! Mini-Hito **2.4b**, `IntrWait` (0x04) y `VBlankIntrWait` (0x05) también lo usan:
+//! ahora que la PPU genera la IRQ de V-Blank, suspenden la CPU hasta esa interrupción
+//! (es una versión simplificada del IntrWait de la BIOS; ver [`dispatch`]). Siguen
+//! como **stub** (no-op que solo deja continuar la CPU) `Stop` (0x03) —espera una IRQ
+//! de teclado/externa— y las de sonido (0x1A+), que esperan a la APU (Fase 2.5).
 //!
 //! ## 🛡️ Seguridad — entradas controladas por la ROM
 //!
@@ -79,6 +80,47 @@ pub const MAX_DECOMP_BYTES: usize = 4 * 1024 * 1024;
 /// El **coste en ciclos** de cada `SWI` de BIOS no se modela todavía (se devuelve
 /// `extra_cycles: 0`), igual que los *waitstates* de ROM son provisionales hasta
 /// emular `WAITCNT`.
+/// El **manejador de IRQ** que la BIOS de Nintendo tiene en el vector `0x18`,
+/// instalado en la región de BIOS cuando se arranca **sin BIOS real** (modo HLE).
+/// Cada par es `(offset dentro de la BIOS, instrucción ARM)`; es el wrapper estándar
+/// que la propia consola ejecuta al tomar una IRQ:
+///
+/// ```text
+/// stmfd sp!, {r0-r3, r12, lr}   ; salva el contexto en la pila de IRQ
+/// mov   r0, #0x04000000
+/// add   lr, pc, #0              ; lr = dirección del ldmfd siguiente
+/// ldr   pc, [r0, #-4]           ; salta al manejador de usuario en [0x03FFFFFC]
+/// ldmfd sp!, {r0-r3, r12, lr}   ; (al volver) restaura el contexto
+/// subs  pc, lr, #4              ; retorna a la instrucción interrumpida
+/// ```
+///
+/// El manejador de usuario lo deja el juego en `0x0300_7FFC` (espejado en
+/// `0x03FF_FFFC`). Sin este wrapper, una IRQ tomada (V-Blank de la PPU en 2.4b, un
+/// timer, un DMA...) saltaría al vector `0x18` **vacío** (ceros) y la CPU
+/// descarrilaría. Es lo que hace usable el sistema de IRQ en el camino por defecto
+/// sin `gba_bios.bin`; con BIOS real, [`Bus::load_bios`] sobreescribe esto con el
+/// wrapper auténtico.
+const HLE_IRQ_WRAPPER: [(usize, u32); 6] = [
+    (0x18, 0xE92D_500F),
+    (0x1C, 0xE3A0_0301),
+    (0x20, 0xE28F_E000),
+    (0x24, 0xE510_F004),
+    (0x28, 0xE8BD_500F),
+    (0x2C, 0xE25E_F004),
+];
+
+/// Instala el [`HLE_IRQ_WRAPPER`] en `bios` (la región de BIOS del [`Bus`]). Lo llama
+/// [`crate::Bus::new`] para que, sin BIOS real, una IRQ tomada se despache al
+/// manejador de usuario en vez de descarrilar en el vector vacío. No toca el resto de
+/// la BIOS (el reset y los `SWI` se resuelven por HLE, no por código en `0x0`).
+pub(crate) fn install_irq_handler(bios: &mut [u8]) {
+    for (off, word) in HLE_IRQ_WRAPPER {
+        if let Some(slot) = bios.get_mut(off..off + 4) {
+            slot.copy_from_slice(&word.to_le_bytes());
+        }
+    }
+}
+
 pub(crate) fn dispatch(cpu: &mut Cpu, bus: &mut Bus, number: u8) -> Executed {
     match number {
         0x00 => return soft_reset(cpu, bus), // único que salta
@@ -104,12 +146,19 @@ pub(crate) fn dispatch(cpu: &mut Cpu, bus: &mut Bus, number: u8) -> Executed {
         // se hace distinto de cero. Continúa a la instrucción siguiente (es esa la
         // que no se ejecutará hasta despertar).
         0x02 => cpu.halt(),
-        // Stubs aún sin disparador: `Stop` (0x03) e `IntrWait`/`VBlankIntrWait`
-        // (0x04/0x05) esperan una IRQ **concreta** que hoy nada genera por tiempo
-        // (la dará la PPU en 2.4b / los timers en 2.3e); las de sonido (0x1A+)
-        // esperan a la APU (Fase 2.5). Sin su disparador, lo seguro es no hacer
-        // nada y continuar, para no colgar el emulador. Igual para un número no
-        // reconocido.
+        // `IntrWait` (0x04) / `VBlankIntrWait` (0x05): suspenden la CPU hasta que
+        // llega la IRQ esperada. Ahora que la PPU (2.4b) y los timers (2.3e) generan
+        // IRQs por tiempo, se implementan reusando el `Halt`: la CPU duerme y el bucle
+        // la despierta cuando `IE & IF != 0` (ver [`Cpu::halt`] y
+        // [`crate::Bus::next_wakeup_cycle`]). Es una versión **simplificada** —no usa
+        // el espejo de `IF` de la BIOS (`0x0300_7FF8`) ni distingue "esperar una
+        // nueva" de "ya pendiente"—, suficiente para que un juego que sincroniza con
+        // el V-Blank deje de girar en vacío.
+        0x04 | 0x05 => cpu.halt(),
+        // Stubs aún sin disparador: `Stop` (0x03), que espera una IRQ de teclado/
+        // externa, y las de sonido (0x1A+), que esperan a la APU (Fase 2.5). Sin su
+        // disparador, lo seguro es no hacer nada y continuar, para no colgar el
+        // emulador. Igual para un número no reconocido.
         _ => {}
     }
     Executed::Continue { extra_cycles: 0 }

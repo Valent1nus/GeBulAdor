@@ -378,12 +378,12 @@ pub enum Halt {
         /// `PC` (crudo) donde se quedó, ya en estado THUMB.
         pc: u32,
     },
-    /// La CPU ejecutó un `SWI` `Halt` y está **dormida** esperando una IRQ, pero
-    /// no hay ninguna pendiente (`IE & IF == 0`) ni —con el bucle actual, sin el
-    /// [`crate::Scheduler`] integrado— forma de que llegue. El bucle se detiene
-    /// limpiamente; no es un error, sino que no hay nada más que ejecutar. Cuando
-    /// los timers (2.3e) y la PPU (2.4b) generen IRQs por tiempo, el bucle avanzará
-    /// el reloj hasta el siguiente evento en vez de parar aquí.
+    /// La CPU ejecutó un `SWI` `Halt`/`IntrWait` y está **dormida** esperando una IRQ,
+    /// pero **ninguna fuente habilitada** puede generarla por tiempo (ningún timer ni
+    /// la PPU con su IRQ habilitada en `IE`; ver [`crate::Bus::next_wakeup_cycle`]). El
+    /// bucle se detiene limpiamente: no es un error, sino que no hay nada que vaya a
+    /// despertarla. Si hubiera una fuente habilitada, el bucle **adelanta el reloj**
+    /// hasta su evento en vez de parar aquí.
     WaitingForInterrupt,
 }
 
@@ -1595,10 +1595,45 @@ impl Cpu {
     /// el `PC` indefinidamente; sin un límite, el bucle no terminaría nunca.
     pub fn run(&mut self, bus: &mut Bus, max_steps: u64) -> RunReport {
         let cycles_start = self.cycles;
-        let mut steps = 0;
-        while steps < max_steps {
-            // Sincroniza los timers con el reloj de la CPU: dispara los desbordes
-            // vencidos (recarga + IRQ) antes de decidir qué hacer en este giro.
+        let (steps, stop) = self.run_until(bus, |_, steps| steps >= max_steps);
+        self.run_report(steps, cycles_start, stop)
+    }
+
+    /// Ejecuta hasta consumir `budget` **ciclos** (en vez de un número de pasos),
+    /// devolviendo cuando el reloj de la CPU ha avanzado al menos esa cantidad —o
+    /// antes si la CPU se detiene—. Es la base de [`crate::Gba::run_frame`]: un frame
+    /// de vídeo son [`crate::ppu::CYCLES_PER_FRAME`] ciclos, durante los cuales la PPU
+    /// (Mini-Hito 2.4b) compone la imagen scanline a scanline.
+    pub fn run_cycles(&mut self, bus: &mut Bus, budget: u64) -> RunReport {
+        let cycles_start = self.cycles;
+        let target = cycles_start.saturating_add(budget);
+        let (steps, stop) = self.run_until(bus, move |cpu, _| cpu.cycles >= target);
+        self.run_report(steps, cycles_start, stop)
+    }
+
+    /// El bucle común de [`Cpu::run`] y [`Cpu::run_cycles`]: ejecuta pasos hasta que
+    /// `should_stop(self, pasos_dados)` lo pide (→ [`RunStop::StepLimit`]) o hasta que
+    /// la CPU se detiene sola (→ [`RunStop::Halted`]). Devuelve los pasos ejecutados y
+    /// el motivo de la parada.
+    ///
+    /// En cada giro **sincroniza el hardware temporizado** con el reloj de la CPU
+    /// ([`Bus::sync_to_cycle`]), que dispara los eventos vencidos del [`Scheduler`]
+    /// (desbordes de timer, scanlines de la PPU). Y el estado `Halt` no para en seco:
+    /// si la CPU duerme sin IRQ pendiente, **adelanta el reloj** hasta el próximo
+    /// evento que pueda despertarla ([`Bus::next_wakeup_cycle`]); si ninguno puede,
+    /// se detiene con [`Halt::WaitingForInterrupt`].
+    fn run_until(
+        &mut self,
+        bus: &mut Bus,
+        mut should_stop: impl FnMut(&Cpu, u64) -> bool,
+    ) -> (u64, RunStop) {
+        let mut steps = 0u64;
+        loop {
+            if should_stop(self, steps) {
+                return (steps, RunStop::StepLimit);
+            }
+            // Sincroniza el hardware temporizado con el reloj de la CPU: dispara los
+            // eventos vencidos (timers + PPU) antes de decidir qué hacer en este giro.
             bus.sync_to_cycle(self.cycles);
 
             // Halt con salto temporal: dormida y sin IRQ, salta el tiempo muerto
@@ -1609,20 +1644,15 @@ impl Cpu {
                         self.cycles = self.cycles.max(next);
                         continue; // el `sync` del próximo giro procesará ese evento
                     }
-                    None => {
-                        return self.run_report(steps, cycles_start, RunStop::Halted(Halt::WaitingForInterrupt));
-                    }
+                    None => return (steps, RunStop::Halted(Halt::WaitingForInterrupt)),
                 }
             }
 
             match self.step(bus) {
                 StepResult::Stepped => steps += 1,
-                StepResult::Halted(halt) => {
-                    return self.run_report(steps, cycles_start, RunStop::Halted(halt));
-                }
+                StepResult::Halted(halt) => return (steps, RunStop::Halted(halt)),
             }
         }
-        self.run_report(steps, cycles_start, RunStop::StepLimit)
     }
 
     /// Construye el [`RunReport`] de una corrida (los ciclos consumidos se calculan

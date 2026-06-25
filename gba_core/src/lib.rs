@@ -9,7 +9,7 @@
 //! sustituir el frontend de escritorio por uno de Android, iOS o WASM sin tocar
 //! una sola línea del núcleo.
 //!
-//! ## Estado actual (Fase 2.4a — PPU modo 3 bitmap)
+//! ## Estado actual (Fase 2.4b — PPU: renderizado por scanlines)
 //!
 //! Además de cargar y validar el cartucho (Fase 1), el núcleo tiene el
 //! esqueleto del hardware: la CPU ARM7TDMI ([`Cpu`]) con sus registros y modos,
@@ -83,7 +83,14 @@
 //! la VRAM se interpreta como un framebuffer 240×160 de color BGR555 directo, y
 //! [`Gba::render_frame`] (vía [`Bus::render_frame`]) lo traduce a RGBA y lo vuelca en
 //! el framebuffer del núcleo. El antiguo azul plano de prueba lo sustituye ahora una
-//! imagen de prueba real renderizada por la PPU. La frontera con el frontend
+//! imagen de prueba real renderizada por la PPU. Por fin, el Mini-Hito **2.4b** pasa
+//! la PPU a **renderizado por scanlines**: añade los registros `DISPSTAT`/`VCOUNT`,
+//! programa en el [`Scheduler`] dos eventos por línea (H-Blank y fin de línea) y, al
+//! dispararse, **dibuja la scanline** y actualiza los *flags* e **interrupciones** de
+//! V-Blank/H-Blank/V-Counter. Con ello la PPU pasa a **poseer el framebuffer** (lo
+//! compone línea a línea durante la ejecución), [`Gba::run_frame`] ejecuta un frame de
+//! vídeo entero, y el `VBlankIntrWait` (módulo `bios_hle`) deja de ser un *stub*: ya
+//! hay una IRQ de V-Blank que despierta a la CPU. La frontera con el frontend
 //! —entregar un buffer RGBA— no cambia.
 
 pub mod arm;
@@ -137,14 +144,10 @@ pub struct Gba {
     /// La CPU ARM7TDMI con sus registros, modos y estado.
     cpu: Cpu,
 
-    /// El bus de memoria: ROM del cartucho, RAMs y registros de I/O.
+    /// El bus de memoria: ROM del cartucho, RAMs y registros de I/O. Alberga también
+    /// la PPU, que desde el Mini-Hito 2.4b es la **dueña del framebuffer** (lo compone
+    /// scanline a scanline); el `Gba` solo lo reenvía con [`Gba::framebuffer`].
     bus: Bus,
-
-    /// Framebuffer en formato RGBA, con [`FRAMEBUFFER_SIZE`] bytes.
-    ///
-    /// El orden es fila a fila desde la esquina superior izquierda; cada píxel
-    /// son 4 bytes consecutivos: `[R, G, B, A]`.
-    framebuffer: Vec<u8>,
 }
 
 impl Gba {
@@ -203,11 +206,7 @@ impl Gba {
     /// Constructor común: monta la consola con la CPU y el bus dados y deja el
     /// framebuffer coherente con el estado inicial de la PPU.
     fn with_hardware(cpu: Cpu, bus: Bus) -> Self {
-        let mut gba = Gba {
-            cpu,
-            bus,
-            framebuffer: vec![0; FRAMEBUFFER_SIZE],
-        };
+        let mut gba = Gba { cpu, bus };
         // Render inicial (Mini-Hito 2.4a): sin nada en VRAM, la pantalla es el color
         // de fondo (negro). El antiguo azul plano de prueba lo sustituye ahora el
         // render real de la PPU.
@@ -268,15 +267,24 @@ impl Gba {
         self.cpu.cycles()
     }
 
-    /// **Renderiza un frame** (Mini-Hito 2.4a): la PPU compone la imagen a partir de
-    /// la VRAM/PRAM y la vuelca en el framebuffer del núcleo. El frontend lo llama
-    /// una vez por frame, antes de pintar con [`Gba::framebuffer`].
+    /// **Renderiza el frame completo** bajo demanda: la PPU compone las 160 líneas a
+    /// partir de la VRAM/PRAM en su framebuffer. Útil para un volcado inmediato (tras
+    /// preparar la VRAM, o en un frontend que no ejecute en bucle).
     ///
-    /// Hoy es un volcado del frame completo bajo demanda (modo 3); el render por
-    /// scanlines dirigido por el [`Scheduler`] —y el flag de V-Blank— llega en el
-    /// Mini-Hito 2.4b.
+    /// Desde el Mini-Hito 2.4b, durante la **ejecución** la imagen se compone sola,
+    /// **scanline a scanline**, en los eventos del [`Scheduler`] (ver [`Gba::run_frame`]);
+    /// este método es el render "de una vez" que conserva 2.4a.
     pub fn render_frame(&mut self) {
-        self.bus.render_frame(&mut self.framebuffer);
+        self.bus.render_frame();
+    }
+
+    /// **Ejecuta un frame de vídeo completo** (Mini-Hito 2.4b): corre la CPU el
+    /// equivalente a [`ppu::CYCLES_PER_FRAME`] ciclos (~280 896), durante los cuales la
+    /// PPU va renderizando cada scanline en su framebuffer y disparando sus eventos de
+    /// H-Blank/V-Blank. Es lo que el frontend llama una vez por frame antes de pintar
+    /// con [`Gba::framebuffer`]. Delega en [`Cpu::run_cycles`].
+    pub fn run_frame(&mut self) -> RunReport {
+        self.cpu.run_cycles(&mut self.bus, ppu::CYCLES_PER_FRAME)
     }
 
     /// Pinta a mano una **imagen de prueba en modo 3** en la VRAM y renderiza, para
@@ -306,18 +314,14 @@ impl Gba {
     ///
     /// El canal alfa se fija siempre a `0xFF` (totalmente opaco).
     pub fn clear(&mut self, r: u8, g: u8, b: u8) {
-        for pixel in self.framebuffer.chunks_exact_mut(BYTES_PER_PIXEL) {
-            pixel[0] = r;
-            pixel[1] = g;
-            pixel[2] = b;
-            pixel[3] = 0xFF;
-        }
+        self.bus.clear_framebuffer(r, g, b);
     }
 
     /// Devuelve el framebuffer crudo en formato RGBA para que el frontend lo
-    /// pinte. Esta es la **única** salida visual del núcleo.
+    /// pinte. Esta es la **única** salida visual del núcleo. Lo posee la PPU (desde
+    /// 2.4b); el `Gba` solo lo reenvía.
     pub fn framebuffer(&self) -> &[u8] {
-        &self.framebuffer
+        self.bus.framebuffer()
     }
 }
 
@@ -593,6 +597,124 @@ mod tests {
             gba.cycles() >= 65_536,
             "el bucle saltó el tiempo muerto hasta el desborde (cycles={})",
             gba.cycles()
+        );
+    }
+
+    #[test]
+    fn vblank_intr_wait_end_to_end_la_ppu_despierta_la_cpu() {
+        // Prueba end-to-end del Mini-Hito 2.4b (uniendo 2.3a-bis/2.3c): la CPU habilita
+        // la IRQ de V-Blank (en IE y en DISPSTAT) y llama a `VBlankIntrWait` (SWI 0x05).
+        // Ahora que la PPU genera la IRQ de V-Blank por tiempo, el bucle adelanta el
+        // reloj hasta la línea 160 y despierta a la CPU. Como en el test de timers, se
+        // usa el camino **sin BIOS** (HLE) e `IME = 0`: la IRQ despierta del Halt pero
+        // no se "toma" (no hace falta un manejador en el vector 0x18).
+        let programa = [
+            0xE3A0_4404u32, // MOV r4, #0x04000000   (base de I/O)
+            0xE3A0_0001,    // MOV r0, #1            (bit 0 = V-Blank)
+            0xE284_5C02,    // ADD r5, r4, #0x200    (r5 = 0x04000200)
+            0xE1C5_00B0,    // STRH r0, [r5]         (IE = V-Blank; IME se queda a 0)
+            0xE3A0_0008,    // MOV r0, #0x08         (bit 3 = enable de V-Blank IRQ)
+            0xE1C4_00B4,    // STRH r0, [r4, #4]     (DISPSTAT = enable de V-Blank IRQ)
+            0xEF05_0000,    // SWI #0x050000         (VBlankIntrWait: la CPU duerme)
+            0xE3A0_7077,    // MOV r7, #0x77         (marca: despertó y siguió)
+            0xEAFF_FFFE,    // b .                   (fin)
+        ];
+        let mut rom = vec![0u8; MIN_ROM_SIZE];
+        for (i, w) in programa.iter().enumerate() {
+            poner(&mut rom, i * 4, *w);
+        }
+        let mut gba = Gba::with_cartridge(Cartridge::from_bytes(rom).unwrap());
+
+        let report = gba.run(100_000);
+        assert!(
+            matches!(report.stop, RunStop::Halted(Halt::InfiniteLoop { .. })),
+            "termina en el «b .» final, no dormida"
+        );
+        assert_eq!(gba.reg(7), 0x77, "la CPU despertó del VBlankIntrWait y siguió");
+        // El despertar prueba que la PPU entró en V-Blank: el reloj llegó al menos a la
+        // línea 160 (160 · 1232 = 197 120 ciclos).
+        assert!(
+            gba.cycles() >= 197_120,
+            "el bucle saltó hasta el V-Blank (cycles={})",
+            gba.cycles()
+        );
+    }
+
+    #[test]
+    fn hle_irq_wrapper_despacha_la_vblank_al_manejador_de_usuario() {
+        // Mini-Hito 2.4b: sin BIOS real, una IRQ tomada salta al wrapper de IRQ que el
+        // bus instala en 0x18 (HLE), que la despacha al manejador de usuario apuntado
+        // en 0x0300_7FFC y retorna. Aquí la CPU registra su manejador, habilita la IRQ
+        // de V-Blank (IE + DISPSTAT + IME + I=0) y espera; al entrar en V-Blank, el
+        // wrapper ejecuta el manejador (marca r10, reconoce IF) y la CPU continúa.
+        let programa = [
+            0xE321_F01Fu32, // 0x00 MSR cpsr_c, #0x1F     (System, I=0: IRQ habilitadas)
+            0xE3A0_0403,    // 0x04 MOV r0, #0x03000000
+            0xE280_0C7F,    // 0x08 ADD r0, r0, #0x7F00   (r0 = 0x03007F00)
+            0xE280_00FC,    // 0x0C ADD r0, r0, #0xFC      (r0 = 0x03007FFC)
+            0xE3A0_1408,    // 0x10 MOV r1, #0x08000000
+            0xE281_1044,    // 0x14 ADD r1, r1, #0x44      (r1 = 0x08000044 = manejador)
+            0xE580_1000,    // 0x18 STR r1, [r0]           ([0x03007FFC] = manejador)
+            0xE3A0_4404,    // 0x1C MOV r4, #0x04000000
+            0xE3A0_2001,    // 0x20 MOV r2, #1
+            0xE584_2208,    // 0x24 STR r2, [r4, #0x208]   (IME = 1)
+            0xE284_5C02,    // 0x28 ADD r5, r4, #0x200     (r5 = 0x04000200)
+            0xE1C5_20B0,    // 0x2C STRH r2, [r5]          (IE = 1 = V-Blank)
+            0xE3A0_2008,    // 0x30 MOV r2, #8
+            0xE1C4_20B4,    // 0x34 STRH r2, [r4, #4]      (DISPSTAT bit3 = V-Blank IRQ)
+            0xE35A_0000,    // 0x38 CMP r10, #0      <- loop: espera a que el handler marque
+            0x0AFF_FFFD,    // 0x3C BEQ 0x38               (mientras r10==0, sigue esperando)
+            0xEAFF_FFFE,    // 0x40 b .                    (fin, tras atender la IRQ)
+            0xE3A0_A0AB,    // 0x44 MOV r10, #0xAB   <- manejador de usuario (en modo IRQ)
+            0xE280_1C02,    // 0x48 ADD r1, r0, #0x200     (r0=0x04000000 lo puso el wrapper)
+            0xE3A0_2001,    // 0x4C MOV r2, #1
+            0xE1C1_20B2,    // 0x50 STRH r2, [r1, #2]      (IF = 1 → reconoce el V-Blank)
+            0xE12F_FF1E,    // 0x54 BX lr                  (vuelve al wrapper, que retorna)
+        ];
+        let mut rom = vec![0u8; MIN_ROM_SIZE];
+        for (i, w) in programa.iter().enumerate() {
+            poner(&mut rom, i * 4, *w);
+        }
+        let mut gba = Gba::with_cartridge(Cartridge::from_bytes(rom).unwrap());
+
+        let report = gba.run(1_000_000);
+        assert!(
+            matches!(report.stop, RunStop::Halted(Halt::InfiniteLoop { .. })),
+            "sale del bucle de espera al «b .» tras atender la IRQ"
+        );
+        assert_eq!(gba.reg(10), 0xAB, "el manejador de usuario corrió vía el wrapper HLE");
+    }
+
+    #[test]
+    fn run_frame_avanza_un_frame_y_compone_la_imagen() {
+        // Mini-Hito 2.4b: la CPU pone modo 3 y pinta el primer píxel, y luego queda en
+        // un bucle ocupado (NOP + salto hacia atrás, que NO es un «b .» de parada). Así
+        // la CPU sigue ejecutando durante todo el frame y la PPU compone la imagen
+        // scanline a scanline; al cabo de un frame de vídeo, run_frame devuelve.
+        let programa = [
+            0xE3A0_0404u32, // 0x00 MOV r0, #0x04000000  (DISPCNT)
+            0xE3A0_1003,    // 0x04 MOV r1, #3
+            0xE1C0_10B0,    // 0x08 STRH r1, [r0]         (DISPCNT = modo 3)
+            0xE3A0_2406,    // 0x0C MOV r2, #0x06000000   (VRAM)
+            0xE3A0_301F,    // 0x10 MOV r3, #0x1F         (rojo puro BGR555)
+            0xE1C2_30B0,    // 0x14 STRH r3, [r2]         (VRAM[0] = rojo)
+            0xE1A0_0000,    // 0x18 NOP (MOV r0, r0)
+            0xEAFF_FFFD,    // 0x1C B 0x18  (salto hacia atrás: bucle ocupado real)
+        ];
+        let mut rom = vec![0u8; MIN_ROM_SIZE];
+        for (i, w) in programa.iter().enumerate() {
+            poner(&mut rom, i * 4, *w);
+        }
+        let mut gba = Gba::with_cartridge(Cartridge::from_bytes(rom).unwrap());
+
+        let report = gba.run_frame();
+        // Corre el frame entero (tope de ciclos), sin detenerse: el bucle es real.
+        assert!(matches!(report.stop, RunStop::StepLimit), "run_frame agota el frame");
+        assert!(gba.cycles() >= ppu::CYCLES_PER_FRAME, "avanzó un frame completo");
+        assert_eq!(
+            &gba.framebuffer()[0..4],
+            &[0xFF, 0x00, 0x00, 0xFF],
+            "la PPU compuso el píxel rojo durante el frame"
         );
     }
 

@@ -65,17 +65,24 @@
 //! consulta la CPU para decidir si salta al vector de IRQ o despierta de un
 //! `Halt`).
 
-use crate::dma::{Dma, DMA_CHANNELS};
+use crate::dma::{Dma, DMA_CHANNELS, DMA_TIMING_HBLANK, DMA_TIMING_VBLANK};
 use crate::interrupt::{Interrupt, InterruptControl};
-use crate::ppu::Ppu;
+use crate::ppu::{Ppu, HBLANK_CYCLES, HDRAW_CYCLES};
 use crate::scheduler::Scheduler;
 use crate::sio::Sio;
 use crate::timers::Timers;
+use crate::SCREEN_HEIGHT;
 
-/// Un **evento de hardware** programado en el [`Scheduler`] del bus (Mini-Hito
-/// 2.3e). Es el tipo de etiqueta que el scheduler ordena y entrega; el bus lo
-/// maneja en [`Bus::sync_to_cycle`]. Hoy solo lo generan los timers; la PPU (2.4b)
-/// y la APU (2.5) añadirán sus variantes.
+/// Un **evento de hardware** programado en el [`Scheduler`] del bus. Es el tipo de
+/// etiqueta que el scheduler ordena y entrega; el bus lo maneja en
+/// [`Bus::sync_to_cycle`]. Los generan los timers (Mini-Hito 2.3e) y la PPU (2.4b);
+/// la APU (2.5) añadirá los suyos.
+///
+/// Los eventos de la PPU forman una **cadena perpetua** (cada uno reprograma el
+/// siguiente) que recorre el barrido línea a línea. Llevan el ciclo `at` en que
+/// estaban programados para **reprogramar sin deriva**: el sucesor se cuelga de `at`
+/// (el instante exacto del evento), no del reloj al drenarlo —que puede ir un poco
+/// por delante si la última instrucción se pasó de largo—.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
     /// Un timer ha desbordado. `timer` es su índice (0–3) y `at` el ciclo en que el
@@ -87,6 +94,28 @@ pub enum Event {
         /// Ciclo en que se programó este desborde.
         at: u64,
     },
+    /// La PPU llega al **H-Blank** de la línea actual (a 960 ciclos del inicio de la
+    /// línea): se renderiza la scanline y se actualiza el estado de H-Blank.
+    HBlank {
+        /// Ciclo en que empieza este H-Blank.
+        at: u64,
+    },
+    /// La PPU **termina la línea** actual (a 1232 ciclos de su inicio): avanza
+    /// `VCOUNT` a la siguiente y actualiza los *flags* e IRQs de V-Blank/V-Counter.
+    EndOfLine {
+        /// Ciclo en que termina la línea (= inicio de la siguiente).
+        at: u64,
+    },
+}
+
+/// Cómo se disparó una transferencia de DMA, para decidir si el canal se apaga o se
+/// re-arma al terminar (ver [`Bus::run_dma_transfer`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DmaTrigger {
+    /// Modo inmediato (timing 0): siempre de disparo único.
+    Immediate,
+    /// Modo por evento (V-Blank/H-Blank): se re-arma si tiene el bit *repeat*.
+    Timed,
 }
 
 /// Valor devuelto al leer una dirección no mapeada (*open bus*). El hardware
@@ -200,8 +229,21 @@ impl Bus {
     /// arrancar como el hardware (Mini-Hito 2.3a). Sin ella, la región queda a
     /// cero y la consola usa el atajo "skip BIOS".
     pub fn new(rom: Vec<u8>) -> Self {
+        let mut scheduler = Scheduler::new();
+        // Arranque del barrido de la PPU (Mini-Hito 2.4b): la línea 0 alcanza su
+        // H-Blank en el ciclo 960. A partir de ahí la cadena de eventos H-Blank /
+        // EndOfLine se reprograma sola, frame tras frame.
+        scheduler.schedule_at(HDRAW_CYCLES, Event::HBlank { at: HDRAW_CYCLES });
+
+        // Modo HLE (sin BIOS real): instala el wrapper de IRQ de la BIOS en el vector
+        // 0x18, para que una IRQ tomada (V-Blank, timer, DMA) se despache al manejador
+        // de usuario en vez de descarrilar en el vector vacío (Mini-Hito 2.4b). Una
+        // BIOS real (load_bios) lo sobreescribe.
+        let mut bios = vec![0; BIOS_SIZE];
+        crate::bios_hle::install_irq_handler(&mut bios);
+
         Bus {
-            bios: vec![0; BIOS_SIZE],
+            bios,
             ewram: vec![0; EWRAM_SIZE],
             iwram: vec![0; IWRAM_SIZE],
             io: vec![0; IO_SIZE],
@@ -214,7 +256,7 @@ impl Bus {
             irq: InterruptControl::new(),
             sio: Sio::new(),
             timers: Timers::new(),
-            scheduler: Scheduler::new(),
+            scheduler,
             bios_loaded: false,
         }
     }
@@ -404,7 +446,22 @@ impl Bus {
         }
         for ch in 0..DMA_CHANNELS {
             if self.dma.poll_channel(ch) {
-                self.run_dma_transfer(ch);
+                self.run_dma_transfer(ch, DmaTrigger::Immediate);
+            }
+        }
+    }
+
+    /// Ejecuta los canales de DMA **armados** para el arranque `timing` (V-Blank o
+    /// H-Blank). Lo llama la PPU (vía [`Bus::sync_to_cycle`]) al entrar en V-Blank o en
+    /// el H-Blank de una línea visible (Mini-Hito 2.4b), saldando lo que el 2.3b dejó
+    /// "armado a la espera de la PPU". La misma guarda de reentrada que el inmediato.
+    fn run_dma_for_timing(&mut self, timing: u16) {
+        if self.dma.is_running() {
+            return;
+        }
+        for ch in 0..DMA_CHANNELS {
+            if self.dma.armed_for(ch, timing) {
+                self.run_dma_transfer(ch, DmaTrigger::Timed);
             }
         }
     }
@@ -418,10 +475,14 @@ impl Bus {
     /// así que el bucle no puede dispararse sin control.
     ///
     /// ⚠️ El **coste en ciclos** del DMA todavía **no** se contabiliza: se integrará
-    /// cuando el [`crate::Scheduler`] se enchufe al bucle (timers 2.3e, PPU 2.4b).
-    /// El **IRQ de fin** (bit 14 del control) tampoco se genera aún: depende del
-    /// sistema de interrupciones (2.3c).
-    fn run_dma_transfer(&mut self, ch: usize) {
+    /// con la precisión a ciclo de la Fase 4. El **IRQ de fin** (bit 14) sí se
+    /// genera desde el 2.3c.
+    ///
+    /// `trigger` distingue el arranque **inmediato** (siempre de disparo único) del
+    /// arranque por **evento** (V-Blank/H-Blank): un DMA por evento con el bit
+    /// *repeat* (bit 9) se **mantiene armado** para volver a disparar en el próximo
+    /// evento; sin él —y siempre en el inmediato— el canal se apaga al terminar.
+    fn run_dma_transfer(&mut self, ch: usize, trigger: DmaTrigger) {
         let plan = self.dma.plan(ch);
         self.dma.begin(); // guarda de reentrada activa durante la copia
         let mut src = plan.src;
@@ -439,7 +500,11 @@ impl Bus {
         }
         let raise_irq = self.dma.irq_on_end(ch); // bit 14 del control, antes de bajarlo
         self.dma.end();
-        self.dma.finish_immediate(ch); // inmediato = disparo único: baja el enable
+        // Un DMA por evento con repeat sigue armado para el próximo; el resto se apaga.
+        let keep_armed = matches!(trigger, DmaTrigger::Timed) && self.dma.repeats(ch);
+        if !keep_armed {
+            self.dma.finish_immediate(ch);
+        }
         if raise_irq {
             // El DMA con "IRQ al terminar" levanta la IRQ de su canal (2.3c).
             self.request_interrupt(Interrupt::dma(ch));
@@ -485,8 +550,40 @@ impl Bus {
                     self.timers
                         .on_overflow(timer, at, &mut self.scheduler, &mut self.irq);
                 }
+                Event::HBlank { at } => self.on_ppu_hblank(at),
+                Event::EndOfLine { at } => self.on_ppu_end_of_line(at),
             }
         }
+    }
+
+    /// Maneja el evento de **H-Blank** de la línea actual (Mini-Hito 2.4b): marca el
+    /// estado de H-Blank en la PPU (y su IRQ si procede), **renderiza** la scanline si
+    /// es visible y dispara el DMA de H-Blank, y reprograma el fin de línea 272 ciclos
+    /// después. `at` es el ciclo (exacto) en que empezó este H-Blank.
+    fn on_ppu_hblank(&mut self, at: u64) {
+        let line = self.ppu.vcount();
+        self.ppu.enter_hblank(&mut self.irq);
+        // El render y el DMA de H-Blank solo ocurren en las líneas visibles.
+        if (line as usize) < SCREEN_HEIGHT {
+            self.ppu.render_scanline(line, &self.vram, &self.pram);
+            self.run_dma_for_timing(DMA_TIMING_HBLANK);
+        }
+        let next = at + HBLANK_CYCLES;
+        self.scheduler.schedule_at(next, Event::EndOfLine { at: next });
+    }
+
+    /// Maneja el evento de **fin de línea** (Mini-Hito 2.4b): avanza el barrido a la
+    /// siguiente línea en la PPU (que actualiza `VCOUNT`, los *flags* y las IRQs de
+    /// V-Blank/V-Counter), dispara el DMA de V-Blank al entrar en él, y reprograma el
+    /// H-Blank de la nueva línea 960 ciclos después. `at` es el ciclo en que termina
+    /// la línea (= inicio de la siguiente).
+    fn on_ppu_end_of_line(&mut self, at: u64) {
+        if self.ppu.enter_next_line(&mut self.irq) {
+            // Acaba de entrar en V-Blank: dispara los DMA armados para ese momento.
+            self.run_dma_for_timing(DMA_TIMING_VBLANK);
+        }
+        let next = at + HDRAW_CYCLES;
+        self.scheduler.schedule_at(next, Event::HBlank { at: next });
     }
 
     /// Ciclo del próximo evento que **podría despertar** a la CPU de un `Halt`, o
@@ -495,7 +592,10 @@ impl Bus {
     /// a generar una IRQ habilitada (ver [`Timers::can_wake`])—. Sin esta guarda, un
     /// `Halt` sin fuente de despertar haría girar el bucle sin avanzar.
     pub fn next_wakeup_cycle(&self) -> Option<u64> {
-        if self.timers.can_wake(&self.irq) {
+        // Cualquier fuente que pueda generar una IRQ habilitada por tiempo justifica
+        // adelantar el reloj: un timer con IRQ (2.3e) o la PPU con V-Blank/H-Blank/
+        // V-Counter habilitada (2.4b, lo que destraba `VBlankIntrWait`).
+        if self.timers.can_wake(&self.irq) || self.ppu.can_wake(&self.irq) {
             self.scheduler.next_event_cycle()
         } else {
             None
@@ -504,15 +604,28 @@ impl Bus {
 
     // ---- PPU / gráficos (Mini-Hito 2.4a) --------------------------------
 
-    /// **Renderiza un frame** en `fb` (el framebuffer RGBA del núcleo) delegando en
-    /// la [`Ppu`]. El bus le **presta** la VRAM y la PRAM —que viven aquí, con sus
-    /// espejos— porque la PPU necesita leerlas para componer la imagen; el resultado
-    /// se escribe en `fb`. Lo invoca [`crate::Gba::render_frame`].
+    /// **Renderiza el frame completo** bajo demanda, delegando en la [`Ppu`], que lo
+    /// vuelca en **su propio** framebuffer. El bus le **presta** la VRAM y la PRAM
+    /// —que viven aquí, con sus espejos— porque la PPU las necesita para componer la
+    /// imagen. Lo invoca [`crate::Gba::render_frame`].
     ///
-    /// De momento es un volcado del frame completo bajo demanda (modo 3); el paso a
-    /// scanlines dirigidas por el [`Scheduler`] es el Mini-Hito 2.4b.
-    pub fn render_frame(&self, fb: &mut [u8]) {
-        self.ppu.render_frame(&self.vram, &self.pram, fb);
+    /// Es el render inmediato de las 160 líneas (modo 3) que conserva 2.4a; durante la
+    /// ejecución, en cambio, la imagen se compone **scanline a scanline** en los
+    /// eventos del [`Scheduler`] (ver [`Bus::sync_to_cycle`]).
+    pub fn render_frame(&mut self) {
+        self.ppu.render_frame(&self.vram, &self.pram);
+    }
+
+    /// El framebuffer RGBA ya compuesto por la PPU (la salida visual del núcleo). Lo
+    /// reenvía [`crate::Gba::framebuffer`] al frontend.
+    pub fn framebuffer(&self) -> &[u8] {
+        self.ppu.framebuffer()
+    }
+
+    /// Rellena todo el framebuffer con un color sólido opaco (alfa `0xFF`). Lo usa
+    /// [`crate::Gba::clear`].
+    pub fn clear_framebuffer(&mut self, r: u8, g: u8, b: u8) {
+        self.ppu.clear_framebuffer([r, g, b, 0xFF]);
     }
 
     // ---- Temporización (Mini-Hito 2.2c) ---------------------------------
@@ -937,15 +1050,21 @@ mod tests {
     // ---- PPU / gráficos (Mini-Hito 2.4a) --------------------------------
 
     #[test]
-    fn dispcnt_se_enruta_a_la_ppu() {
-        // Escribir DISPCNT por el bus debe ir a la PPU (su fuente de verdad) y
-        // releerse igual; un registro de vídeo vecino aún sin dueño (DISPSTAT, 0x004)
-        // sigue en el buffer crudo, sin pisarse.
+    fn dispcnt_dispstat_vcount_se_enrutan_a_la_ppu() {
+        // DISPCNT/DISPSTAT/VCOUNT van a la PPU (su fuente de verdad); un registro de
+        // vídeo vecino aún sin dueño (BG0CNT, 0x008, llega en 2.4c) sigue en el buffer
+        // crudo, sin pisarse.
         let mut bus = Bus::new(Vec::new());
         bus.write_u16(IO_START, 0x0403); // DISPCNT = modo 3 + bit 10 (BG2 on)
-        bus.write_u16(IO_START + 0x004, 0x1234); // DISPSTAT (buffer crudo, 2.4b)
+        bus.write_u16(IO_START + 0x008, 0x1234); // BG0CNT (buffer crudo, 2.4c)
         assert_eq!(bus.read_u16(IO_START), 0x0403);
-        assert_eq!(bus.read_u16(IO_START + 0x004), 0x1234);
+        assert_eq!(bus.read_u16(IO_START + 0x008), 0x1234);
+        // DISPSTAT solo deja escribir enables (bits 3-5) y LYC (bits 8-15).
+        bus.write_u16(IO_START + 0x004, 0x8038); // enables 3-5 + LYC=0x80
+        assert_eq!(bus.read_u16(IO_START + 0x004), 0x8038);
+        // VCOUNT es de solo lectura: arranca en 0 y la escritura se ignora.
+        bus.write_u16(IO_START + 0x006, 0x00FF);
+        assert_eq!(bus.read_u16(IO_START + 0x006), 0);
     }
 
     #[test]
@@ -956,10 +1075,138 @@ mod tests {
         // Primer píxel = verde puro (BGR555 0x03E0).
         bus.write_u16(VRAM_START, 0x03E0);
 
-        let mut fb = vec![0u8; crate::FRAMEBUFFER_SIZE];
-        bus.render_frame(&mut fb);
+        bus.render_frame();
 
-        assert_eq!(&fb[0..4], &[0x00, 0xFF, 0x00, 0xFF], "el bus volcó la VRAM");
+        assert_eq!(&bus.framebuffer()[0..4], &[0x00, 0xFF, 0x00, 0xFF], "el bus volcó la VRAM");
+    }
+
+    // ---- PPU: barrido por scanlines (Mini-Hito 2.4b) --------------------
+
+    use crate::ppu::{CYCLES_PER_FRAME, HDRAW_CYCLES as HDRAW, SCANLINE_CYCLES};
+
+    /// El color RGBA del píxel `(x, y)` del framebuffer del bus.
+    fn fb_pixel(bus: &Bus, x: usize, y: usize) -> [u8; 4] {
+        let i = (y * 240 + x) * 4;
+        bus.framebuffer()[i..i + 4].try_into().unwrap()
+    }
+
+    #[test]
+    fn el_barrido_avanza_vcount_y_marca_vblank() {
+        // Sin tocar la CPU, sincronizar el reloj hace avanzar el barrido por sí solo.
+        let mut bus = Bus::new(Vec::new());
+        // A mitad de la línea 10 (ciclo 10·1232 + 100): VCOUNT = 10, sin V-Blank.
+        bus.sync_to_cycle(10 * SCANLINE_CYCLES + 100);
+        assert_eq!(bus.read_u16(IO_START + 0x006), 10, "VCOUNT = 10");
+        assert_eq!(bus.read_u16(IO_START + 0x004) & 1, 0, "la 10 no es V-Blank");
+        // Al inicio de la línea 160 (ciclo 160·1232): VCOUNT = 160 y flag de V-Blank.
+        bus.sync_to_cycle(160 * SCANLINE_CYCLES);
+        assert_eq!(bus.read_u16(IO_START + 0x006), 160);
+        assert_ne!(bus.read_u16(IO_START + 0x004) & 1, 0, "la 160 sí es V-Blank");
+    }
+
+    #[test]
+    fn la_ppu_solicita_la_irq_de_vblank() {
+        let mut bus = Bus::new(Vec::new());
+        bus.write_u16(IO_START + 0x200, Interrupt::VBlank.bit()); // IE = V-Blank
+        bus.write_u16(IO_START + 0x004, 1 << 3); // DISPSTAT: enable de V-Blank IRQ
+        // Antes de la línea 160 no hay IRQ; al entrar en ella, sí.
+        bus.sync_to_cycle(159 * SCANLINE_CYCLES + 500);
+        assert_eq!(bus.read_u16(IO_START + 0x202) & Interrupt::VBlank.bit(), 0);
+        bus.sync_to_cycle(160 * SCANLINE_CYCLES);
+        assert_ne!(
+            bus.read_u16(IO_START + 0x202) & Interrupt::VBlank.bit(),
+            0,
+            "la IRQ de V-Blank quedó pendiente en IF"
+        );
+    }
+
+    #[test]
+    fn la_ppu_solicita_la_irq_de_hblank_cada_linea() {
+        let mut bus = Bus::new(Vec::new());
+        bus.write_u16(IO_START + 0x200, Interrupt::HBlank.bit()); // IE = H-Blank
+        bus.write_u16(IO_START + 0x004, 1 << 4); // DISPSTAT: enable de H-Blank IRQ
+        // Pasado el H-Blank de la línea 0 (ciclo 960), la IRQ de H-Blank está puesta.
+        bus.sync_to_cycle(HDRAW + 1);
+        assert_ne!(bus.read_u16(IO_START + 0x202) & Interrupt::HBlank.bit(), 0);
+    }
+
+    #[test]
+    fn el_dma_de_vblank_se_dispara_al_entrar_en_vblank() {
+        // DMA3 armado para V-Blank (timing 1): no copia hasta el V-Blank.
+        let mut bus = Bus::new(Vec::new());
+        bus.write_u32(EWRAM_START, 0xCAFE_F00D);
+        bus.write_u32(dma_reg(3, 0), EWRAM_START); // SAD
+        bus.write_u32(dma_reg(3, 4), IWRAM_START); // DAD
+        bus.write_u16(dma_reg(3, 8), 1); // 1 unidad
+        let vblank = 1u16 << 12;
+        bus.write_u16(dma_reg(3, 0xA), DMA_ENABLE | DMA_WORD | vblank);
+
+        // Antes del V-Blank: nada copiado.
+        bus.sync_to_cycle(100 * SCANLINE_CYCLES);
+        assert_eq!(bus.read_u32(IWRAM_START), 0, "aún no es V-Blank");
+        // Al entrar en V-Blank (línea 160): la copia se dispara.
+        bus.sync_to_cycle(160 * SCANLINE_CYCLES);
+        assert_eq!(bus.read_u32(IWRAM_START), 0xCAFE_F00D, "el DMA de V-Blank copió");
+        // Sin repeat, el canal se apaga tras disparar.
+        assert_eq!(bus.read_u16(dma_reg(3, 0xA)) & DMA_ENABLE, 0);
+    }
+
+    #[test]
+    fn el_dma_de_hblank_se_dispara_en_una_linea_visible() {
+        // DMA3 armado para H-Blank (timing 2) con repeat: copia en cada H-Blank.
+        let mut bus = Bus::new(Vec::new());
+        bus.write_u32(EWRAM_START, 0x1234_5678);
+        bus.write_u32(dma_reg(3, 0), EWRAM_START); // SAD
+        bus.write_u32(dma_reg(3, 4), IWRAM_START); // DAD
+        bus.write_u16(dma_reg(3, 8), 1);
+        let hblank = 2u16 << 12;
+        let repeat = 1u16 << 9;
+        bus.write_u16(dma_reg(3, 0xA), DMA_ENABLE | DMA_WORD | hblank | repeat);
+
+        // Tras el primer H-Blank (línea 0 visible), la copia ya ocurrió.
+        bus.sync_to_cycle(HDRAW + 1);
+        assert_eq!(bus.read_u32(IWRAM_START), 0x1234_5678, "el DMA de H-Blank copió");
+        // Con repeat, sigue armado para el próximo H-Blank.
+        assert_ne!(bus.read_u16(dma_reg(3, 0xA)) & DMA_ENABLE, 0, "repeat mantiene armado");
+    }
+
+    #[test]
+    fn un_efecto_por_scanline_se_captura_en_el_render() {
+        // La "Prueba" del hito: un cambio de registro en pleno frame afecta SOLO a las
+        // líneas que se dibujan después, no a las ya dibujadas. Modo 3, con un píxel
+        // rojo al inicio de dos líneas; a mitad de frame activamos el *forced blank*.
+        let mut bus = Bus::new(Vec::new());
+        bus.write_u16(IO_START, 0x0003); // DISPCNT = modo 3
+        let rojo = 0x001Fu16;
+        bus.write_u16(VRAM_START + (2 * 240) * 2, rojo); // píxel (0,2)
+        bus.write_u16(VRAM_START + (10 * 240) * 2, rojo); // píxel (0,10)
+
+        // Dibujar hasta pasada la línea 2 (su H-Blank): (0,2) sale rojo.
+        bus.sync_to_cycle(2 * SCANLINE_CYCLES + HDRAW + 1);
+        assert_eq!(fb_pixel(&bus, 0, 2), [0xFF, 0x00, 0x00, 0xFF], "(0,2) rojo");
+
+        // En pleno frame, activar forced blank (mantiene modo 3). Las líneas dibujadas
+        // desde aquí salen blancas.
+        bus.write_u16(IO_START, 0x0003 | (1 << 7));
+        bus.sync_to_cycle(10 * SCANLINE_CYCLES + HDRAW + 1);
+
+        assert_eq!(fb_pixel(&bus, 0, 2), [0xFF, 0x00, 0x00, 0xFF], "la línea 2 ya estaba dibujada");
+        assert_eq!(fb_pixel(&bus, 0, 10), [0xFF, 0xFF, 0xFF, 0xFF], "la 10 se dibujó con forced blank");
+    }
+
+    #[test]
+    fn un_frame_completo_renderiza_la_imagen() {
+        // La otra mitad de la "Prueba": tras un frame completo, la imagen está bien.
+        let mut bus = Bus::new(Vec::new());
+        bus.write_u16(IO_START, 0x0003); // modo 3
+        bus.write_u16(VRAM_START, 0x001F); // (0,0) rojo
+        let last_px = (240 * 160 - 1) * 2;
+        bus.write_u16(VRAM_START + last_px as u32, 0x7C00); // último píxel azul
+
+        bus.sync_to_cycle(CYCLES_PER_FRAME);
+
+        assert_eq!(fb_pixel(&bus, 0, 0), [0xFF, 0x00, 0x00, 0xFF], "primer píxel rojo");
+        assert_eq!(fb_pixel(&bus, 239, 159), [0x00, 0x00, 0xFF, 0xFF], "último píxel azul");
     }
 
     // ---- Timers (Mini-Hito 2.3e) ----------------------------------------

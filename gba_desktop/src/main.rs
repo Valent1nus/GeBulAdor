@@ -109,7 +109,7 @@ fn main() {
                         println!("  Estado THUMB en {pc:#010X} — ejecución THUMB aún no implementada.")
                     }
                     RunStop::Halted(Halt::WaitingForInterrupt) => {
-                        println!("  CPU en Halt esperando una IRQ que no llega (falta PPU/timers).")
+                        println!("  CPU en Halt esperando una IRQ que ninguna fuente habilitada va a generar.")
                     }
                     RunStop::StepLimit => {
                         println!("  Tope de pasos alcanzado sin detenerse (¿bucle?).")
@@ -190,8 +190,8 @@ fn run_test_rom(path: &Path) {
         }
         RunStop::Halted(Halt::WaitingForInterrupt) => {
             println!(
-                "⏸️  CPU en Halt esperando una IRQ: sin timers (2.3e) ni PPU (2.4b) que la \
-                 generen por tiempo, no despierta todavía."
+                "⏸️  CPU en Halt esperando una IRQ que ninguna fuente habilitada (timer/PPU) \
+                 va a generar; no despierta."
             );
         }
         RunStop::StepLimit => {
@@ -303,7 +303,7 @@ fn run_window(mut gba: Gba) {
     let mut buffer: Vec<u32> = vec![0; SCREEN_WIDTH * SCREEN_HEIGHT];
 
     let mut window = Window::new(
-        "EmulaRUST — GBA (Fase 2.4a · PPU modo 3 · ESC para salir)",
+        "EmulaRUST — GBA (Fase 2.4b · PPU por scanlines · ESC para salir)",
         SCREEN_WIDTH,
         SCREEN_HEIGHT,
         WindowOptions {
@@ -319,9 +319,10 @@ fn run_window(mut gba: Gba) {
     window.set_target_fps(60);
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
-        // Mini-Hito 2.4a: la PPU compone el frame desde la VRAM antes de pintarlo.
-        // (El render por scanlines integrado en la ejecución llega en el 2.4b.)
-        gba.render_frame();
+        // Mini-Hito 2.4b: ejecutar un frame de vídeo entero. La PPU va componiendo la
+        // imagen scanline a scanline durante la ejecución (no hace falta un render
+        // aparte); luego se pinta el framebuffer ya compuesto.
+        gba.run_frame();
         rgba_to_0rgb(gba.framebuffer(), &mut buffer);
         window
             .update_with_buffer(&buffer, SCREEN_WIDTH, SCREEN_HEIGHT)

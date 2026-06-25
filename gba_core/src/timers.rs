@@ -394,7 +394,9 @@ mod tests {
         // Disparar el evento del desborde.
         sched.advance_to(2);
         let event = sched.pop_due().expect("hay un desborde vencido");
-        let Event::TimerOverflow { timer, at } = event;
+        let Event::TimerOverflow { timer, at } = event else {
+            panic!("se esperaba un desborde de timer, no {event:?}");
+        };
         t.on_overflow(timer, at, &mut sched, &mut irq);
 
         assert!(irq.raised(), "el desborde levantó la IRQ del Timer0");

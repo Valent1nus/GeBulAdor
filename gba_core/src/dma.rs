@@ -75,6 +75,9 @@ const CTRL_DST_CTL_SHIFT: u16 = 5;
 /// Control de la dirección de **origen** (bits 7-8): 0=incrementa, 1=decrementa,
 /// 2=fija, 3=prohibido.
 const CTRL_SRC_CTL_SHIFT: u16 = 7;
+/// Repetición (bit 9): un canal con arranque por evento (V-Blank/H-Blank/especial)
+/// se **re-arma** tras cada disparo en vez de apagarse. No aplica al modo inmediato.
+const CTRL_REPEAT_BIT: u16 = 1 << 9;
 /// Tipo de transferencia (bit 10): 0 = 16 bits, 1 = 32 bits.
 const CTRL_WORD_BIT: u16 = 1 << 10;
 /// Modo de arranque (bits 12-13): 0=inmediato, 1=V-Blank, 2=H-Blank, 3=especial.
@@ -85,9 +88,14 @@ const CTRL_IRQ_BIT: u16 = 1 << 14;
 /// Bit de **enable** (bit 15): activa el canal. Su flanco 0→1 es lo que dispara.
 const CTRL_ENABLE_BIT: u16 = 1 << 15;
 
-/// El modo de arranque "inmediato" (campo de timing = 0): único implementado en
-/// el Mini-Hito 2.3b.
+/// El modo de arranque "inmediato" (campo de timing = 0): el del Mini-Hito 2.3b.
 const TIMING_IMMEDIATE: u16 = 0;
+/// Modo de arranque **V-Blank** (campo de timing = 1): lo dispara la PPU al entrar
+/// en V-Blank (Mini-Hito 2.4b).
+pub const DMA_TIMING_VBLANK: u16 = 1;
+/// Modo de arranque **H-Blank** (campo de timing = 2): lo dispara la PPU al entrar
+/// en el H-Blank de una línea visible (Mini-Hito 2.4b).
+pub const DMA_TIMING_HBLANK: u16 = 2;
 
 /// Máscara de la dirección de **origen** por canal. DMA0 solo direcciona memoria
 /// interna (27 bits); DMA1–3 alcanzan también el cartucho (28 bits).
@@ -228,6 +236,24 @@ impl Dma {
         false
     }
 
+    /// `true` si el canal `ch` está **armado para el arranque `timing`** (V-Blank o
+    /// H-Blank): tiene el `enable` puesto y su modo de arranque coincide. Lo consulta
+    /// el bus cuando la PPU dispara uno de esos eventos (Mini-Hito 2.4b) para ejecutar
+    /// los canales que esperaban ese momento. A diferencia del inmediato, no depende
+    /// de un flanco: mientras el `enable` siga a 1, el canal vuelve a disparar en cada
+    /// evento (el bit `repeat` decide si sigue armado, ver [`Dma::repeats`]).
+    pub fn armed_for(&self, ch: usize, timing: u16) -> bool {
+        let control = self.control(ch);
+        control & CTRL_ENABLE_BIT != 0 && (control >> CTRL_TIMING_SHIFT) & 0b11 == timing
+    }
+
+    /// `true` si el canal `ch` tiene el bit **repeat** (bit 9): tras disparar por su
+    /// evento, se re-arma en vez de apagarse. Lo usa el bus para decidir si, tras una
+    /// transferencia por V-Blank/H-Blank, deja el canal activo o lo apaga.
+    pub fn repeats(&self, ch: usize) -> bool {
+        self.control(ch) & CTRL_REPEAT_BIT != 0
+    }
+
     /// Decodifica el control del canal `ch` en un [`DmaTransfer`] listo para que el
     /// bus lo ejecute: direcciones enmascaradas y alineadas, conteo resuelto (0 →
     /// máximo) y el paso con signo de origen/destino según su modo de dirección.
@@ -257,10 +283,11 @@ impl Dma {
         }
     }
 
-    /// Cierra una transferencia **inmediata**: como el modo inmediato es de disparo
-    /// único (el bit `repeat` no aplica), limpia el `enable` (bit 15) del control y
-    /// el latch del canal, de modo que una lectura posterior de `CNT_H` vea el
-    /// canal ya parado y un nuevo `enable` vuelva a ser un flanco que dispare.
+    /// **Apaga** un canal tras una transferencia de disparo único: limpia el
+    /// `enable` (bit 15) del control y el latch del canal, de modo que una lectura
+    /// posterior de `CNT_H` vea el canal parado y un nuevo `enable` vuelva a ser un
+    /// flanco que dispare. Lo usa el bus para el modo **inmediato** (siempre único) y
+    /// para un DMA por evento **sin** bit repeat (ver [`Dma::repeats`]).
     pub fn finish_immediate(&mut self, ch: usize) {
         // El bit 15 (enable) es el bit 7 del byte alto del control `CNT_H`.
         let hi_byte = ch * CHANNEL_STRIDE + OFF_CNT_H + 1;
@@ -469,6 +496,29 @@ mod tests {
         assert!(!plan.word, "sin bit 10 → 16 bits");
         assert_eq!(plan.src_step, 0, "origen fijo");
         assert_eq!(plan.dst_step, -2, "destino decrementa una unidad de 16 bits");
+    }
+
+    #[test]
+    fn armed_for_reconoce_el_modo_de_arranque_por_evento() {
+        let mut dma = Dma::new();
+        // Canal con enable + timing V-Blank (1): armado para V-Blank, no para H-Blank.
+        let vblank = CTRL_ENABLE_BIT | (DMA_TIMING_VBLANK << CTRL_TIMING_SHIFT);
+        write_reg16(&mut dma, 1, OFF_CNT_H, vblank);
+        assert!(dma.armed_for(1, DMA_TIMING_VBLANK));
+        assert!(!dma.armed_for(1, DMA_TIMING_HBLANK));
+        // Sin enable, no está armado para nada.
+        let solo_timing = DMA_TIMING_VBLANK << CTRL_TIMING_SHIFT;
+        write_reg16(&mut dma, 2, OFF_CNT_H, solo_timing);
+        assert!(!dma.armed_for(2, DMA_TIMING_VBLANK), "sin enable no está armado");
+    }
+
+    #[test]
+    fn repeats_lee_el_bit_9() {
+        let mut dma = Dma::new();
+        write_reg16(&mut dma, 0, OFF_CNT_H, CTRL_ENABLE_BIT);
+        assert!(!dma.repeats(0));
+        write_reg16(&mut dma, 0, OFF_CNT_H, CTRL_ENABLE_BIT | CTRL_REPEAT_BIT);
+        assert!(dma.repeats(0));
     }
 
     #[test]
