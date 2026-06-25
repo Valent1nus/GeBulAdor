@@ -47,8 +47,18 @@
 //! ejecuta la **copia inmediata** (ver [`Bus::poll_dma_triggers`]). Es el primer
 //! registro de I/O con semántica real; los timers (2.3e) y el IRQ (2.3c) seguirán
 //! el mismo patrón.
+//!
+//! ## Interrupciones (Mini-Hito 2.3c)
+//!
+//! El bus alberga también el controlador de interrupciones ([`InterruptControl`]):
+//! enruta a él los registros `IE`/`IF`/`IME` y ofrece la API que conecta a los
+//! componentes con la CPU — [`Bus::request_interrupt`] (la usa el DMA al terminar,
+//! y la usarán timers/PPU), [`Bus::irq_pending`] y [`Bus::irq_raised`] (las
+//! consulta la CPU para decidir si salta al vector de IRQ o despierta de un
+//! `Halt`).
 
 use crate::dma::{Dma, DMA_CHANNELS};
+use crate::interrupt::{Interrupt, InterruptControl};
 
 /// Valor devuelto al leer una dirección no mapeada (*open bus*). El hardware
 /// real devuelve patrones más complejos, pero `0` es seguro y suficiente por
@@ -121,6 +131,11 @@ pub struct Bus {
     /// [`Bus::run_dma_transfer`]), porque es quien accede a la memoria.
     dma: Dma,
 
+    /// El controlador de **interrupciones** (Mini-Hito 2.3c): `IE`/`IF`/`IME`. Los
+    /// componentes solicitan IRQs por [`Bus::request_interrupt`] y la CPU consulta
+    /// [`Bus::irq_pending`]/[`Bus::irq_raised`].
+    irq: InterruptControl,
+
     /// `true` si se ha cargado la **BIOS real** ([`Bus::load_bios`]). Es la fuente
     /// de verdad de "¿hay BIOS?" y decide el camino del `SWI`: con BIOS real se
     /// salta al vector `0x08` (LLE, Mini-Hito 2.2l); sin ella se intercepta y se
@@ -146,6 +161,7 @@ impl Bus {
             oam: vec![0; OAM_SIZE],
             rom,
             dma: Dma::new(),
+            irq: InterruptControl::new(),
             bios_loaded: false,
         }
     }
@@ -197,6 +213,8 @@ impl Bus {
                 let off = addr & 0x00FF_FFFF;
                 if Dma::in_range(off) {
                     self.dma.read_u8(off)
+                } else if InterruptControl::handles(off) {
+                    self.irq.read_u8(off)
                 } else {
                     read_at(&self.io, off as usize)
                 }
@@ -258,6 +276,8 @@ impl Bus {
                 let off = addr & 0x00FF_FFFF;
                 if Dma::in_range(off) {
                     self.dma.write_u8(off, value);
+                } else if InterruptControl::handles(off) {
+                    self.irq.write_u8(off, value);
                 } else {
                     write_at(&mut self.io, off as usize, value);
                 }
@@ -351,8 +371,34 @@ impl Bus {
             src = src.wrapping_add(plan.src_step as u32);
             dst = dst.wrapping_add(plan.dst_step as u32);
         }
+        let raise_irq = self.dma.irq_on_end(ch); // bit 14 del control, antes de bajarlo
         self.dma.end();
         self.dma.finish_immediate(ch); // inmediato = disparo único: baja el enable
+        if raise_irq {
+            // El DMA con "IRQ al terminar" levanta la IRQ de su canal (2.3c).
+            self.request_interrupt(Interrupt::dma(ch));
+        }
+    }
+
+    // ---- Interrupciones (Mini-Hito 2.3c) --------------------------------
+
+    /// Marca la IRQ de `source` como pendiente (pone su bit en `IF`). La llaman los
+    /// componentes de hardware al disparar: hoy el DMA al terminar; mañana los
+    /// timers (2.3e), la PPU (2.4b) y el SIO (Fase 4).
+    pub fn request_interrupt(&mut self, source: Interrupt) {
+        self.irq.request(source);
+    }
+
+    /// `true` si hay alguna IRQ habilitada y pendiente (`IE & IF != 0`), **sin**
+    /// mirar `IME`. Es lo que despierta a la CPU de un `Halt` (ver [`crate::Cpu`]).
+    pub fn irq_raised(&self) -> bool {
+        self.irq.raised()
+    }
+
+    /// `true` si una IRQ debe atenderse: [`Bus::irq_raised`] **y** `IME = 1`. La CPU
+    /// comprueba además el bit `I` del `CPSR` antes de saltar al vector.
+    pub fn irq_pending(&self) -> bool {
+        self.irq.pending()
     }
 
     // ---- Temporización (Mini-Hito 2.2c) ---------------------------------
@@ -689,6 +735,35 @@ mod tests {
         assert_eq!(bus.read_u32(IWRAM_START), 0);
         // Y el canal sigue armado (enable a 1).
         assert_ne!(bus.read_u16(dma_reg(3, 0xA)) & DMA_ENABLE, 0);
+    }
+
+    #[test]
+    fn dma_con_irq_al_terminar_levanta_la_interrupcion_del_canal() {
+        // El bit 14 del control pide IRQ al terminar (Mini-Hito 2.3c): tras la
+        // copia, el bus debe levantar la IRQ del canal correspondiente.
+        let mut bus = Bus::new(Vec::new());
+        bus.write_u32(EWRAM_START, 0x1234_5678);
+        bus.write_u32(dma_reg(2, 0), EWRAM_START); // SAD
+        bus.write_u32(dma_reg(2, 4), IWRAM_START); // DAD
+        bus.write_u16(dma_reg(2, 8), 1);
+        const DMA_IRQ: u16 = 1 << 14;
+        bus.write_u16(dma_reg(2, 0xA), DMA_ENABLE | DMA_WORD | DMA_IRQ);
+
+        // La copia ocurrió y, además, la IRQ del DMA2 quedó pendiente en IF.
+        assert_eq!(bus.read_u32(IWRAM_START), 0x1234_5678);
+        let if_bit_dma2 = bus.read_u16(IO_START + 0x202) & Interrupt::Dma2.bit();
+        assert_ne!(if_bit_dma2, 0, "el DMA2 con bit 14 levanta su IRQ");
+    }
+
+    #[test]
+    fn dma_sin_bit_de_irq_no_levanta_interrupcion() {
+        let mut bus = Bus::new(Vec::new());
+        bus.write_u32(EWRAM_START, 0x1234_5678);
+        bus.write_u32(dma_reg(2, 0), EWRAM_START);
+        bus.write_u32(dma_reg(2, 4), IWRAM_START);
+        bus.write_u16(dma_reg(2, 8), 1);
+        bus.write_u16(dma_reg(2, 0xA), DMA_ENABLE | DMA_WORD); // sin bit 14
+        assert_eq!(bus.read_u16(IO_START + 0x202), 0, "IF sigue limpio");
     }
 
     #[test]

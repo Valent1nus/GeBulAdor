@@ -31,9 +31,11 @@
 //! - **Reset/control:** [`SoftReset`](soft_reset) (0x00),
 //!   [`RegisterRamReset`](register_ram_reset) (0x01).
 //!
-//! Quedan como **stub** (no-op que solo deja continuar la CPU) las que suspenden
-//! el procesador hasta una interrupción: `Halt` (0x02), `Stop` (0x03), `IntrWait`
-//! (0x04) y `VBlankIntrWait` (0x05) — dependen del IRQ (2.3c) y de la PPU (2.4b)—,
+//! `Halt` (0x02) ya está implementado (Mini-Hito 2.3c): pone la CPU en bajo
+//! consumo hasta que `IE & IF` se hace distinto de cero (ver [`Cpu::halt`]).
+//! Quedan como **stub** (no-op que solo deja continuar la CPU) las que esperan una
+//! IRQ **concreta** que todavía nada genera por tiempo: `Stop` (0x03), `IntrWait`
+//! (0x04) y `VBlankIntrWait` (0x05) —necesitan los timers (2.3e) o la PPU (2.4b)—,
 //! y las de sonido (0x1A+), que esperan a la APU (Fase 2.5).
 //!
 //! ## 🛡️ Seguridad — entradas controladas por la ROM
@@ -97,11 +99,17 @@ pub(crate) fn dispatch(cpu: &mut Cpu, bus: &mut Bus, number: u8) -> Executed {
         0x16 => diff_unfilter(cpu, bus, /* unit16 */ false, /* write16 */ false),
         0x17 => diff_unfilter(cpu, bus, /* unit16 */ false, /* write16 */ true),
         0x18 => diff_unfilter(cpu, bus, /* unit16 */ true, /* write16 */ true),
-        // Stubs: suspenden la CPU hasta una IRQ (Halt/Stop/IntrWait/VBlankIntrWait,
-        // 0x02–0x05) o pertenecen a la APU (sonido, 0x1A+). Sin sus disparadores,
-        // lo correcto es **no hacer nada y continuar** para no descarrilar; se
-        // completarán en 2.3c (IRQ), 2.4b (PPU) y la Fase 2.5 (APU). Lo mismo para
-        // cualquier número no reconocido.
+        // `Halt` (0x02): pone la CPU en bajo consumo hasta la próxima IRQ. El
+        // mecanismo ya existe (Mini-Hito 2.3c): la CPU despierta cuando `IE & IF`
+        // se hace distinto de cero. Continúa a la instrucción siguiente (es esa la
+        // que no se ejecutará hasta despertar).
+        0x02 => cpu.halt(),
+        // Stubs aún sin disparador: `Stop` (0x03) e `IntrWait`/`VBlankIntrWait`
+        // (0x04/0x05) esperan una IRQ **concreta** que hoy nada genera por tiempo
+        // (la dará la PPU en 2.4b / los timers en 2.3e); las de sonido (0x1A+)
+        // esperan a la APU (Fase 2.5). Sin su disparador, lo seguro es no hacer
+        // nada y continuar, para no colgar el emulador. Igual para un número no
+        // reconocido.
         _ => {}
     }
     Executed::Continue { extra_cycles: 0 }

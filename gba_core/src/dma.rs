@@ -79,6 +79,9 @@ const CTRL_SRC_CTL_SHIFT: u16 = 7;
 const CTRL_WORD_BIT: u16 = 1 << 10;
 /// Modo de arranque (bits 12-13): 0=inmediato, 1=V-Blank, 2=H-Blank, 3=especial.
 const CTRL_TIMING_SHIFT: u16 = 12;
+/// Bit de **IRQ al terminar** (bit 14): si está a 1, el canal solicita una
+/// interrupción al acabar la transferencia (Mini-Hito 2.3c).
+const CTRL_IRQ_BIT: u16 = 1 << 14;
 /// Bit de **enable** (bit 15): activa el canal. Su flanco 0→1 es lo que dispara.
 const CTRL_ENABLE_BIT: u16 = 1 << 15;
 
@@ -267,6 +270,14 @@ impl Dma {
         if let Some(latch) = self.enabled_latch.get_mut(ch) {
             *latch = false;
         }
+    }
+
+    /// `true` si el canal `ch` pide **IRQ al terminar** (bit 14 del control). Lo
+    /// consulta el bus tras la copia para levantar la interrupción del canal
+    /// (Mini-Hito 2.3c). Se lee antes de [`Dma::finish_immediate`], que solo toca
+    /// el bit 15 (enable), así que el 14 sigue intacto.
+    pub fn irq_on_end(&self, ch: usize) -> bool {
+        self.control(ch) & CTRL_IRQ_BIT != 0
     }
 
     /// El registro de control `CNT_H` (16 bits) del canal `ch`.

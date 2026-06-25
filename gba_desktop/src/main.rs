@@ -108,6 +108,9 @@ fn main() {
                     RunStop::Halted(Halt::ThumbNotImplemented { pc }) => {
                         println!("  Estado THUMB en {pc:#010X} — ejecución THUMB aún no implementada.")
                     }
+                    RunStop::Halted(Halt::WaitingForInterrupt) => {
+                        println!("  CPU en Halt esperando una IRQ que no llega (falta PPU/timers).")
+                    }
                     RunStop::StepLimit => {
                         println!("  Tope de pasos alcanzado sin detenerse (¿bucle?).")
                     }
@@ -184,6 +187,12 @@ fn run_test_rom(path: &Path) {
         }
         RunStop::Halted(Halt::ThumbNotImplemented { pc }) => {
             println!("⏸️  Estado THUMB en {pc:#010X}: la ejecución THUMB aún no está (2.2m/2.3a).");
+        }
+        RunStop::Halted(Halt::WaitingForInterrupt) => {
+            println!(
+                "⏸️  CPU en Halt esperando una IRQ: sin timers (2.3e) ni PPU (2.4b) que la \
+                 generen por tiempo, no despierta todavía."
+            );
         }
         RunStop::StepLimit => {
             println!("⏱️  Tope de {MAX_STEPS} pasos sin terminar (¿bucle no detectado o ROM muy larga?).");

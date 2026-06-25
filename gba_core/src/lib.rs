@@ -9,7 +9,7 @@
 //! sustituir el frontend de escritorio por uno de Android, iOS o WASM sin tocar
 //! una sola línea del núcleo.
 //!
-//! ## Estado actual (Fase 2.3b)
+//! ## Estado actual (Fase 2.3c)
 //!
 //! Además de cargar y validar el cartucho (Fase 1), el núcleo tiene el
 //! esqueleto del hardware: la CPU ARM7TDMI ([`Cpu`]) con sus registros y modos,
@@ -64,8 +64,14 @@
 //! [`dma`]): los cuatro canales DMA0–DMA3 con **copia inmediata**. El bus enruta a
 //! ellos el bloque de registros de I/O del DMA y, al activarse el `enable` de un
 //! canal en modo inmediato, ejecuta la transferencia (los modos por evento
-//! —V-Blank/H-Blank/FIFO— quedan armados a la espera de la PPU/APU). La frontera
-//! con el frontend —entregar un buffer RGBA— no cambia.
+//! —V-Blank/H-Blank/FIFO— quedan armados a la espera de la PPU/APU). El Mini-Hito
+//! **2.3c** añade el **sistema de interrupciones** (módulo [`interrupt`]):
+//! `IE`/`IF`/`IME` en el bus, una API para que los componentes soliciten IRQs
+//! ([`Bus::request_interrupt`], ya conectada al "IRQ al terminar" del DMA) y la
+//! **entrada a la excepción de IRQ** en la CPU (vector `0x18`, modo IRQ) cuando hay
+//! una pendiente y habilitada. Con ello, el `SWI Halt` deja de ser stub: la CPU
+//! puede dormir hasta que llegue una interrupción. La frontera con el frontend
+//! —entregar un buffer RGBA— no cambia.
 
 pub mod arm;
 pub mod bios;
@@ -75,6 +81,7 @@ pub mod cartridge;
 pub mod cpu;
 pub mod dma;
 pub mod header;
+pub mod interrupt;
 pub mod scheduler;
 pub mod thumb;
 
@@ -83,6 +90,7 @@ pub use bios::{Bios, BiosError};
 pub use bus::{AccessWidth, Bus};
 pub use cartridge::{Cartridge, CartridgeError, MAX_ROM_SIZE, MIN_ROM_SIZE};
 pub use dma::{Dma, DmaTransfer, DMA_CHANNELS};
+pub use interrupt::{Interrupt, InterruptControl};
 pub use cpu::{Cpu, CpuMode, Cpsr, Halt, RunReport, RunStop, StepResult};
 pub use header::Header;
 pub use scheduler::Scheduler;
@@ -426,6 +434,63 @@ mod tests {
         );
         // El DMA copió el 0x42 de EWRAM a IWRAM, y el LDR lo trajo a r5.
         assert_eq!(gba.reg(5), 0x42, "el DMA debe haber copiado el dato");
+    }
+
+    #[test]
+    fn irq_end_to_end_dma_dispara_una_interrupcion_atendida_por_la_bios() {
+        // Prueba end-to-end del Mini-Hito 2.3c (uniéndolo al 2.3b): un DMA con
+        // "IRQ al terminar" levanta la interrupción, la CPU salta al vector 0x18, un
+        // handler real (en una BIOS sintética) la reconoce y vuelve con
+        // `SUBS pc, lr, #4`, y la ejecución continúa de forma natural.
+        //
+        // BIOS sintética: arranca saltando a la ROM y tiene el handler de IRQ en
+        // 0x18 (marca r10, reconoce IF y retorna).
+        let mut bios = vec![0u8; crate::bus::BIOS_SIZE];
+        poner(&mut bios, 0x00, 0xE3A0_0408); // MOV r0, #0x0800_0000
+        poner(&mut bios, 0x04, 0xE12F_FF10); // BX r0 → salta a la ROM (ARM)
+        poner(&mut bios, 0x18, 0xE3A0_A0CA); // [IRQ] MOV r10, #0xCA (marca handler)
+        poner(&mut bios, 0x1C, 0xE3A0_B404); // MOV r11, #0x0400_0000
+        poner(&mut bios, 0x20, 0xE28B_BC02); // ADD r11, r11, #0x200 (r11=0x0400_0200)
+        poner(&mut bios, 0x24, 0xE3E0_C000); // MVN r12, #0 (r12 = 0xFFFF_FFFF)
+        poner(&mut bios, 0x28, 0xE1CB_C0B2); // STRH r12, [r11, #2] → IF=0xFFFF (ack)
+        poner(&mut bios, 0x2C, 0xE25E_F004); // SUBS pc, lr, #4 (retorno de la IRQ)
+        let bios = Bios::from_bytes(bios).expect("16 KiB válida");
+
+        // ROM: habilita interrupciones y programa un DMA0 con IRQ al terminar.
+        let programa = [
+            0xE321_F01Fu32, // MSR cpsr_c, #0x1F    (modo System, I=0: IRQ habilitadas)
+            0xE3A0_4404,     // MOV r4, #0x04000000 (base de I/O)
+            0xE3A0_0001,     // MOV r0, #1
+            0xE584_0208,     // STR r0, [r4, #0x208] (IME = 1)
+            0xE284_5C02,     // ADD r5, r4, #0x200   (r5 = 0x04000200)
+            0xE3A0_0C01,     // MOV r0, #0x100       (bit 8 = DMA0)
+            0xE1C5_00B0,     // STRH r0, [r5]        (IE = DMA0)
+            0xE3A0_1402,     // MOV r1, #0x02000000  (EWRAM: origen)
+            0xE3A0_0099,     // MOV r0, #0x99        (el dato)
+            0xE581_0000,     // STR r0, [r1]         (EWRAM[0] = 0x99)
+            0xE584_10B0,     // STR r1, [r4, #0xB0]  (DMA0SAD = EWRAM)
+            0xE3A0_2403,     // MOV r2, #0x03000000  (IWRAM: destino)
+            0xE584_20B4,     // STR r2, [r4, #0xB4]  (DMA0DAD = IWRAM)
+            0xE3A0_3001,     // MOV r3, #1
+            0xE1C4_3BB8,     // STRH r3, [r4, #0xB8] (DMA0CNT_L = 1)
+            0xE3A0_3CC4,     // MOV r3, #0xC400      (enable | 32 bits | IRQ-al-terminar)
+            0xE1C4_3BBA,     // STRH r3, [r4, #0xBA] (DMA0CNT_H → copia + levanta IRQ)
+            0xE592_6000,     // LDR r6, [r2]         (r6 = IWRAM[0]; se ejecuta TRAS la IRQ)
+            0xEAFF_FFFE,     // b .                  (fin)
+        ];
+        let mut rom = vec![0u8; MIN_ROM_SIZE];
+        for (i, w) in programa.iter().enumerate() {
+            poner(&mut rom, i * 4, *w);
+        }
+        let mut gba = Gba::with_cartridge_and_bios(Cartridge::from_bytes(rom).unwrap(), bios);
+
+        let report = gba.run(1_000);
+        assert!(
+            matches!(report.stop, RunStop::Halted(Halt::InfiniteLoop { .. })),
+            "termina en el «b .» final"
+        );
+        assert_eq!(gba.reg(10), 0xCA, "el handler de IRQ se ejecutó");
+        assert_eq!(gba.reg(6), 0x99, "y la copia del DMA llegó al destino");
     }
 
     #[test]

@@ -64,6 +64,10 @@ pub const PC_AHEAD_ARM: u32 = 8;
 /// de 2 bytes por delante (Mini-Hito 2.1e).
 pub const PC_AHEAD_THUMB: u32 = 4;
 
+/// Dirección del **vector de excepción de IRQ** (Mini-Hito 2.3c): al atender una
+/// interrupción, la CPU salta aquí, donde la BIOS (o el HLE) tiene su manejador.
+pub const IRQ_VECTOR: u32 = 0x0000_0018;
+
 /// Bits **realmente implementados** de un PSR en el ARM7TDMI: los flags de
 /// condición `NZCV` (31-28) y el byte de control `I`/`F`/`T` + modo (7-0). Los
 /// bits 27-8 son reservados: se leen como 0 y `MSR` no puede escribirlos. Lo usa
@@ -326,6 +330,11 @@ pub struct Cpu {
     /// fetch coincide, el acceso es S; si no, es N (no secuencial). `None` tras
     /// un reset o un salto, donde el primer fetch es siempre N.
     seq_fetch_addr: Option<u32>,
+
+    /// `true` si la CPU está en estado de **bajo consumo** (`Halt`): no ejecuta
+    /// instrucciones hasta que una IRQ quede pendiente (Mini-Hito 2.3c). Lo activa
+    /// el `SWI` `Halt` (`bios_hle`) y lo limpia [`Cpu::step`] al despertar.
+    halted: bool,
 }
 
 /// Resultado de ejecutar **un paso** de la CPU ([`Cpu::step`]).
@@ -369,6 +378,13 @@ pub enum Halt {
         /// `PC` (crudo) donde se quedó, ya en estado THUMB.
         pc: u32,
     },
+    /// La CPU ejecutó un `SWI` `Halt` y está **dormida** esperando una IRQ, pero
+    /// no hay ninguna pendiente (`IE & IF == 0`) ni —con el bucle actual, sin el
+    /// [`crate::Scheduler`] integrado— forma de que llegue. El bucle se detiene
+    /// limpiamente; no es un error, sino que no hay nada más que ejecutar. Cuando
+    /// los timers (2.3e) y la PPU (2.4b) generen IRQs por tiempo, el bucle avanzará
+    /// el reloj hasta el siguiente evento en vez de parar aquí.
+    WaitingForInterrupt,
 }
 
 /// Informe de una corrida en bucle ([`Cpu::run`] / [`crate::Gba::run`]).
@@ -451,6 +467,7 @@ impl Cpu {
             fiq_r8_r12: [0; 5],
             cycles: 0,
             seq_fetch_addr: None,
+            halted: false,
         }
     }
 
@@ -1399,11 +1416,59 @@ impl Cpu {
     /// detienen la CPU con [`StepResult::Halted`], **sin** avanzar el `PC` (queda
     /// en la instrucción culpable, para inspeccionarla).
     pub fn step(&mut self, bus: &mut Bus) -> StepResult {
+        // Estado de bajo consumo (`SWI Halt`, Mini-Hito 2.3c): la CPU no ejecuta
+        // hasta que una IRQ quede pendiente (`IE & IF`, sin mirar `IME`, como el
+        // hardware). Sin el scheduler integrado, si no hay ninguna posible, el
+        // bucle se detiene limpiamente en vez de girar en vacío.
+        if self.halted {
+            if bus.irq_raised() {
+                self.halted = false;
+            } else {
+                return StepResult::Halted(Halt::WaitingForInterrupt);
+            }
+        }
+
+        // ¿Atender una IRQ antes de la siguiente instrucción? Hacen falta las tres:
+        // `IME = 1` y `IE & IF != 0` (las mira el bus) y el bit `I` del CPSR a 0.
+        if !self.cpsr.irq_disabled() && bus.irq_pending() {
+            return self.take_irq();
+        }
+
         if self.cpsr.thumb() {
             self.step_thumb(bus)
         } else {
             self.step_arm(bus)
         }
+    }
+
+    /// Atiende una **IRQ** (Mini-Hito 2.3c): entra en la excepción de interrupción
+    /// como el hardware. Solo se llama cuando el salto está garantizado (las
+    /// condiciones ya las comprobó [`Cpu::step`]).
+    ///
+    /// La diferencia con `SWI`/indefinida es la **dirección de retorno**: una IRQ
+    /// se toma *entre* instrucciones, así que `LR_irq` apunta a la instrucción que
+    /// **no** se llegó a ejecutar **+4**, porque el manejador estándar vuelve con
+    /// `SUBS pc, lr, #4` (a diferencia del `MOVS pc, lr` de `SWI`). Ese `+4` es el
+    /// mismo viniera la CPU de estado ARM o THUMB.
+    fn take_irq(&mut self) -> StepResult {
+        let return_addr = self.pc().wrapping_add(4);
+        self.enter_exception_at(CpuMode::Irq, IRQ_VECTOR, return_addr);
+        // La entrada vacía el pipeline (es un salto al vector): el próximo fetch es
+        // no secuencial. El **coste en ciclos** de la entrada de IRQ aún no se
+        // contabiliza (se afinará al integrar el scheduler, igual que el del DMA).
+        self.seq_fetch_addr = None;
+        StepResult::Stepped
+    }
+
+    /// Pone la CPU en estado **`Halt`** (la usa el `SWI Halt` del HLE, Mini-Hito
+    /// 2.3c): deja de ejecutar hasta que [`Cpu::step`] la despierte con una IRQ.
+    pub fn halt(&mut self) {
+        self.halted = true;
+    }
+
+    /// `true` si la CPU está dormida en estado `Halt`.
+    pub fn is_halted(&self) -> bool {
+        self.halted
     }
 
     /// Un paso en estado **ARM** (32 bits): el flujo de dos pasos condición→opcode
@@ -2191,7 +2256,19 @@ impl Cpu {
     /// el hardware lo ignora y aquí también — el HLE/LLE de esas funciones es
     /// cosa del Mini-Hito 2.2l/2.3a, no del mecanismo de entrada.)
     fn enter_exception(&mut self, mode: CpuMode, vector: u32) -> Executed {
+        // SWI/indefinida vuelven con `MOVS pc, lr`: el retorno es la instrucción
+        // siguiente a la actual (PC + tamaño de instrucción).
         let return_addr = self.pc().wrapping_add(self.instruction_size());
+        self.enter_exception_at(mode, vector, return_addr);
+        Executed::Branched { extra_cycles: 0 }
+    }
+
+    /// Mecánica común de entrada a una excepción, con la dirección de retorno ya
+    /// calculada por el llamante (que difiere entre `SWI`/indefinida y la IRQ; ver
+    /// [`Cpu::take_irq`]). Cambia de modo —lo que banca `SP`/`LR`—, guarda el
+    /// `CPSR` previo en el `SPSR`, deja el retorno en `LR`, enmascara las IRQ, fuerza
+    /// estado ARM y salta al `vector`.
+    fn enter_exception_at(&mut self, mode: CpuMode, vector: u32, return_addr: u32) {
         let saved_cpsr = self.cpsr.bits();
         self.set_mode(mode); // banca SP/LR al modo de la excepción
         self.set_spsr(saved_cpsr); // SPSR_<mode> = CPSR previo (para el retorno)
@@ -2199,7 +2276,6 @@ impl Cpu {
         self.cpsr.set_irq_disabled(true); // las excepciones entran con IRQ enmascarada
         self.cpsr.set_thumb(false); // y siempre en estado ARM
         self.set_pc(vector);
-        Executed::Branched { extra_cycles: 0 }
     }
 
     /// Ejecuta un `SWI` en **modo HLE** (sin BIOS real): despacha la función
@@ -4118,6 +4194,161 @@ mod tests {
         assert_eq!(cpu.pc(), base + 2, "avanza 2 bytes (siguiente instrucción THUMB)");
         assert_eq!(cpu.reg(0), 3, "cociente 20/6");
         assert_eq!(cpu.reg(1), 2, "resto 20%6");
+    }
+
+    // ===== Interrupciones / IRQ (Mini-Hito 2.3c) ============================
+
+    /// Deja una IRQ de `source` **pendiente y habilitada**: `IE` con todas las
+    /// fuentes, `IME = 1` y el bit de `source` levantado en `IF`. La CPU la
+    /// atenderá si además su bit `I` está a 0.
+    fn armar_irq(bus: &mut Bus, source: crate::interrupt::Interrupt) {
+        bus.write_u16(crate::bus::IO_START + 0x200, 0xFFFF); // IE = todas
+        bus.write_u32(crate::bus::IO_START + 0x208, 1); // IME = 1
+        bus.request_interrupt(source);
+    }
+
+    #[test]
+    fn una_irq_se_atiende_y_salta_al_vector_0x18() {
+        // La "Prueba" del Mini-Hito 2.3c: con una IRQ pendiente y habilitada, la
+        // CPU salta al vector de interrupción en modo IRQ.
+        let base = crate::bus::IWRAM_START + 0x40;
+        let mut bus = Bus::new(vec![0u8; 4]);
+        let mut cpu = Cpu::new();
+        cpu.set_pc(base);
+        cpu.set_mode(CpuMode::System); // modo previo conocido (≠ IRQ)
+        cpu.cpsr_mut().set_irq_disabled(false); // IRQ habilitadas en el CPSR
+        cpu.cpsr_mut().set_c(true); // un flag cualquiera, debe acabar en el SPSR
+        let cpsr_previo = cpu.cpsr().bits();
+        armar_irq(&mut bus, crate::interrupt::Interrupt::VBlank);
+
+        let efecto = cpu.step(&mut bus);
+        assert_eq!(efecto, StepResult::Stepped);
+        assert_eq!(cpu.mode(), CpuMode::Irq, "la IRQ entra en modo IRQ");
+        assert_eq!(cpu.pc(), 0x0000_0018, "salta al vector de IRQ");
+        assert_eq!(cpu.reg(LR), base + 4, "LR_irq = instrucción interrumpida + 4");
+        assert_eq!(cpu.spsr(), Some(cpsr_previo), "SPSR_irq = CPSR previo");
+        assert!(!cpu.cpsr().thumb(), "entra en estado ARM");
+        assert!(cpu.cpsr().irq_disabled(), "y con las IRQ enmascaradas (I=1)");
+    }
+
+    #[test]
+    fn una_irq_no_se_atiende_con_el_bit_i_a_1() {
+        // Con el bit I del CPSR a 1, la IRQ queda pendiente pero NO se toma: la CPU
+        // ejecuta normalmente la instrucción a la que apunta.
+        let base = crate::bus::IWRAM_START + 0x40;
+        let mut bus = Bus::new(vec![0u8; 4]);
+        bus.write_u32(base, 0xE3A0_002A); // MOV r0, #42
+        let mut cpu = Cpu::new();
+        cpu.set_pc(base);
+        cpu.set_mode(CpuMode::System);
+        cpu.cpsr_mut().set_irq_disabled(true); // IRQ enmascaradas
+        armar_irq(&mut bus, crate::interrupt::Interrupt::VBlank);
+
+        cpu.step(&mut bus);
+        assert_eq!(cpu.mode(), CpuMode::System, "no entra en IRQ");
+        assert_eq!(cpu.pc(), base + 4, "ejecuta la instrucción normal");
+        assert_eq!(cpu.reg(0), 42);
+    }
+
+    #[test]
+    fn una_irq_no_se_atiende_con_ime_a_0_ni_sin_fuente_habilitada() {
+        let base = crate::bus::IWRAM_START + 0x40;
+        // (a) IME = 0: aunque IE & IF != 0, no se atiende.
+        let mut bus = Bus::new(vec![0u8; 4]);
+        bus.write_u16(crate::bus::IO_START + 0x200, 0xFFFF); // IE
+        bus.request_interrupt(crate::interrupt::Interrupt::VBlank); // IF
+        // (IME se queda a 0)
+        let mut cpu = Cpu::new();
+        cpu.set_pc(base);
+        cpu.set_mode(CpuMode::System);
+        cpu.cpsr_mut().set_irq_disabled(false);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.mode(), CpuMode::System, "sin IME no se atiende");
+
+        // (b) IME = 1 pero IE no habilita la fuente pendiente.
+        let mut bus = Bus::new(vec![0u8; 4]);
+        bus.write_u32(crate::bus::IO_START + 0x208, 1); // IME = 1
+        bus.write_u16(crate::bus::IO_START + 0x200, 0x0002); // IE = solo H-Blank
+        bus.request_interrupt(crate::interrupt::Interrupt::VBlank); // pendiente: V-Blank
+        let mut cpu = Cpu::new();
+        cpu.set_pc(base);
+        cpu.set_mode(CpuMode::System);
+        cpu.cpsr_mut().set_irq_disabled(false);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.mode(), CpuMode::System, "la fuente pendiente no está en IE");
+    }
+
+    #[test]
+    fn irq_entrada_y_retorno_con_subs_pc_lr_4_vuelve_al_flujo() {
+        // Integración entrada+retorno: la IRQ entra al handler y el retorno estándar
+        // `SUBS pc, lr, #4` restaura el CPSR desde el SPSR (modo, flags, bit I) y
+        // reanuda en la instrucción que se había interrumpido.
+        let base = crate::bus::IWRAM_START + 0x40;
+        let mut bus = Bus::new(vec![0u8; 4]);
+        let mut cpu = Cpu::new();
+        cpu.set_pc(base);
+        cpu.set_mode(CpuMode::System);
+        cpu.cpsr_mut().set_irq_disabled(false);
+        cpu.cpsr_mut().set_c(true);
+        let cpsr_previo = cpu.cpsr().bits();
+        armar_irq(&mut bus, crate::interrupt::Interrupt::VBlank);
+
+        cpu.step(&mut bus); // toma la IRQ → modo IRQ, PC=0x18, LR_irq=base+4
+        assert_eq!(cpu.mode(), CpuMode::Irq);
+
+        // El handler reconoce la IRQ (limpia IF) y vuelve con `SUBS pc, lr, #4`.
+        bus.write_u16(crate::bus::IO_START + 0x202, 0xFFFF); // acknowledge
+        cpu.execute_data_processing(0xE25E_F004); // SUBS pc, lr, #4
+        assert_eq!(cpu.mode(), CpuMode::System, "el retorno restaura el modo previo");
+        assert_eq!(cpu.cpsr().bits(), cpsr_previo, "y el CPSR completo (flags + I)");
+        assert_eq!(cpu.pc(), base, "reanuda en la instrucción interrumpida");
+    }
+
+    #[test]
+    fn halt_duerme_la_cpu_hasta_que_llega_una_irq() {
+        let base = crate::bus::IWRAM_START + 0x40;
+        let mut bus = Bus::new(vec![0u8; 4]);
+        bus.write_u32(base, 0xE3A0_002A); // MOV r0, #42 (la instrucción tras el Halt)
+        let mut cpu = Cpu::new();
+        cpu.set_pc(base);
+        cpu.set_mode(CpuMode::System);
+        cpu.cpsr_mut().set_irq_disabled(false);
+        cpu.halt();
+
+        // Dormida y sin IRQ: el bucle se detiene limpiamente, sin ejecutar nada.
+        assert!(cpu.is_halted());
+        assert_eq!(
+            cpu.step(&mut bus),
+            StepResult::Halted(Halt::WaitingForInterrupt)
+        );
+        assert_eq!(cpu.reg(0), 0, "no ejecutó la instrucción mientras dormía");
+
+        // Llega una IRQ: despierta y, como está habilitada (IME+IE+I=0), la atiende.
+        armar_irq(&mut bus, crate::interrupt::Interrupt::Dma0);
+        cpu.step(&mut bus);
+        assert!(!cpu.is_halted(), "una IRQ pendiente despierta la CPU");
+        assert_eq!(cpu.mode(), CpuMode::Irq, "y la atiende saltando al vector");
+    }
+
+    #[test]
+    fn halt_despierta_aunque_ime_este_a_0_pero_no_toma_la_irq() {
+        // El Halt despierta con `IE & IF` aunque `IME = 0` (no depende del master
+        // enable); pero entonces no salta al vector: solo reanuda la ejecución.
+        let base = crate::bus::IWRAM_START + 0x40;
+        let mut bus = Bus::new(vec![0u8; 4]);
+        bus.write_u32(base, 0xE3A0_002A); // MOV r0, #42
+        bus.write_u16(crate::bus::IO_START + 0x200, 0xFFFF); // IE habilitado
+        bus.request_interrupt(crate::interrupt::Interrupt::VBlank); // IF (sin IME)
+        let mut cpu = Cpu::new();
+        cpu.set_pc(base);
+        cpu.set_mode(CpuMode::System);
+        cpu.cpsr_mut().set_irq_disabled(false);
+        cpu.halt();
+
+        cpu.step(&mut bus);
+        assert!(!cpu.is_halted(), "despierta con IE&IF aunque IME=0");
+        assert_eq!(cpu.mode(), CpuMode::System, "pero no salta al vector (IME=0)");
+        assert_eq!(cpu.reg(0), 42, "reanuda ejecutando la instrucción siguiente");
     }
 
     // ===== Ejecución THUMB (Mini-Hito 2.2m) =================================
