@@ -49,15 +49,16 @@
 //! de ciclo, por **orden de inserción** (FIFO) gracias a un número de secuencia.
 //! El desempate nunca se deja "al azar" interno del montículo.
 //!
-//! ## Estado actual (2.2d): infraestructura, todavía sin integrar
+//! ## Estado actual (2.3e): integrado en el bucle
 //!
-//! Esta pieza se monta ahora —igual que el bucle (2.2a), el oráculo de test
-//! (2.2b) y el contador de ciclos (2.2c)— pero **aún no se enchufa** al bucle de
-//! ejecución: todavía no hay eventos reales que disparar. Por eso el `Scheduler`
-//! lleva de momento su **propio** reloj ([`Scheduler::now`]), que se avanza a
-//! mano. Cuando existan los primeros eventos (timers, 2.3e), el reloj de la CPU
-//! ([`crate::Cpu::cycles`]) y el del scheduler se unificarán, y el bucle drenará
-//! los eventos vencidos tras cada instrucción.
+//! Esta pieza se montó en el 2.2d como infraestructura y, desde el Mini-Hito
+//! **2.3e (timers)**, **ya está enchufada** al bucle de ejecución. Vive dentro del
+//! [`crate::Bus`] como `Scheduler<`[`Event`](crate::Event)`>`: los timers programan
+//! aquí sus desbordes y [`crate::Bus::sync_to_cycle`] —que [`crate::Cpu::run`] llama
+//! tras cada instrucción— adelanta su reloj hasta el de la CPU
+//! ([`crate::Cpu::cycles`]) y drena los eventos vencidos. Su reloj
+//! ([`Scheduler::now`]) se mantiene así sincronizado con el de la CPU. La PPU (2.4b)
+//! y la APU (2.5) añadirán sus propios eventos a esta misma cola.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;

@@ -9,7 +9,7 @@
 //! sustituir el frontend de escritorio por uno de Android, iOS o WASM sin tocar
 //! una sola línea del núcleo.
 //!
-//! ## Estado actual (Fase 2.3d)
+//! ## Estado actual (Fase 2.3e — Fase 2.3 completa)
 //!
 //! Además de cargar y validar el cartucho (Fase 1), el núcleo tiene el
 //! esqueleto del hardware: la CPU ARM7TDMI ([`Cpu`]) con sus registros y modos,
@@ -73,8 +73,13 @@
 //! puede dormir hasta que llegue una interrupción. El Mini-Hito **2.3d** suma los
 //! registros del **SIO** / Cable Link (módulo [`sio`]): `SIODATA`/`SIOCNT`/`RCNT`
 //! se almacenan en el bus —**sin** lógica de transferencia, que es de la Fase 4—,
-//! para que los juegos puedan configurarlos. La frontera con el frontend —entregar
-//! un buffer RGBA— no cambia.
+//! para que los juegos puedan configurarlos. El Mini-Hito **2.3e** cierra la Fase
+//! 2.3 con los **timers** (módulo [`timers`]) y, al hacerlo, **integra por fin el
+//! [`Scheduler`] en el bucle**: los timers programan sus desbordes en la cola de
+//! eventos y [`Bus::sync_to_cycle`], llamado tras cada instrucción, los dispara
+//! (recarga, IRQ de overflow, cascada). El `Halt` aprovecha el scheduler para
+//! **saltar el tiempo muerto** hasta el evento que despierte a la CPU. La frontera
+//! con el frontend —entregar un buffer RGBA— no cambia.
 
 pub mod arm;
 pub mod bios;
@@ -88,14 +93,16 @@ pub mod interrupt;
 pub mod scheduler;
 pub mod sio;
 pub mod thumb;
+pub mod timers;
 
 pub use arm::{ArmInstruction, Condition, Decoded};
 pub use bios::{Bios, BiosError};
-pub use bus::{AccessWidth, Bus};
+pub use bus::{AccessWidth, Bus, Event};
 pub use cartridge::{Cartridge, CartridgeError, MAX_ROM_SIZE, MIN_ROM_SIZE};
 pub use dma::{Dma, DmaTransfer, DMA_CHANNELS};
 pub use interrupt::{Interrupt, InterruptControl};
 pub use sio::Sio;
+pub use timers::{Timers, NUM_TIMERS};
 pub use cpu::{Cpu, CpuMode, Cpsr, Halt, RunReport, RunStop, StepResult};
 pub use header::Header;
 pub use scheduler::Scheduler;
@@ -115,11 +122,10 @@ pub const FRAMEBUFFER_SIZE: usize = SCREEN_WIDTH * SCREEN_HEIGHT * BYTES_PER_PIX
 
 /// Estado completo de una GBA emulada.
 ///
-/// Agrupa la CPU ([`Cpu`]), el bus de memoria ([`Bus`]) y el framebuffer. En
-/// fases posteriores sumará la PPU y, cuando existan eventos reales que disparar
-/// (timers en 2.3e, PPU en 2.4b), integrará el [`Scheduler`] —ya disponible como
-/// módulo desde el 2.2d—. El frontend interactúa con la emulación únicamente a
-/// través de este tipo.
+/// Agrupa la CPU ([`Cpu`]), el bus de memoria ([`Bus`]) y el framebuffer. El bus
+/// ya alberga el [`Scheduler`] (integrado en el bucle desde el 2.3e, con los timers
+/// como primeros eventos); en fases posteriores se sumará la PPU. El frontend
+/// interactúa con la emulación únicamente a través de este tipo.
 pub struct Gba {
     /// La CPU ARM7TDMI con sus registros, modos y estado.
     cpu: Cpu,
@@ -496,6 +502,51 @@ mod tests {
         );
         assert_eq!(gba.reg(10), 0xCA, "el handler de IRQ se ejecutó");
         assert_eq!(gba.reg(6), 0x99, "y la copia del DMA llegó al destino");
+    }
+
+    #[test]
+    fn timer_end_to_end_despierta_la_cpu_de_un_halt() {
+        // Prueba end-to-end del Mini-Hito 2.3e (uniendo 2.3c): la CPU programa un
+        // timer con IRQ y hace `Halt`. Al integrar el scheduler en el bucle, este
+        // **adelanta el reloj** hasta el desborde del timer, cuya IRQ (`IE & IF`)
+        // despierta a la CPU. Sin la integración del scheduler, el `Halt` pararía en
+        // seco. Se usa el camino **sin BIOS** para que el `SWI Halt` entre por el HLE
+        // (`cpu.halt()`); con `IME = 0`, la IRQ despierta pero no se atiende, así que
+        // la CPU reanuda directamente (no hace falta un manejador en el vector 0x18).
+        let programa = [
+            0xE3A0_4404u32, // MOV r4, #0x04000000  (base de I/O)
+            0xE3A0_0008,    // MOV r0, #0x08         (bit 3 = Timer0)
+            0xE284_5C02,    // ADD r5, r4, #0x200    (r5 = 0x04000200)
+            0xE1C5_00B0,    // STRH r0, [r5]         (IE = Timer0; IME se queda a 0)
+            0xE284_6C01,    // ADD r6, r4, #0x100    (r6 = 0x04000100, base de timers)
+            0xE3A0_0000,    // MOV r0, #0
+            0xE1C6_00B0,    // STRH r0, [r6]         (TM0CNT_L = 0 → desborda en 65536)
+            0xE3A0_00C0,    // MOV r0, #0xC0         (enable | IRQ, prescaler ÷1)
+            0xE1C6_00B2,    // STRH r0, [r6, #2]     (TM0CNT_H → arranca el timer)
+            0xEF02_0000,    // SWI #0x020000         (Halt: la CPU duerme)
+            0xE3A0_7077,    // MOV r7, #0x77         (marca: despertó y siguió)
+            0xEAFF_FFFE,    // b .                   (fin)
+        ];
+        let mut rom = vec![0u8; MIN_ROM_SIZE];
+        for (i, w) in programa.iter().enumerate() {
+            poner(&mut rom, i * 4, *w);
+        }
+        let mut gba = Gba::with_cartridge(Cartridge::from_bytes(rom).unwrap());
+
+        let report = gba.run(10_000);
+        assert!(
+            matches!(report.stop, RunStop::Halted(Halt::InfiniteLoop { .. })),
+            "termina en el «b .» final, no dormida"
+        );
+        assert_eq!(gba.reg(7), 0x77, "la CPU despertó del Halt y siguió ejecutando");
+        // El despertar prueba que el timer desbordó: el reloj saltó hasta su
+        // desborde (~65536 ciclos), muy por encima de las ~pocas decenas que cuesta
+        // el puñado de instrucciones del programa.
+        assert!(
+            gba.cycles() >= 65_536,
+            "el bucle saltó el tiempo muerto hasta el desborde (cycles={})",
+            gba.cycles()
+        );
     }
 
     #[test]

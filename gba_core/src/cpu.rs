@@ -1583,6 +1583,13 @@ impl Cpu {
     /// Ejecuta pasos en bucle hasta que la CPU se detiene ([`StepResult::Halted`])
     /// o hasta completar `max_steps` instrucciones (Mini-Hito 2.2a).
     ///
+    /// Desde el Mini-Hito 2.3e, el bucle **integra el [`Scheduler`](crate::Scheduler)**:
+    /// tras cada instrucción sincroniza el hardware temporizado con el reloj de la
+    /// CPU ([`Bus::sync_to_cycle`]), disparando los desbordes de timer (que recargan
+    /// y, si procede, solicitan su IRQ). Y el estado `Halt` ya no para en seco: si la
+    /// CPU duerme sin IRQ pendiente, **adelanta el reloj** hasta el próximo evento que
+    /// pueda despertarla ([`Bus::next_wakeup_cycle`]) en vez de girar en vacío.
+    ///
     /// El tope `max_steps` es una **salvaguarda**: mientras falten instrucciones
     /// por implementar, una secuencia de NOPs (p. ej. memoria a cero) avanzaría
     /// el `PC` indefinidamente; sin un límite, el bucle no terminaría nunca.
@@ -1590,21 +1597,42 @@ impl Cpu {
         let cycles_start = self.cycles;
         let mut steps = 0;
         while steps < max_steps {
+            // Sincroniza los timers con el reloj de la CPU: dispara los desbordes
+            // vencidos (recarga + IRQ) antes de decidir qué hacer en este giro.
+            bus.sync_to_cycle(self.cycles);
+
+            // Halt con salto temporal: dormida y sin IRQ, salta el tiempo muerto
+            // hasta el próximo evento que pueda despertarla; si ninguno puede, para.
+            if self.halted && !bus.irq_raised() {
+                match bus.next_wakeup_cycle() {
+                    Some(next) => {
+                        self.cycles = self.cycles.max(next);
+                        continue; // el `sync` del próximo giro procesará ese evento
+                    }
+                    None => {
+                        return self.run_report(steps, cycles_start, RunStop::Halted(Halt::WaitingForInterrupt));
+                    }
+                }
+            }
+
             match self.step(bus) {
                 StepResult::Stepped => steps += 1,
                 StepResult::Halted(halt) => {
-                    return RunReport {
-                        steps,
-                        cycles: self.cycles - cycles_start,
-                        stop: RunStop::Halted(halt),
-                    };
+                    return self.run_report(steps, cycles_start, RunStop::Halted(halt));
                 }
             }
         }
+        self.run_report(steps, cycles_start, RunStop::StepLimit)
+    }
+
+    /// Construye el [`RunReport`] de una corrida (los ciclos consumidos se calculan
+    /// respecto a `cycles_start`). Evita repetir la misma estructura en cada salida
+    /// de [`Cpu::run`].
+    fn run_report(&self, steps: u64, cycles_start: u64, stop: RunStop) -> RunReport {
         RunReport {
             steps,
             cycles: self.cycles - cycles_start,
-            stop: RunStop::StepLimit,
+            stop,
         }
     }
 

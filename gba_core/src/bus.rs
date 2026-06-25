@@ -60,7 +60,26 @@
 
 use crate::dma::{Dma, DMA_CHANNELS};
 use crate::interrupt::{Interrupt, InterruptControl};
+use crate::scheduler::Scheduler;
 use crate::sio::Sio;
+use crate::timers::Timers;
+
+/// Un **evento de hardware** programado en el [`Scheduler`] del bus (Mini-Hito
+/// 2.3e). Es el tipo de etiqueta que el scheduler ordena y entrega; el bus lo
+/// maneja en [`Bus::sync_to_cycle`]. Hoy solo lo generan los timers; la PPU (2.4b)
+/// y la APU (2.5) añadirán sus variantes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Event {
+    /// Un timer ha desbordado. `timer` es su índice (0–3) y `at` el ciclo en que el
+    /// desborde estaba programado (sirve para descartar eventos **obsoletos** de
+    /// un timer reconfigurado; ver [`crate::timers`]).
+    TimerOverflow {
+        /// Índice del timer que desbordó (0–3).
+        timer: usize,
+        /// Ciclo en que se programó este desborde.
+        at: u64,
+    },
+}
 
 /// Valor devuelto al leer una dirección no mapeada (*open bus*). El hardware
 /// real devuelve patrones más complejos, pero `0` es seguro y suficiente por
@@ -143,6 +162,15 @@ pub struct Bus {
     /// Fase 4.
     sio: Sio,
 
+    /// Los cuatro **timers** de hardware (Mini-Hito 2.3e): `TM0CNT`–`TM3CNT`.
+    timers: Timers,
+
+    /// La **cola de eventos** por ciclo ([`Scheduler`], Mini-Hito 2.2d), por fin
+    /// integrada en el bucle (2.3e): los timers programan aquí sus desbordes y
+    /// [`Bus::sync_to_cycle`] los dispara. Su reloj se mantiene sincronizado con el
+    /// de la CPU. La PPU (2.4b) y la APU (2.5) usarán esta misma cola.
+    scheduler: Scheduler<Event>,
+
     /// `true` si se ha cargado la **BIOS real** ([`Bus::load_bios`]). Es la fuente
     /// de verdad de "¿hay BIOS?" y decide el camino del `SWI`: con BIOS real se
     /// salta al vector `0x08` (LLE, Mini-Hito 2.2l); sin ella se intercepta y se
@@ -170,6 +198,8 @@ impl Bus {
             dma: Dma::new(),
             irq: InterruptControl::new(),
             sio: Sio::new(),
+            timers: Timers::new(),
+            scheduler: Scheduler::new(),
             bios_loaded: false,
         }
     }
@@ -225,6 +255,8 @@ impl Bus {
                     self.irq.read_u8(off)
                 } else if Sio::handles(off) {
                     self.sio.read_u8(off)
+                } else if Timers::handles(off) {
+                    self.timers.read_u8(off, self.scheduler.now())
                 } else {
                     read_at(&self.io, off as usize)
                 }
@@ -290,6 +322,9 @@ impl Bus {
                     self.irq.write_u8(off, value);
                 } else if Sio::handles(off) {
                     self.sio.write_u8(off, value);
+                } else if Timers::handles(off) {
+                    let now = self.scheduler.now();
+                    self.timers.write_u8(off, value, now, &mut self.scheduler);
                 } else {
                     write_at(&mut self.io, off as usize, value);
                 }
@@ -411,6 +446,41 @@ impl Bus {
     /// comprueba además el bit `I` del `CPSR` antes de saltar al vector.
     pub fn irq_pending(&self) -> bool {
         self.irq.pending()
+    }
+
+    // ---- Timers y scheduler (Mini-Hito 2.3e) ----------------------------
+
+    /// **Sincroniza el hardware temporizado** con el reloj de la CPU: adelanta el
+    /// [`Scheduler`] hasta `cycle` y dispara todos los eventos vencidos —hoy, los
+    /// desbordes de timer, que recargan y, si procede, solicitan su IRQ—.
+    ///
+    /// Lo llama el bucle de la CPU ([`Cpu::run`](crate::Cpu)) tras cada instrucción.
+    /// Por eso un desborde se atiende con granularidad de **instrucción** (en el
+    /// primer `sync` tras el ciclo objetivo), no a mitad de una; afinar eso a ciclo
+    /// exacto —ejecutar la CPU solo hasta el próximo evento— es trabajo posterior.
+    pub fn sync_to_cycle(&mut self, cycle: u64) {
+        self.scheduler.advance_to(cycle);
+        while let Some(event) = self.scheduler.pop_due() {
+            match event {
+                Event::TimerOverflow { timer, at } => {
+                    self.timers
+                        .on_overflow(timer, at, &mut self.scheduler, &mut self.irq);
+                }
+            }
+        }
+    }
+
+    /// Ciclo del próximo evento que **podría despertar** a la CPU de un `Halt`, o
+    /// `None` si ninguno puede. Sirve para que el bucle, con la CPU dormida, **salte
+    /// el tiempo muerto** hasta ese evento en vez de pararse —o se pare, si nada va
+    /// a generar una IRQ habilitada (ver [`Timers::can_wake`])—. Sin esta guarda, un
+    /// `Halt` sin fuente de despertar haría girar el bucle sin avanzar.
+    pub fn next_wakeup_cycle(&self) -> Option<u64> {
+        if self.timers.can_wake(&self.irq) {
+            self.scheduler.next_event_cycle()
+        } else {
+            None
+        }
     }
 
     // ---- Temporización (Mini-Hito 2.2c) ---------------------------------
@@ -823,12 +893,54 @@ mod tests {
 
     #[test]
     fn el_sio_no_interfiere_con_el_buffer_de_io_vecino() {
-        // Un registro de I/O cualquiera fuera del rango SIO (p. ej. 0x100, TM0CNT
-        // en el futuro) sigue yendo al buffer crudo, no al SIO.
+        // Un registro de I/O sin semántica propia (p. ej. DISPCNT de la PPU, 0x000,
+        // aún sin implementar) sigue yendo al buffer crudo, no al SIO.
         let mut bus = Bus::new(Vec::new());
-        bus.write_u16(IO_START + 0x100, 0xBEEF);
+        bus.write_u16(IO_START, 0xBEEF); // DISPCNT (PPU, buffer crudo)
         bus.write_u16(IO_START + 0x128, 0xCAFE); // SIOCNT (SIO)
-        assert_eq!(bus.read_u16(IO_START + 0x100), 0xBEEF, "el buffer de I/O intacto");
+        assert_eq!(bus.read_u16(IO_START), 0xBEEF, "el buffer de I/O intacto");
         assert_eq!(bus.read_u16(IO_START + 0x128), 0xCAFE);
+    }
+
+    // ---- Timers (Mini-Hito 2.3e) ----------------------------------------
+
+    /// Programa el timer `i` desde el bus (como haría la CPU): recarga y control.
+    fn programa_timer(bus: &mut Bus, i: u32, reload: u16, control: u16) {
+        let base = IO_START + 0x100 + i * 4;
+        bus.write_u16(base, reload); // TMxCNT_L
+        bus.write_u16(base + 2, control); // TMxCNT_H
+    }
+
+    #[test]
+    fn un_timer_desborda_en_el_ciclo_esperado_y_lanza_su_irq() {
+        // La "Prueba" del hito: un timer con prescaler conocido desborda en el ciclo
+        // esperado y lanza su IRQ. Recarga 0xFFC0 → 0x40=64 incrementos; ÷1 → 64
+        // ciclos. IRQ del Timer1 habilitada en IE.
+        let mut bus = Bus::new(Vec::new());
+        bus.write_u16(IO_START + 0x200, Interrupt::Timer1.bit()); // IE = Timer1
+        const ENABLE: u16 = 1 << 7;
+        const IRQ: u16 = 1 << 6;
+        programa_timer(&mut bus, 1, 0xFFC0, ENABLE | IRQ);
+
+        // Antes del ciclo 64 no ha desbordado: la IRQ no está pendiente.
+        bus.sync_to_cycle(63);
+        assert_eq!(bus.read_u16(IO_START + 0x202) & Interrupt::Timer1.bit(), 0);
+        // Al alcanzar el ciclo 64, desborda y solicita su IRQ.
+        bus.sync_to_cycle(64);
+        assert_ne!(
+            bus.read_u16(IO_START + 0x202) & Interrupt::Timer1.bit(),
+            0,
+            "el desborde levantó la IRQ del Timer1"
+        );
+    }
+
+    #[test]
+    fn el_contador_de_un_timer_se_lee_segun_el_tiempo() {
+        let mut bus = Bus::new(Vec::new());
+        const ENABLE: u16 = 1 << 7;
+        programa_timer(&mut bus, 0, 0, ENABLE | 0b10); // ÷256, recarga 0
+        bus.sync_to_cycle(1000);
+        // 1000 / 256 = 3 incrementos.
+        assert_eq!(bus.read_u16(IO_START + 0x100), 3);
     }
 }

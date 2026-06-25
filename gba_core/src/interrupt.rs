@@ -81,6 +81,17 @@ impl Interrupt {
             _ => Interrupt::Dma3,
         }
     }
+
+    /// La fuente de IRQ del timer `index` (0–3). Un `index` fuera de rango se trata
+    /// como Timer3 (defensa: el llamante siempre pasa 0–3).
+    pub fn timer(index: usize) -> Interrupt {
+        match index {
+            0 => Interrupt::Timer0,
+            1 => Interrupt::Timer1,
+            2 => Interrupt::Timer2,
+            _ => Interrupt::Timer3,
+        }
+    }
 }
 
 // Offsets (dentro de la región de I/O, base `0x0400_0000`) de los registros.
@@ -160,6 +171,12 @@ impl InterruptControl {
     /// desbordar...), vía [`crate::Bus::request_interrupt`].
     pub fn request(&mut self, source: Interrupt) {
         self.requested |= source.bit();
+    }
+
+    /// `true` si la fuente `source` está **habilitada** en `IE`. Lo usa el bus para
+    /// saber si un timer con IRQ podría despertar a la CPU de un `Halt` (2.3e).
+    pub fn is_enabled(&self, source: Interrupt) -> bool {
+        self.ie & source.bit() != 0
     }
 
     /// `true` si hay **alguna IRQ habilitada y pendiente** (`IE & IF != 0`), **sin**
