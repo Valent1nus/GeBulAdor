@@ -45,9 +45,16 @@
 //! bloque de registros del [`Dma`] (`0x0400_00B0`–`0x0400_00DF`): el bus enruta
 //! sus accesos al controlador de DMA y, tras escribir un control con el `enable`,
 //! ejecuta la **copia inmediata** (ver [`Bus::poll_dma_triggers`]). Es el primer
-//! registro de I/O con semántica real; el IRQ (2.3c), el SIO (2.3d) y los timers
-//! (2.3e) siguen el mismo patrón: un módulo dedicado al que el bus enruta su rango
-//! de direcciones.
+//! registro de I/O con semántica real; el IRQ (2.3c), el SIO (2.3d), los timers
+//! (2.3e) y la PPU (`DISPCNT`, 2.4a) siguen el mismo patrón: un módulo dedicado al
+//! que el bus enruta su rango de direcciones.
+//!
+//! ## La PPU produce imagen (Mini-Hito 2.4a)
+//!
+//! La [`Ppu`] es algo más que un registro: además de ser la fuente de verdad de
+//! `DISPCNT`, **genera el framebuffer**. Como la VRAM y la PRAM viven aquí (es el
+//! bus quien resuelve sus espejos), [`Bus::render_frame`] le **presta** esas
+//! regiones para que componga la imagen y la vuelque en el framebuffer del núcleo.
 //!
 //! ## Interrupciones (Mini-Hito 2.3c)
 //!
@@ -60,6 +67,7 @@
 
 use crate::dma::{Dma, DMA_CHANNELS};
 use crate::interrupt::{Interrupt, InterruptControl};
+use crate::ppu::Ppu;
 use crate::scheduler::Scheduler;
 use crate::sio::Sio;
 use crate::timers::Timers;
@@ -147,6 +155,12 @@ pub struct Bus {
     oam: Vec<u8>,
     rom: Vec<u8>,
 
+    /// La **PPU** / unidad gráfica (Mini-Hito 2.4a): la fuente de verdad de
+    /// `DISPCNT`. El bus le enruta ese registro y le **presta** la VRAM y la PRAM al
+    /// renderizar (ver [`Bus::render_frame`]), ya que es el bus quien gestiona el
+    /// mapa de memoria de vídeo.
+    ppu: Ppu,
+
     /// El controlador de **DMA** (Mini-Hito 2.3b): la fuente de verdad de los
     /// registros DMA y de qué copiar. La copia en sí la ejecuta el propio bus (ver
     /// [`Bus::run_dma_transfer`]), porque es quien accede a la memoria.
@@ -195,6 +209,7 @@ impl Bus {
             vram: vec![0; VRAM_SIZE],
             oam: vec![0; OAM_SIZE],
             rom,
+            ppu: Ppu::new(),
             dma: Dma::new(),
             irq: InterruptControl::new(),
             sio: Sio::new(),
@@ -249,7 +264,9 @@ impl Bus {
             // excepción es el bloque DMA (2.3b), que se enruta al controlador.
             0x04 => {
                 let off = addr & 0x00FF_FFFF;
-                if Dma::in_range(off) {
+                if Ppu::handles(off) {
+                    self.ppu.read_u8(off)
+                } else if Dma::in_range(off) {
                     self.dma.read_u8(off)
                 } else if InterruptControl::handles(off) {
                     self.irq.read_u8(off)
@@ -316,7 +333,9 @@ impl Bus {
             // disparo se decide tras la escritura de 16/32 bits). El resto, buffer.
             0x04 => {
                 let off = addr & 0x00FF_FFFF;
-                if Dma::in_range(off) {
+                if Ppu::handles(off) {
+                    self.ppu.write_u8(off, value);
+                } else if Dma::in_range(off) {
                     self.dma.write_u8(off, value);
                 } else if InterruptControl::handles(off) {
                     self.irq.write_u8(off, value);
@@ -481,6 +500,19 @@ impl Bus {
         } else {
             None
         }
+    }
+
+    // ---- PPU / gráficos (Mini-Hito 2.4a) --------------------------------
+
+    /// **Renderiza un frame** en `fb` (el framebuffer RGBA del núcleo) delegando en
+    /// la [`Ppu`]. El bus le **presta** la VRAM y la PRAM —que viven aquí, con sus
+    /// espejos— porque la PPU necesita leerlas para componer la imagen; el resultado
+    /// se escribe en `fb`. Lo invoca [`crate::Gba::render_frame`].
+    ///
+    /// De momento es un volcado del frame completo bajo demanda (modo 3); el paso a
+    /// scanlines dirigidas por el [`Scheduler`] es el Mini-Hito 2.4b.
+    pub fn render_frame(&self, fb: &mut [u8]) {
+        self.ppu.render_frame(&self.vram, &self.pram, fb);
     }
 
     // ---- Temporización (Mini-Hito 2.2c) ---------------------------------
@@ -893,13 +925,41 @@ mod tests {
 
     #[test]
     fn el_sio_no_interfiere_con_el_buffer_de_io_vecino() {
-        // Un registro de I/O sin semántica propia (p. ej. DISPCNT de la PPU, 0x000,
-        // aún sin implementar) sigue yendo al buffer crudo, no al SIO.
+        // Un registro de I/O sin semántica propia (p. ej. BLDCNT, 0x050, efectos de
+        // color aún sin implementar) sigue yendo al buffer crudo, no al SIO.
         let mut bus = Bus::new(Vec::new());
-        bus.write_u16(IO_START, 0xBEEF); // DISPCNT (PPU, buffer crudo)
+        bus.write_u16(IO_START + 0x050, 0xBEEF); // BLDCNT (buffer crudo)
         bus.write_u16(IO_START + 0x128, 0xCAFE); // SIOCNT (SIO)
-        assert_eq!(bus.read_u16(IO_START), 0xBEEF, "el buffer de I/O intacto");
+        assert_eq!(bus.read_u16(IO_START + 0x050), 0xBEEF, "el buffer de I/O intacto");
         assert_eq!(bus.read_u16(IO_START + 0x128), 0xCAFE);
+    }
+
+    // ---- PPU / gráficos (Mini-Hito 2.4a) --------------------------------
+
+    #[test]
+    fn dispcnt_se_enruta_a_la_ppu() {
+        // Escribir DISPCNT por el bus debe ir a la PPU (su fuente de verdad) y
+        // releerse igual; un registro de vídeo vecino aún sin dueño (DISPSTAT, 0x004)
+        // sigue en el buffer crudo, sin pisarse.
+        let mut bus = Bus::new(Vec::new());
+        bus.write_u16(IO_START, 0x0403); // DISPCNT = modo 3 + bit 10 (BG2 on)
+        bus.write_u16(IO_START + 0x004, 0x1234); // DISPSTAT (buffer crudo, 2.4b)
+        assert_eq!(bus.read_u16(IO_START), 0x0403);
+        assert_eq!(bus.read_u16(IO_START + 0x004), 0x1234);
+    }
+
+    #[test]
+    fn render_frame_vuelca_la_vram_en_modo_3() {
+        // End-to-end por el bus: configurar modo 3, escribir VRAM y renderizar.
+        let mut bus = Bus::new(Vec::new());
+        bus.write_u16(IO_START, 0x0003); // DISPCNT = modo 3
+        // Primer píxel = verde puro (BGR555 0x03E0).
+        bus.write_u16(VRAM_START, 0x03E0);
+
+        let mut fb = vec![0u8; crate::FRAMEBUFFER_SIZE];
+        bus.render_frame(&mut fb);
+
+        assert_eq!(&fb[0..4], &[0x00, 0xFF, 0x00, 0xFF], "el bus volcó la VRAM");
     }
 
     // ---- Timers (Mini-Hito 2.3e) ----------------------------------------

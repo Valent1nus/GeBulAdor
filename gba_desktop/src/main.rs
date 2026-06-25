@@ -295,7 +295,7 @@ fn human_size(bytes: usize) -> String {
 }
 
 /// Abre la ventana y ejecuta el bucle de pintado del framebuffer del núcleo.
-fn run_window(gba: Gba) {
+fn run_window(mut gba: Gba) {
     // El núcleo (`gba`) produce los píxeles; el frontend solo los muestra.
 
     // minifb pinta desde un buffer de `u32` en formato 0RGB (0x00RRGGBB). El
@@ -303,7 +303,7 @@ fn run_window(gba: Gba) {
     let mut buffer: Vec<u32> = vec![0; SCREEN_WIDTH * SCREEN_HEIGHT];
 
     let mut window = Window::new(
-        "EmulaRUST — GBA (Fase 2.3a-bis · ESC para salir)",
+        "EmulaRUST — GBA (Fase 2.4a · PPU modo 3 · ESC para salir)",
         SCREEN_WIDTH,
         SCREEN_HEIGHT,
         WindowOptions {
@@ -319,6 +319,9 @@ fn run_window(gba: Gba) {
     window.set_target_fps(60);
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
+        // Mini-Hito 2.4a: la PPU compone el frame desde la VRAM antes de pintarlo.
+        // (El render por scanlines integrado en la ejecución llega en el 2.4b.)
+        gba.render_frame();
         rgba_to_0rgb(gba.framebuffer(), &mut buffer);
         window
             .update_with_buffer(&buffer, SCREEN_WIDTH, SCREEN_HEIGHT)

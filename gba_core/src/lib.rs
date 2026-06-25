@@ -9,7 +9,7 @@
 //! sustituir el frontend de escritorio por uno de Android, iOS o WASM sin tocar
 //! una sola línea del núcleo.
 //!
-//! ## Estado actual (Fase 2.3e — Fase 2.3 completa)
+//! ## Estado actual (Fase 2.4a — PPU modo 3 bitmap)
 //!
 //! Además de cargar y validar el cartucho (Fase 1), el núcleo tiene el
 //! esqueleto del hardware: la CPU ARM7TDMI ([`Cpu`]) con sus registros y modos,
@@ -78,8 +78,13 @@
 //! [`Scheduler`] en el bucle**: los timers programan sus desbordes en la cola de
 //! eventos y [`Bus::sync_to_cycle`], llamado tras cada instrucción, los dispara
 //! (recarga, IRQ de overflow, cascada). El `Halt` aprovecha el scheduler para
-//! **saltar el tiempo muerto** hasta el evento que despierte a la CPU. La frontera
-//! con el frontend —entregar un buffer RGBA— no cambia.
+//! **saltar el tiempo muerto** hasta el evento que despierte a la CPU. Por fin, el
+//! Mini-Hito **2.4a** estrena la **PPU** (módulo [`ppu`]) con el **modo 3 bitmap**:
+//! la VRAM se interpreta como un framebuffer 240×160 de color BGR555 directo, y
+//! [`Gba::render_frame`] (vía [`Bus::render_frame`]) lo traduce a RGBA y lo vuelca en
+//! el framebuffer del núcleo. El antiguo azul plano de prueba lo sustituye ahora una
+//! imagen de prueba real renderizada por la PPU. La frontera con el frontend
+//! —entregar un buffer RGBA— no cambia.
 
 pub mod arm;
 pub mod bios;
@@ -90,6 +95,7 @@ pub mod cpu;
 pub mod dma;
 pub mod header;
 pub mod interrupt;
+pub mod ppu;
 pub mod scheduler;
 pub mod sio;
 pub mod thumb;
@@ -101,6 +107,7 @@ pub use bus::{AccessWidth, Bus, Event};
 pub use cartridge::{Cartridge, CartridgeError, MAX_ROM_SIZE, MIN_ROM_SIZE};
 pub use dma::{Dma, DmaTransfer, DMA_CHANNELS};
 pub use interrupt::{Interrupt, InterruptControl};
+pub use ppu::{bgr555_to_rgba, Ppu};
 pub use sio::Sio;
 pub use timers::{Timers, NUM_TIMERS};
 pub use cpu::{Cpu, CpuMode, Cpsr, Halt, RunReport, RunStop, StepResult};
@@ -144,11 +151,15 @@ impl Gba {
     /// Crea una GBA **sin cartucho**: hardware en reset y ROM vacía. Sirve para
     /// la prueba "Hola Ventana" (Fase 1.1) sin necesidad de cargar un juego.
     ///
-    /// El framebuffer arranca en un azul sólido de prueba; demuestra que el
-    /// núcleo produce píxeles y que el frontend los pinta, y desaparecerá en
-    /// cuanto la PPU genere imágenes reales.
+    /// Para demostrar la PPU del Mini-Hito 2.4a, el framebuffer arranca con una
+    /// **imagen de prueba en modo 3** (un degradado de color escrito a mano en la
+    /// VRAM, ver [`Gba::draw_test_image_mode3`]): así, ejecutar el frontend sin ROM
+    /// muestra ya el camino real VRAM → PPU → framebuffer. Sustituye al antiguo
+    /// azul plano de prueba; con una ROM real, es el juego quien gobierna la imagen.
     pub fn new() -> Self {
-        Self::with_hardware(Cpu::new(), Bus::new(Vec::new()))
+        let mut gba = Self::with_hardware(Cpu::new(), Bus::new(Vec::new()));
+        gba.draw_test_image_mode3();
+        gba
     }
 
     /// Construye la consola a partir de un cartucho ya validado y la deja lista
@@ -189,16 +200,18 @@ impl Gba {
         Self::with_hardware(Cpu::new(), bus)
     }
 
-    /// Constructor común: monta la consola con la CPU y el bus dados y pinta el
-    /// framebuffer de prueba.
+    /// Constructor común: monta la consola con la CPU y el bus dados y deja el
+    /// framebuffer coherente con el estado inicial de la PPU.
     fn with_hardware(cpu: Cpu, bus: Bus) -> Self {
         let mut gba = Gba {
             cpu,
             bus,
             framebuffer: vec![0; FRAMEBUFFER_SIZE],
         };
-        // Azul "GBA" (#1E90FF) como color de prueba visible.
-        gba.clear(0x1E, 0x90, 0xFF);
+        // Render inicial (Mini-Hito 2.4a): sin nada en VRAM, la pantalla es el color
+        // de fondo (negro). El antiguo azul plano de prueba lo sustituye ahora el
+        // render real de la PPU.
+        gba.render_frame();
         gba
     }
 
@@ -253,6 +266,40 @@ impl Gba {
     /// Ciclos totales que la CPU ha ejecutado desde el arranque (Mini-Hito 2.2c).
     pub fn cycles(&self) -> u64 {
         self.cpu.cycles()
+    }
+
+    /// **Renderiza un frame** (Mini-Hito 2.4a): la PPU compone la imagen a partir de
+    /// la VRAM/PRAM y la vuelca en el framebuffer del núcleo. El frontend lo llama
+    /// una vez por frame, antes de pintar con [`Gba::framebuffer`].
+    ///
+    /// Hoy es un volcado del frame completo bajo demanda (modo 3); el render por
+    /// scanlines dirigido por el [`Scheduler`] —y el flag de V-Blank— llega en el
+    /// Mini-Hito 2.4b.
+    pub fn render_frame(&mut self) {
+        self.bus.render_frame(&mut self.framebuffer);
+    }
+
+    /// Pinta a mano una **imagen de prueba en modo 3** en la VRAM y renderiza, para
+    /// demostrar la PPU del Mini-Hito 2.4a cuando no hay ROM (la llama [`Gba::new`]).
+    ///
+    /// El patrón es un degradado: el rojo crece de izquierda a derecha, el verde de
+    /// arriba abajo, y el azul es constante; así se ve un barrido de color suave que
+    /// confirma que cada píxel BGR555 de la VRAM llega bien al framebuffer. Escribe
+    /// por el bus (camino real de la CPU), no tocando la VRAM por un atajo.
+    fn draw_test_image_mode3(&mut self) {
+        // DISPCNT = modo 3 (bitmap directo 16bpp).
+        self.bus.write_u16(bus::IO_START, 0x0003);
+        for y in 0..SCREEN_HEIGHT {
+            for x in 0..SCREEN_WIDTH {
+                let r = (x * 31 / (SCREEN_WIDTH - 1)) as u16; // 0..=31 horizontal
+                let g = (y * 31 / (SCREEN_HEIGHT - 1)) as u16; // 0..=31 vertical
+                let b = 15u16; // azul constante de fondo
+                let color = r | (g << 5) | (b << 10); // BGR555
+                let addr = bus::VRAM_START + ((y * SCREEN_WIDTH + x) * 2) as u32;
+                self.bus.write_u16(addr, color);
+            }
+        }
+        self.render_frame();
     }
 
     /// Rellena todo el framebuffer con un color sólido opaco.
@@ -557,5 +604,54 @@ mod tests {
         poner(&mut rom, 0x00, 0xEAFF_FFFE); // b .
         let gba = Gba::with_cartridge(Cartridge::from_bytes(rom).unwrap());
         assert_eq!(gba.pc(), crate::bus::ROM_START);
+    }
+
+    #[test]
+    fn ppu_modo3_end_to_end_la_cpu_pinta_un_pixel() {
+        // Prueba end-to-end del Mini-Hito 2.4a: la CPU ejecuta código ARM real que
+        // selecciona el modo 3 en DISPCNT y escribe un píxel en la VRAM; luego la PPU
+        // vuelca esa VRAM al framebuffer y comprobamos el color resultante.
+        let programa = [
+            0xE3A0_0404u32, // MOV r0, #0x04000000  (base de I/O = DISPCNT)
+            0xE3A0_1003,    // MOV r1, #3
+            0xE1C0_10B0,    // STRH r1, [r0]         (DISPCNT = modo 3)
+            0xE3A0_2406,    // MOV r2, #0x06000000  (VRAM)
+            0xE3A0_301F,    // MOV r3, #0x1F         (rojo puro en BGR555)
+            0xE1C2_30B0,    // STRH r3, [r2]         (VRAM[0] = rojo)
+            0xEAFF_FFFE,    // b .                   (fin)
+        ];
+        let mut rom = vec![0u8; MIN_ROM_SIZE];
+        for (i, w) in programa.iter().enumerate() {
+            poner(&mut rom, i * 4, *w);
+        }
+        let mut gba = Gba::with_cartridge(Cartridge::from_bytes(rom).unwrap());
+
+        let report = gba.run(1_000);
+        assert!(
+            matches!(report.stop, RunStop::Halted(Halt::InfiniteLoop { .. })),
+            "el programa termina en su «b .» final"
+        );
+        // Tras ejecutar, la PPU vuelca la VRAM (modo 3) al framebuffer.
+        gba.render_frame();
+        assert_eq!(
+            &gba.framebuffer()[0..4],
+            &[0xFF, 0x00, 0x00, 0xFF],
+            "el píxel que pintó la CPU se ve rojo en el framebuffer"
+        );
+    }
+
+    #[test]
+    fn new_pinta_una_imagen_de_prueba_no_uniforme() {
+        // Sin ROM, Gba::new() ya no es un color plano: la PPU en modo 3 vuelca un
+        // degradado de prueba, así que esquinas opuestas tienen colores distintos.
+        let gba = Gba::new();
+        let fb = gba.framebuffer();
+        let n = fb.len();
+        assert_ne!(
+            &fb[0..4],
+            &fb[n - 4..n],
+            "la imagen de prueba del modo 3 tiene degradado (no es un color plano)"
+        );
+        assert_eq!(fb[3], 0xFF, "los píxeles son opacos");
     }
 }
