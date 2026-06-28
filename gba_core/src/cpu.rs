@@ -542,6 +542,31 @@ impl Cpu {
         self.r[index] = value;
     }
 
+    /// Lee el registro `index` desde el **banco de User**, sea cual sea el modo
+    /// actual. Es la semántica de la transferencia con **bit-S** (`LDM/STM {..}^`),
+    /// que mueve los registros del banco de usuario aunque la CPU esté en un modo
+    /// privilegiado (Mini-Hito 2.2n). Solo `r8`–`r14` se banquean: `r8`–`r12` solo
+    /// difieren en FIQ; `r13`/`r14` viven en el banco 0 (User/System) fuera de él.
+    fn reg_user_bank(&self, index: usize) -> u32 {
+        match index {
+            8..=12 if self.mode() == CpuMode::Fiq => self.usr_r8_r12[index - 8],
+            13 if !matches!(self.mode(), CpuMode::User | CpuMode::System) => self.bank_sp[0],
+            14 if !matches!(self.mode(), CpuMode::User | CpuMode::System) => self.bank_lr[0],
+            _ => self.r[index],
+        }
+    }
+
+    /// Escribe el registro `index` en el **banco de User**, contraparte de
+    /// [`Cpu::reg_user_bank`] para el `LDM {..}^`.
+    fn set_reg_user_bank(&mut self, index: usize, value: u32) {
+        match index {
+            8..=12 if self.mode() == CpuMode::Fiq => self.usr_r8_r12[index - 8] = value,
+            13 if !matches!(self.mode(), CpuMode::User | CpuMode::System) => self.bank_sp[0] = value,
+            14 if !matches!(self.mode(), CpuMode::User | CpuMode::System) => self.bank_lr[0] = value,
+            _ => self.r[index] = value,
+        }
+    }
+
     /// El Program Counter **crudo** (`r15` sin el desfase de pipeline): la
     /// dirección de fetch real. Es lo que usa [`Cpu::fetch`]. Para el valor que
     /// ve una instrucción al leer `r15` como operando (adelantado por el
@@ -710,9 +735,21 @@ impl Cpu {
 
         // --- Flags y escritura del resultado ------------------------------
         if matches!(opcode, 0x8..=0xB) {
-            // Comparaciones (TST/TEQ/CMP/CMN): siempre fijan flags, nunca escriben
-            // Rd y nunca son un salto (el campo Rd se ignora).
-            self.write_flags(result, carry, overflow);
+            // Comparaciones (TST/TEQ/CMP/CMN): normalmente fijan flags, nunca
+            // escriben Rd y nunca saltan (el campo Rd se ignora)... salvo la
+            // **variante "P"** (`Rd = r15`: `TSTP`/`TEQP`/`CMPP`/`CMNP`), legado del
+            // ARM antiguo que el ARM7TDMI conserva: en vez de tocar los flags,
+            // copia el `SPSR` del modo actual al `CPSR` —un cambio de modo, con su
+            // intercambio de bancos—. Es el mecanismo que usan los tests de banking
+            // de jsmolka (`arm.gba`) para volver del modo de prueba; sin él, la CPU
+            // se queda en el modo equivocado y acaba descarrilando (Mini-Hito 2.2n).
+            // En User/System no hay `SPSR`: ahí la "P" se comporta como un compare
+            // normal (solo flags), que es lo único escribible del CPSR.
+            if rd == PC && self.mode().has_spsr() {
+                self.restore_cpsr_from_spsr();
+            } else {
+                self.write_flags(result, carry, overflow);
+            }
             Executed::Continue { extra_cycles }
         } else if rd == PC {
             // Rd = r15: la operación es un salto. Con S=1 es además un retorno de
@@ -1203,11 +1240,10 @@ impl Cpu {
     ///   [`Cpu::store_value`]).
     /// - `LDM` a `r15`: es un **salto** (alineado a palabra); con `S=1` restaura
     ///   además el `CPSR` (lo que puede pasar a THUMB).
-    ///
-    /// *(Pendiente de una revisión posterior: la transferencia del banco **User**
-    /// con `S=1` sin `r15`, y el caso de **lista vacía**. En User/System —donde las
-    /// gba-tests pasan la mayor parte del tiempo— el banco User es el actual, así
-    /// que la aproximación coincide.)*
+    /// - `S=1` sin `r15` en la lista: transferencia del **banco de User** (`^`), ver
+    ///   [`Cpu::reg_user_bank`] (Mini-Hito 2.2n).
+    /// - **Lista vacía:** quirk del ARM7TDMI —se transfiere solo `r15` y la base se
+    ///   ajusta `±0x40` como si fueran los 16 registros— (Mini-Hito 2.2n).
     pub fn execute_block_data_transfer(&mut self, instr: u32, bus: &mut Bus) -> Executed {
         let pre = (instr & (1 << 24)) != 0; // P
         let add = (instr & (1 << 23)) != 0; // U
@@ -1215,10 +1251,16 @@ impl Cpu {
         let write_back = (instr & (1 << 21)) != 0; // W
         let load = (instr & (1 << 20)) != 0; // L
         let rn = ((instr >> 16) & 0xF) as usize;
-        let list = instr & 0xFFFF;
 
-        let n = list.count_ones();
-        let block_bytes = 4 * n;
+        // Quirk de **lista vacía** del ARM7TDMI: una lista sin registros transfiere
+        // en realidad solo `r15`, y la base avanza/retrocede `0x40` (16 registros).
+        // Con lista no vacía, lo normal: la lista tal cual y `4·(nº de registros)`.
+        let raw_list = instr & 0xFFFF;
+        let (list, block_bytes) = if raw_list == 0 {
+            (1 << PC, 0x40)
+        } else {
+            (raw_list, 4 * raw_list.count_ones())
+        };
         let base = self.reg(rn);
 
         // Dirección más baja del bloque y valor final de la base. Como siempre se
@@ -1248,6 +1290,13 @@ impl Cpu {
         // debajo de `rn` activo.) Decide el quirk del `STM` con la base en la lista.
         let rn_is_first = (list & (1 << rn)) != 0 && (list & ((1 << rn) - 1)) == 0;
 
+        // Bit-S (`^`): transfiere el **banco de User** en vez del modo actual. Aplica
+        // al `STM` siempre, y al `LDM` salvo cuando `r15` está en la lista —ese caso
+        // es el retorno de excepción (restaura el CPSR), tratado al final—. Es lo que
+        // usan los tests de banking de jsmolka (Mini-Hito 2.2n).
+        let r15_in_list = list & (1 << PC) != 0;
+        let user_bank = s_bit && !(load && r15_in_list);
+
         let mut addr = lowest;
         let mut extra = 0u64;
         let mut first = true;
@@ -1266,15 +1315,20 @@ impl Cpu {
                 let value = bus.read_u32(aligned);
                 if reg == PC {
                     branch_target = Some(value); // se resuelve al final (salto)
+                } else if user_bank {
+                    self.set_reg_user_bank(reg, value);
                 } else {
                     self.set_reg(reg, value);
                 }
             } else {
                 // `STM`. Si la base va en la lista y NO es la primera, se guarda ya
                 // con el write-back aplicado; si es la primera (o no hay write-back),
-                // su valor original. `r15` se almacena como instrucción+12.
+                // su valor original. Con bit-S (`^`) la fuente es el banco de User.
+                // `r15` se almacena como instrucción+12 (nunca se banquea).
                 let value = if reg == rn && write_back && !rn_is_first {
                     writeback_value
+                } else if user_bank && reg != PC {
+                    self.reg_user_bank(reg)
                 } else {
                     self.store_value(reg)
                 };
@@ -4078,6 +4132,76 @@ mod tests {
         cpu.execute_block_data_transfer(0xE8B0_0003, &mut bus); // LDMIA r0!, {r0,r1}
         assert_eq!(cpu.reg(0), 0x1111_1111, "la base lleva el dato cargado, no base+8");
         assert_eq!(cpu.reg(1), 0x2222_2222);
+    }
+
+    // ===== Banking en cambios de modo (Mini-Hito 2.2n) ======================
+
+    #[test]
+    fn data_processing_p_form_restaura_cpsr_desde_spsr() {
+        // La variante "P" de las comparaciones (Rd = r15, S = 1: TEQP/CMPP) no toca
+        // los flags: copia el SPSR del modo actual al CPSR. Es el retorno de modo
+        // del ARM antiguo que ejercen los tests de banking de arm.gba.
+        let mut cpu = Cpu::new();
+        cpu.set_reg(8, 0x20); // r8 compartido (User/System)
+        cpu.set_mode(CpuMode::Fiq);
+        cpu.set_reg(8, 0x40); // r8 propio de FIQ
+        cpu.set_spsr(u32::from(CpuMode::System.bits())); // SPSR_fiq → modo System
+
+        // 0xE15FF000 = comparación con Rd = r15 y S = 1 → CPSR ← SPSR.
+        cpu.execute_data_processing(0xE15F_F000);
+        assert_eq!(cpu.mode(), CpuMode::System, "la P-form vuelve al modo del SPSR");
+        assert_eq!(cpu.reg(8), 0x20, "y el banco de r8 vuelve al de User/System");
+    }
+
+    #[test]
+    fn ldm_stm_con_bit_s_usan_el_banco_de_user() {
+        // `LDM/STM {..}^` (bit S, sin r15) transfiere el banco de User aunque la CPU
+        // esté en un modo privilegiado. En FIQ, r8 difiere entre el banco visible y
+        // el de User: el `^` debe ver este último.
+        let mut bus = Bus::new(vec![0u8; 4]);
+        let mut cpu = Cpu::new();
+        let addr = crate::bus::IWRAM_START + 0x40;
+        cpu.set_reg(8, 0x20); // r8 de User
+        cpu.set_mode(CpuMode::Fiq);
+        cpu.set_reg(8, 0x40); // r8 de FIQ (visible ahora)
+        cpu.set_reg(0, addr);
+
+        // STMIA r0, {r8}^ → guarda el r8 de User (0x20), no el visible de FIQ.
+        cpu.execute_block_data_transfer(0xE8C0_0100, &mut bus);
+        assert_eq!(bus.read_u32(addr), 0x20, "STM^ guarda el banco de User");
+        assert_eq!(cpu.reg(8), 0x40, "el r8 visible (FIQ) no se toca");
+
+        // LDMIA r0, {r8}^ → carga en el banco de User, no en el visible de FIQ.
+        bus.write_u32(addr, 0x99);
+        cpu.execute_block_data_transfer(0xE8D0_0100, &mut bus);
+        assert_eq!(cpu.reg(8), 0x40, "LDM^ no cambia el r8 visible (FIQ)");
+        cpu.set_mode(CpuMode::System);
+        assert_eq!(cpu.reg(8), 0x99, "el valor entró en el banco de User");
+    }
+
+    #[test]
+    fn lista_vacia_transfiere_r15_y_ajusta_la_base_0x40() {
+        // Quirk del ARM7TDMI: con la lista de registros vacía se transfiere solo
+        // r15 y la base se ajusta 0x40 (como si fueran los 16 registros).
+        let mut bus = Bus::new(vec![0u8; 4]);
+        let mut cpu = Cpu::new();
+        let base = crate::bus::IWRAM_START + 0x40;
+
+        // LDMIA r0!, {} → carga r15 desde [base] (salto) y la base avanza 0x40.
+        bus.write_u32(base, 0x0800_1234);
+        cpu.set_reg(0, base);
+        let efecto = cpu.execute_block_data_transfer(0xE8B0_0000, &mut bus);
+        assert!(matches!(efecto, Executed::Branched { .. }), "la lista vacía carga PC → salto");
+        assert_eq!(cpu.pc(), 0x0800_1234, "r15 se cargó de [base]");
+        assert_eq!(cpu.reg(0), base + 0x40, "la base avanza 0x40 (16 registros)");
+
+        // STMDB r0!, {} → almacena r15 (instr+12) y la base retrocede 0x40.
+        let pc = crate::bus::IWRAM_START + 0x80;
+        cpu.set_pc(pc);
+        cpu.set_reg(0, base);
+        cpu.execute_block_data_transfer(0xE920_0000, &mut bus);
+        assert_eq!(cpu.reg(0), base - 0x40, "la base retrocede 0x40");
+        assert_eq!(bus.read_u32(base - 0x40), pc + 12, "almacena r15 como instr+12");
     }
 
     // ===== Intercambio atómico SWP/SWPB (Mini-Hito 2.2k) ====================
