@@ -1,5 +1,5 @@
 //! La **PPU** (Picture Processing Unit): el subsistema gráfico de la GBA.
-//! Mini-Hito **2.4b — Renderizado por Scanlines**.
+//! Mini-Hitos **2.4a–2.4c** (bitmap modo 3 → barrido por scanlines → fondos de tiles).
 //!
 //! ## De "frame de una vez" a "línea a línea"
 //!
@@ -55,10 +55,12 @@
 //!
 //! ## Qué queda para los siguientes hitos
 //!
-//! Este hito mantiene el único modo dibujable de 2.4a (el **modo 3** bitmap), ahora
-//! por scanlines; el resto de bits de `DISPCNT` se siguen almacenando sin efecto.
-//! Los modos de *tiles* (0/1/2) son el 2.4c, los sprites el 2.4d y los modos bitmap
-//! 4/5 el 2.4e.
+//! Tras 2.4c esta PPU dibuja los **fondos de texto** de los modos 0 y 1 (BG0–3 /
+//! BG0–1) además del **modo 3** bitmap, todo por scanlines. Quedan: los fondos
+//! **afines** (modo 2 entero y el BG2 del modo 1) para el 2.4f, los **sprites** (OAM)
+//! para el 2.4d, los **modos bitmap 4/5** para el 2.4e y los efectos (ventanas,
+//! blending, mosaico) para 2.4g–2.4h. El resto de bits de `DISPCNT`/`BGxCNT` no
+//! usados aquí (p. ej. *mosaic*) se almacenan sin efecto.
 
 use crate::interrupt::{Interrupt, InterruptControl};
 use crate::{BYTES_PER_PIXEL, FRAMEBUFFER_SIZE, SCREEN_HEIGHT, SCREEN_WIDTH};
@@ -71,11 +73,23 @@ const DISPCNT_LO: u32 = 0x000;
 const DISPSTAT_LO: u32 = 0x004;
 /// `VCOUNT` (línea actual, 16 bits, solo lectura): bytes `0x006`–`0x007`.
 const VCOUNT_LO: u32 = 0x006;
+/// `BG0CNT` (control del fondo 0, 16 bits): bytes `0x008`–`0x009`. Los cuatro
+/// `BGxCNT` ocupan `0x008`–`0x00F` (2 bytes cada uno).
+const BG0CNT_LO: u32 = 0x008;
+/// `BG0HOFS` (scroll horizontal del fondo 0, 16 bits, solo escritura): bytes
+/// `0x010`–`0x011`. Los 8 registros `BGxHOFS`/`BGxVOFS` ocupan `0x010`–`0x01F`
+/// intercalados (HOFS, VOFS, HOFS, VOFS… por fondo).
+const BG0HOFS_LO: u32 = 0x010;
+/// Primer byte **después** del bloque de registros de scroll de fondo (`0x020`).
+const BG_REGS_END: u32 = 0x020;
 
 /// Máscara del **modo de vídeo** en `DISPCNT` (bits 0-2).
 const BG_MODE_MASK: u16 = 0b111;
 /// Bit de ***forced blank*** en `DISPCNT` (bit 7): pantalla en blanco.
 const FORCED_BLANK: u16 = 1 << 7;
+/// Bit del *enable* del fondo 0 en `DISPCNT` (bit 8). Los fondos BG0–BG3 ocupan los
+/// bits 8-11: el fondo `n` se muestra si su bit `8 + n` está a 1.
+const DISPCNT_BG0_ENABLE: u16 = 1 << 8;
 
 // Bits de `DISPSTAT`.
 /// *Flag* de V-Blank (bit 0, solo lectura): 1 mientras el barrido está en V-Blank.
@@ -93,6 +107,32 @@ const DISPSTAT_VCOUNT_IRQ: u16 = 1 << 5;
 /// Bits **escribibles** del byte bajo de `DISPSTAT` (los tres enables, 3-5). Los
 /// bits 0-2 son *flags* de solo lectura y los 6-7 no se usan.
 const DISPSTAT_LOW_WRITABLE: u16 = DISPSTAT_VBLANK_IRQ | DISPSTAT_HBLANK_IRQ | DISPSTAT_VCOUNT_IRQ;
+
+// ---- Campos de `BGxCNT` (control de un fondo de tiles, Mini-Hito 2.4c) ----
+
+/// Máscara de la **prioridad** del fondo en `BGxCNT` (bits 0-1): 0 = más al frente.
+const BGCNT_PRIORITY_MASK: u16 = 0b11;
+/// Bit de **color de 256 colores / 8 bpp** en `BGxCNT` (bit 7): si está a 0, el
+/// fondo usa 16 paletas de 16 colores (4 bpp).
+const BGCNT_8BPP: u16 = 1 << 7;
+/// Tamaño en bytes de un **bloque de caracteres** (*char base block*, bits 2-3 de
+/// `BGxCNT` × esto): 16 KiB.
+const CHAR_BLOCK_BYTES: usize = 0x4000;
+/// Tamaño en bytes de un **bloque de mapa** (*screen base block*, bits 8-12 de
+/// `BGxCNT` × esto): 2 KiB = 1024 entradas de mapa de 16 bits.
+const SCREEN_BLOCK_BYTES: usize = 0x800;
+/// Bytes de un tile en 4 bpp (8×8 píxeles, medio byte cada uno): 32.
+const TILE_BYTES_4BPP: usize = 32;
+/// Bytes de un tile en 8 bpp (8×8 píxeles, un byte cada uno): 64.
+const TILE_BYTES_8BPP: usize = 64;
+
+// Campos de una **entrada de mapa de tiles** (16 bits, modo texto).
+/// Máscara del **número de tile** (bits 0-9).
+const MAP_TILE_MASK: u16 = 0x3FF;
+/// Bit de **volteo horizontal** del tile (bit 10).
+const MAP_HFLIP: u16 = 1 << 10;
+/// Bit de **volteo vertical** del tile (bit 11).
+const MAP_VFLIP: u16 = 1 << 11;
 
 // ---- Temporización del barrido (GBATEK: 1 punto = 4 ciclos de CPU) ----
 
@@ -124,6 +164,16 @@ pub struct Ppu {
     /// Línea actual del barrido (`VCOUNT`, 0–227). La avanza el evento de fin de
     /// línea ([`Ppu::enter_next_line`]); el resto del hardware la lee.
     vcount: u16,
+    /// Control de cada fondo `BG0CNT`–`BG3CNT` (`0x0400_0008`–`0x0400_000F`,
+    /// Mini-Hito 2.4c): prioridad, bloque de *tiles*, *mosaic*, 4/8 bpp, bloque de
+    /// mapa y tamaño. Ver [`Ppu::render_scanline`].
+    bgcnt: [u16; 4],
+    /// *Scroll* horizontal de cada fondo `BG0HOFS`–`BG3HOFS` (`0x0400_0010`+, de
+    /// **solo escritura**, 9 bits útiles).
+    bghofs: [u16; 4],
+    /// *Scroll* vertical de cada fondo `BG0VOFS`–`BG3VOFS` (`0x0400_0012`+, de
+    /// **solo escritura**, 9 bits útiles).
+    bgvofs: [u16; 4],
     /// Framebuffer RGBA del núcleo ([`FRAMEBUFFER_SIZE`] bytes). La PPU lo va
     /// rellenando **scanline a scanline** ([`Ppu::render_scanline`]); el frontend lo
     /// lee a través de [`crate::Bus::framebuffer`].
@@ -138,16 +188,20 @@ impl Ppu {
             dispcnt: 0,
             dispstat: 0,
             vcount: 0,
+            bgcnt: [0; 4],
+            bghofs: [0; 4],
+            bgvofs: [0; 4],
             framebuffer: vec![0; FRAMEBUFFER_SIZE],
         }
     }
 
-    /// `true` si el offset de I/O `io_off` cae en un registro que gestiona la PPU
-    /// (`DISPCNT`, `DISPSTAT` o `VCOUNT`). Lo usa el bus para enrutar aquí el acceso.
-    /// El hueco `0x002`–`0x003` (*green swap*, no implementado) queda fuera.
+    /// `true` si el offset de I/O `io_off` cae en un registro que gestiona la PPU:
+    /// `DISPCNT`, `DISPSTAT`, `VCOUNT` y, desde 2.4c, los `BGxCNT`/`BGxHOFS`/`BGxVOFS`
+    /// (`0x008`–`0x01F`). Lo usa el bus para enrutar aquí el acceso. El hueco
+    /// `0x002`–`0x003` (*green swap*, no implementado) queda fuera.
     pub fn handles(io_off: u32) -> bool {
         (DISPCNT_LO..DISPCNT_LO + 2).contains(&io_off)
-            || (DISPSTAT_LO..VCOUNT_LO + 2).contains(&io_off)
+            || (DISPSTAT_LO..BG_REGS_END).contains(&io_off)
     }
 
     /// Lee un byte de un registro de la PPU. Nunca panica: un offset fuera de los
@@ -160,6 +214,12 @@ impl Ppu {
             n if n == DISPSTAT_LO + 1 => (self.dispstat >> 8) as u8,
             VCOUNT_LO => self.vcount as u8,
             n if n == VCOUNT_LO + 1 => (self.vcount >> 8) as u8,
+            // BGxCNT (0x008–0x00F): legible. idx = qué fondo, bit bajo = qué byte.
+            n if (BG0CNT_LO..BG0HOFS_LO).contains(&n) => {
+                let idx = ((n - BG0CNT_LO) / 2) as usize;
+                (self.bgcnt[idx] >> (((n & 1) * 8) as u16)) as u8
+            }
+            // BGxHOFS/BGxVOFS (0x010–0x01F): de solo escritura, se leen como 0.
             _ => 0,
         }
     }
@@ -187,6 +247,22 @@ impl Ppu {
                 self.dispstat = (self.dispstat & 0x00FF) | (u16::from(value) << 8);
                 let matches = self.vcount == self.lyc();
                 self.set_flag(DISPSTAT_VCOUNT_FLAG, matches);
+            }
+            // BGxCNT (0x008–0x00F): control de fondo, escribible entero.
+            n if (BG0CNT_LO..BG0HOFS_LO).contains(&n) => {
+                let idx = ((n - BG0CNT_LO) / 2) as usize;
+                write_byte(&mut self.bgcnt[idx], n & 1, value);
+            }
+            // BGxHOFS/BGxVOFS (0x010–0x01F): scroll, intercalados HOFS, VOFS por
+            // fondo (4 bytes por fondo). El bit 2 del offset distingue VOFS de HOFS.
+            n if (BG0HOFS_LO..BG_REGS_END).contains(&n) => {
+                let idx = ((n - BG0HOFS_LO) / 4) as usize;
+                let reg = if n & 0b10 == 0 {
+                    &mut self.bghofs[idx]
+                } else {
+                    &mut self.bgvofs[idx]
+                };
+                write_byte(reg, n & 1, value);
             }
             // VCOUNT es de solo lectura.
             _ => {}
@@ -287,21 +363,35 @@ impl Ppu {
     /// pinta nada (las líneas de V-Blank no tienen píxeles).
     ///
     /// El orden de decisión reproduce el del hardware: *forced blank* → línea blanca;
-    /// modo 3 → bitmap directo 16bpp de la VRAM; cualquier otro modo (aún sin
-    /// implementar) → el *backdrop* (`PRAM[0]`).
+    /// modos de **tiles** 0/1 (2.4c) → composición de fondos por prioridad; modo 3 →
+    /// bitmap directo 16bpp de la VRAM; cualquier otro modo (aún sin implementar) → el
+    /// *backdrop* (`PRAM[0]`).
+    ///
+    /// > Los fondos **afines** (modo 2 entero, y el BG2 del modo 1) son del Mini-Hito
+    /// > 2.4f; aquí solo se dibujan los fondos de **texto** (modo 0: BG0–3; modo 1:
+    /// > BG0–1). Los sprites llegan en 2.4d.
     pub fn render_scanline(&mut self, y: u16, vram: &[u8], pram: &[u8]) {
         let y = y as usize;
         if y >= SCREEN_HEIGHT {
             return;
         }
+        // Copiamos el estado de registros que necesita el render a locales antes de
+        // tomar prestado el framebuffer mutablemente (evita un conflicto de préstamos
+        // con `self`): todos son `Copy`.
+        let dispcnt = self.dispcnt;
+        let bgcnt = self.bgcnt;
+        let bghofs = self.bghofs;
+        let bgvofs = self.bgvofs;
+
         let start = y * SCREEN_WIDTH * BYTES_PER_PIXEL;
         let row = &mut self.framebuffer[start..start + SCREEN_WIDTH * BYTES_PER_PIXEL];
 
-        if self.dispcnt & FORCED_BLANK != 0 {
+        if dispcnt & FORCED_BLANK != 0 {
             fill_row(row, WHITE);
             return;
         }
-        match (self.dispcnt & BG_MODE_MASK) as u8 {
+        match (dispcnt & BG_MODE_MASK) as u8 {
+            mode @ (0 | 1) => render_tiled_row(row, y, mode, dispcnt, &bgcnt, &bghofs, &bgvofs, vram, pram),
             3 => {
                 // Cada píxel: 2 bytes BGR555 desde la VRAM, fila a fila.
                 let row_base = y * SCREEN_WIDTH * 2;
@@ -401,6 +491,162 @@ fn fill_row(row: &mut [u8], rgba: [u8; 4]) {
     }
 }
 
+/// Lee un byte de un buffer (VRAM/PRAM) sin panicar: un offset fuera de rango
+/// devuelve 0 (defensa: la entrada de mapa la controla la ROM y podría apuntar lejos).
+#[inline]
+fn read_at(buf: &[u8], off: usize) -> u8 {
+    buf.get(off).copied().unwrap_or(0)
+}
+
+/// Escribe el byte bajo (`byte_sel == 0`) o alto (`!= 0`) de un registro de 16 bits,
+/// conservando el otro. Lo usan los registros de fondo de [`Ppu::write_u8`].
+fn write_byte(reg: &mut u16, byte_sel: u32, value: u8) {
+    if byte_sel == 0 {
+        *reg = (*reg & 0xFF00) | u16::from(value);
+    } else {
+        *reg = (*reg & 0x00FF) | (u16::from(value) << 8);
+    }
+}
+
+/// Renderiza una scanline `y` en los **modos de tiles** 0 y 1 (Mini-Hito 2.4c),
+/// componiendo los fondos de **texto** activos por orden de prioridad sobre el
+/// *backdrop*.
+///
+/// Solo se dibujan los fondos de texto válidos en el modo (modo 0 → BG0–3; modo 1 →
+/// BG0–1; el BG2 afín del modo 1 es del 2.4f) **y** habilitados en `DISPCNT`. Se
+/// ordenan por (prioridad, índice de fondo): para cada píxel se toma el primer fondo
+/// —el más al frente— que aporte un color no transparente (índice de paleta ≠ 0); si
+/// ninguno lo hace, queda el *backdrop*.
+#[allow(clippy::too_many_arguments)]
+fn render_tiled_row(
+    row: &mut [u8],
+    y: usize,
+    mode: u8,
+    dispcnt: u16,
+    bgcnt: &[u16; 4],
+    bghofs: &[u16; 4],
+    bgvofs: &[u16; 4],
+    vram: &[u8],
+    pram: &[u8],
+) {
+    // Fondos de texto que el modo permite dibujar (los afines son del 2.4f).
+    let text_bgs: &[usize] = match mode {
+        0 => &[0, 1, 2, 3],
+        1 => &[0, 1],
+        _ => &[],
+    };
+    // De ellos, los habilitados en DISPCNT (bits 8-11), ordenados por prioridad.
+    let mut order = [0usize; 4];
+    let mut count = 0;
+    for &bg in text_bgs {
+        if dispcnt & (DISPCNT_BG0_ENABLE << bg) != 0 {
+            order[count] = bg;
+            count += 1;
+        }
+    }
+    let order = &mut order[..count];
+    // Estable y por (prioridad, índice): a igual prioridad, el fondo de menor índice
+    // queda delante (regla de la GBA).
+    order.sort_by_key(|&bg| ((bgcnt[bg] & BGCNT_PRIORITY_MASK) as u8, bg as u8));
+
+    let backdrop = backdrop(pram);
+    for (x, out) in row.chunks_exact_mut(BYTES_PER_PIXEL).enumerate() {
+        let mut rgba = backdrop;
+        for &bg in order.iter() {
+            if let Some(color) = sample_text_bg(bgcnt[bg], bghofs[bg], bgvofs[bg], x, y, vram, pram) {
+                rgba = bgr555_to_rgba(color);
+                break;
+            }
+        }
+        out.copy_from_slice(&rgba);
+    }
+}
+
+/// Muestrea el color de un **fondo de texto** en el píxel de pantalla `(screen_x,
+/// screen_y)`, aplicando su *scroll*. Devuelve el color **BGR555** del píxel, o `None`
+/// si es transparente (índice de paleta 0). Nunca panica: todo acceso a `vram`/`pram`
+/// va por `get`.
+///
+/// Reproduce el pipeline del hardware: *scroll* → envoltura al tamaño del fondo →
+/// localizar la entrada de mapa en su *screen base block* → leer tile, volteos y
+/// paleta → resolver el píxel del tile en 4 u 8 bpp desde el *char base block*.
+fn sample_text_bg(
+    bgcnt: u16,
+    hofs: u16,
+    vofs: u16,
+    screen_x: usize,
+    screen_y: usize,
+    vram: &[u8],
+    pram: &[u8],
+) -> Option<u16> {
+    let (width_tiles, height_tiles) = bg_size_tiles(bgcnt);
+    // Coordenada dentro del fondo, envuelta a su tamaño total (potencia de dos).
+    let bg_x = (screen_x + hofs as usize) & (width_tiles * 8 - 1);
+    let bg_y = (screen_y + vofs as usize) & (height_tiles * 8 - 1);
+    let (tile_x, tile_y) = (bg_x / 8, bg_y / 8);
+    let (mut px, mut py) = (bg_x % 8, bg_y % 8);
+
+    // Entrada de mapa (16 bits) en el screen base block del fondo.
+    let screen_base = ((bgcnt >> 8) & 0x1F) as usize * SCREEN_BLOCK_BYTES;
+    let entry_off = screen_base + map_entry_index(tile_x, tile_y, width_tiles) * 2;
+    let entry = u16::from_le_bytes([read_at(vram, entry_off), read_at(vram, entry_off + 1)]);
+
+    let tile_num = (entry & MAP_TILE_MASK) as usize;
+    if entry & MAP_HFLIP != 0 {
+        px = 7 - px;
+    }
+    if entry & MAP_VFLIP != 0 {
+        py = 7 - py;
+    }
+
+    let char_base = ((bgcnt >> 2) & 0b11) as usize * CHAR_BLOCK_BYTES;
+    let index = if bgcnt & BGCNT_8BPP != 0 {
+        // 8 bpp: un byte por píxel, paleta única de 256 colores.
+        read_at(vram, char_base + tile_num * TILE_BYTES_8BPP + py * 8 + px) as usize
+    } else {
+        // 4 bpp: medio byte por píxel; el nibble bajo es el píxel par.
+        let byte = read_at(vram, char_base + tile_num * TILE_BYTES_4BPP + py * 4 + px / 2);
+        let nibble = if px & 1 == 0 { byte & 0x0F } else { byte >> 4 };
+        nibble as usize
+    };
+    if index == 0 {
+        return None; // índice 0 = transparente
+    }
+    // En 4 bpp el número de paleta (bits 12-15 de la entrada) selecciona un banco de
+    // 16 colores; en 8 bpp se usa la paleta de fondo completa.
+    let pal_index = if bgcnt & BGCNT_8BPP != 0 {
+        index
+    } else {
+        ((entry >> 12) & 0xF) as usize * 16 + index
+    };
+    let off = pal_index * 2;
+    Some(u16::from_le_bytes([read_at(pram, off), read_at(pram, off + 1)]))
+}
+
+/// Índice (en entradas de mapa de 16 bits) de la celda de tile `(tile_x, tile_y)`
+/// dentro del *screen base block* de un fondo de texto, modelando el reparto en
+/// *screenblocks* de 32×32 tiles según el ancho del fondo.
+///
+/// Los fondos de más de 256 px se componen de varios bloques de 32×32 entradas
+/// (1024 cada uno): a la derecha y, en 512×512, también abajo. Esta función ubica la
+/// celda en el bloque correcto (GBATEK, "Text BG Screen").
+fn map_entry_index(tile_x: usize, tile_y: usize, width_tiles: usize) -> usize {
+    let blocks_x = width_tiles / 32; // 1 o 2 bloques de ancho
+    let block = (tile_x / 32) + (tile_y / 32) * blocks_x;
+    block * 1024 + (tile_y % 32) * 32 + (tile_x % 32)
+}
+
+/// Tamaño de un fondo de texto en **tiles** (ancho, alto), de los bits 14-15 de
+/// `BGxCNT`: 0 → 32×32 (256×256 px), 1 → 64×32, 2 → 32×64, 3 → 64×64.
+fn bg_size_tiles(bgcnt: u16) -> (usize, usize) {
+    match (bgcnt >> 14) & 0b11 {
+        0 => (32, 32),
+        1 => (64, 32),
+        2 => (32, 64),
+        _ => (64, 64),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,7 +675,11 @@ mod tests {
         assert!(Ppu::handles(0x005));
         assert!(Ppu::handles(0x006)); // VCOUNT
         assert!(Ppu::handles(0x007));
-        assert!(!Ppu::handles(0x008)); // ya fuera (BG0CNT, llega en 2.4c)
+        assert!(Ppu::handles(0x008)); // BG0CNT (2.4c)
+        assert!(Ppu::handles(0x00F)); // BG3CNT (byte alto)
+        assert!(Ppu::handles(0x010)); // BG0HOFS
+        assert!(Ppu::handles(0x01F)); // BG3VOFS (byte alto)
+        assert!(!Ppu::handles(0x020)); // ya fuera (BG2 afín BG2PA, llega en 2.4f)
     }
 
     #[test]
@@ -604,7 +854,7 @@ mod tests {
     #[test]
     fn un_modo_no_implementado_pinta_el_backdrop() {
         let mut ppu = Ppu::new();
-        ppu.write_u8(0x000, 0x00); // modo 0 (tiles, aún sin implementar)
+        ppu.write_u8(0x000, 0x02); // modo 2 (solo fondos afines, aún sin implementar)
         let vram = vec![0u8; VRAM_SIZE];
         let mut pram = vec![0u8; PRAM_SIZE];
         pram[0..2].copy_from_slice(&0x03E0u16.to_le_bytes()); // backdrop verde
@@ -617,6 +867,182 @@ mod tests {
         let mut ppu = Ppu::new();
         ppu.clear_framebuffer([10, 20, 30, 0xFF]);
         assert!(all_rows_are(&ppu, [10, 20, 30, 0xFF]));
+    }
+
+    // ---- Fondos de tiles (Mini-Hito 2.4c) -----------------------------------
+
+    #[test]
+    fn bgcnt_almacena_los_cuatro_y_es_legible() {
+        let mut ppu = Ppu::new();
+        for bg in 0..4u32 {
+            let off = 0x008 + bg * 2;
+            ppu.write_u8(off, 0xCD);
+            ppu.write_u8(off + 1, 0xAB);
+            assert_eq!(ppu.read_u8(off), 0xCD, "BG{bg}CNT byte bajo");
+            assert_eq!(ppu.read_u8(off + 1), 0xAB, "BG{bg}CNT byte alto");
+        }
+    }
+
+    #[test]
+    fn los_scroll_son_de_solo_escritura() {
+        let mut ppu = Ppu::new();
+        ppu.write_u8(0x010, 0x34); // BG0HOFS
+        ppu.write_u8(0x011, 0x01);
+        ppu.write_u8(0x012, 0x78); // BG0VOFS
+        // Se almacenan internamente pero no son legibles (write-only → 0).
+        assert_eq!(ppu.read_u8(0x010), 0);
+        assert_eq!(ppu.read_u8(0x012), 0);
+    }
+
+    /// Escribe en `vram` la fila 0 de un tile 4 bpp con todos sus 8 píxeles al índice
+    /// de paleta `pal_index` (1–15). `tile_num` y `char_base` (en bytes) ubican el tile.
+    fn poner_fila0_tile_4bpp(vram: &mut [u8], char_base: usize, tile_num: usize, pal_index: u8) {
+        let base = char_base + tile_num * 32; // 32 bytes por tile en 4 bpp
+        let nibble_par = pal_index; // píxel par = nibble bajo
+        let byte = nibble_par | (pal_index << 4); // dos píxeles por byte
+        for b in 0..4 {
+            vram[base + b] = byte;
+        }
+    }
+
+    /// Programa un color BGR555 en la entrada `i` de la paleta de fondo (`PRAM`).
+    fn poner_color_pram(pram: &mut [u8], i: usize, color: u16) {
+        pram[i * 2..i * 2 + 2].copy_from_slice(&color.to_le_bytes());
+    }
+
+    #[test]
+    fn modo0_dibuja_un_tile_y_respeta_la_transparencia() {
+        let mut ppu = Ppu::new();
+        // Modo 0, BG0 habilitado (bit 8).
+        ppu.write_u8(0x000, 0x00);
+        ppu.write_u8(0x001, 0x01);
+        // BG0CNT: char base 0, screen base block 8 (0x4000), prioridad 0, 4 bpp, size 0.
+        ppu.write_u8(0x008, 0x00);
+        ppu.write_u8(0x009, 0x08);
+
+        let mut vram = vec![0u8; VRAM_SIZE];
+        let mut pram = vec![0u8; PRAM_SIZE];
+        // Tile 1: fila 0 toda al índice 1. Mapa: celda (0,0) → tile 1; celda (1,0) → 0.
+        poner_fila0_tile_4bpp(&mut vram, 0, 1, 1);
+        vram[0x4000..0x4002].copy_from_slice(&0x0001u16.to_le_bytes()); // celda (0,0) = tile 1
+        poner_color_pram(&mut pram, 0, 0x7C00); // backdrop azul
+        poner_color_pram(&mut pram, 1, 0x001F); // paleta 1 = rojo
+
+        ppu.render_scanline(0, &vram, &pram);
+
+        // Los 8 píxeles del tile 1 son rojos.
+        assert_eq!(pixel(&ppu, 0, 0), [0xFF, 0x00, 0x00, 0xFF], "píxel del tile 1");
+        assert_eq!(pixel(&ppu, 7, 0), [0xFF, 0x00, 0x00, 0xFF]);
+        // La celda (1,0) apunta al tile 0 (transparente) → se ve el backdrop.
+        assert_eq!(pixel(&ppu, 8, 0), [0x00, 0x00, 0xFF, 0xFF], "tile 0 transparente → backdrop");
+    }
+
+    #[test]
+    fn el_scroll_horizontal_desplaza_el_fondo() {
+        let mut ppu = Ppu::new();
+        ppu.write_u8(0x000, 0x00);
+        ppu.write_u8(0x001, 0x01); // modo 0, BG0
+        ppu.write_u8(0x009, 0x08); // BG0CNT: screen base block 8
+        ppu.write_u8(0x010, 8); // BG0HOFS = 8: la celda (1,0) pasa a empezar en x=0
+
+        let mut vram = vec![0u8; VRAM_SIZE];
+        let mut pram = vec![0u8; PRAM_SIZE];
+        poner_fila0_tile_4bpp(&mut vram, 0, 1, 1);
+        // Tile 1 en la celda (1,0); la (0,0) queda vacía.
+        vram[0x4002..0x4004].copy_from_slice(&0x0001u16.to_le_bytes());
+        poner_color_pram(&mut pram, 0, 0x7C00); // backdrop
+        poner_color_pram(&mut pram, 1, 0x001F); // rojo
+
+        ppu.render_scanline(0, &vram, &pram);
+
+        // Con hofs=8, el tile de la celda (1,0) se ve ya en x=0.
+        assert_eq!(pixel(&ppu, 0, 0), [0xFF, 0x00, 0x00, 0xFF], "scroll trae el tile (1,0) a x=0");
+    }
+
+    #[test]
+    fn la_prioridad_decide_que_fondo_se_ve() {
+        let mut ppu = Ppu::new();
+        // Modo 0, BG0 y BG1 habilitados (bits 8 y 9).
+        ppu.write_u8(0x000, 0x00);
+        ppu.write_u8(0x001, 0x03);
+        // BG0CNT: prioridad 1 (bits 0-1 = 1), screen base block 8.
+        ppu.write_u8(0x008, 0x01);
+        ppu.write_u8(0x009, 0x08);
+        // BG1CNT: prioridad 0 (más al frente), screen base block 9 (0x4800).
+        ppu.write_u8(0x00A, 0x00);
+        ppu.write_u8(0x00B, 0x09);
+
+        let mut vram = vec![0u8; VRAM_SIZE];
+        let mut pram = vec![0u8; PRAM_SIZE];
+        // Ambos fondos usan tiles distintos con colores distintos en la celda (0,0).
+        poner_fila0_tile_4bpp(&mut vram, 0, 1, 1); // tile 1 → índice 1 (rojo)
+        poner_fila0_tile_4bpp(&mut vram, 0, 2, 2); // tile 2 → índice 2 (verde)
+        vram[0x4000..0x4002].copy_from_slice(&0x0001u16.to_le_bytes()); // BG0 celda (0,0) = tile 1
+        vram[0x4800..0x4802].copy_from_slice(&0x0002u16.to_le_bytes()); // BG1 celda (0,0) = tile 2
+        poner_color_pram(&mut pram, 0, 0x0000);
+        poner_color_pram(&mut pram, 1, 0x001F); // rojo (BG0)
+        poner_color_pram(&mut pram, 2, 0x03E0); // verde (BG1)
+
+        ppu.render_scanline(0, &vram, &pram);
+
+        // BG1 tiene prioridad 0 (delante de BG0, prioridad 1) → se ve verde.
+        assert_eq!(pixel(&ppu, 0, 0), [0x00, 0xFF, 0x00, 0xFF], "gana la menor prioridad (BG1)");
+    }
+
+    #[test]
+    fn el_volteo_horizontal_de_la_entrada_de_mapa_se_aplica() {
+        let mut ppu = Ppu::new();
+        ppu.write_u8(0x000, 0x00);
+        ppu.write_u8(0x001, 0x01); // modo 0, BG0
+        ppu.write_u8(0x009, 0x08); // screen base block 8
+
+        let mut vram = vec![0u8; VRAM_SIZE];
+        let mut pram = vec![0u8; PRAM_SIZE];
+        // Tile 1, fila 0: solo el píxel 0 (nibble bajo del primer byte) al índice 1.
+        vram[32] = 0x01; // px0 = índice 1, px1 = 0
+        // Celda (0,0) = tile 1 con volteo horizontal (bit 10).
+        vram[0x4000..0x4002].copy_from_slice(&(0x0001u16 | MAP_HFLIP).to_le_bytes());
+        poner_color_pram(&mut pram, 0, 0x7C00); // backdrop azul
+        poner_color_pram(&mut pram, 1, 0x001F); // rojo
+
+        ppu.render_scanline(0, &vram, &pram);
+
+        // Sin volteo el píxel rojo estaría en x=0; con volteo horizontal pasa a x=7.
+        assert_eq!(pixel(&ppu, 0, 0), [0x00, 0x00, 0xFF, 0xFF], "x=0 ya no es el píxel del tile");
+        assert_eq!(pixel(&ppu, 7, 0), [0xFF, 0x00, 0x00, 0xFF], "el píxel rojo se volteó a x=7");
+    }
+
+    #[test]
+    fn modo0_en_8bpp_usa_la_paleta_de_256_colores() {
+        let mut ppu = Ppu::new();
+        ppu.write_u8(0x000, 0x00);
+        ppu.write_u8(0x001, 0x01); // modo 0, BG0
+        // BG0CNT: 8 bpp (bit 7), screen base block 8.
+        ppu.write_u8(0x008, BGCNT_8BPP as u8);
+        ppu.write_u8(0x009, 0x08);
+
+        let mut vram = vec![0u8; VRAM_SIZE];
+        let mut pram = vec![0u8; PRAM_SIZE];
+        // 8 bpp: 64 bytes por tile, un byte por píxel. Tile 1, px0 = índice 5.
+        vram[64] = 5;
+        vram[0x4000..0x4002].copy_from_slice(&0x0001u16.to_le_bytes()); // celda (0,0) = tile 1
+        poner_color_pram(&mut pram, 0, 0x0000);
+        poner_color_pram(&mut pram, 5, 0x001F); // índice 5 = rojo
+
+        ppu.render_scanline(0, &vram, &pram);
+
+        assert_eq!(pixel(&ppu, 0, 0), [0xFF, 0x00, 0x00, 0xFF], "8 bpp resuelve por índice directo");
+    }
+
+    #[test]
+    fn map_entry_index_ubica_los_screenblocks() {
+        // 256×256 (32×32): un solo bloque, índice lineal.
+        assert_eq!(map_entry_index(0, 0, 32), 0);
+        assert_eq!(map_entry_index(31, 31, 32), 31 * 32 + 31);
+        // 512×256 (64×32): la columna 32 cae en el segundo screenblock (+1024).
+        assert_eq!(map_entry_index(32, 0, 64), 1024);
+        // 512×512 (64×64): fila 32 → bloque de abajo; con ancho 2 bloques, +2048.
+        assert_eq!(map_entry_index(0, 32, 64), 2048);
     }
 
     #[test]

@@ -1051,12 +1051,11 @@ mod tests {
 
     #[test]
     fn dispcnt_dispstat_vcount_se_enrutan_a_la_ppu() {
-        // DISPCNT/DISPSTAT/VCOUNT van a la PPU (su fuente de verdad); un registro de
-        // vídeo vecino aún sin dueño (BG0CNT, 0x008, llega en 2.4c) sigue en el buffer
-        // crudo, sin pisarse.
+        // DISPCNT/DISPSTAT/VCOUNT y, desde 2.4c, BG0CNT (0x008) van a la PPU (su
+        // fuente de verdad).
         let mut bus = Bus::new(Vec::new());
         bus.write_u16(IO_START, 0x0403); // DISPCNT = modo 3 + bit 10 (BG2 on)
-        bus.write_u16(IO_START + 0x008, 0x1234); // BG0CNT (buffer crudo, 2.4c)
+        bus.write_u16(IO_START + 0x008, 0x1234); // BG0CNT (enrutado a la PPU, 2.4c)
         assert_eq!(bus.read_u16(IO_START), 0x0403);
         assert_eq!(bus.read_u16(IO_START + 0x008), 0x1234);
         // DISPSTAT solo deja escribir enables (bits 3-5) y LYC (bits 8-15).
@@ -1078,6 +1077,32 @@ mod tests {
         bus.render_frame();
 
         assert_eq!(&bus.framebuffer()[0..4], &[0x00, 0xFF, 0x00, 0xFF], "el bus volcó la VRAM");
+    }
+
+    #[test]
+    fn render_frame_dibuja_un_fondo_de_tiles_modo0() {
+        // End-to-end por el bus (Mini-Hito 2.4c): programar modo 0 con BG0, escribir
+        // un tile + su mapa + la paleta en sus regiones, y comprobar que el barrido
+        // (render_frame) compone el fondo.
+        let mut bus = Bus::new(Vec::new());
+        // DISPCNT = modo 0 + BG0 habilitado (bit 8).
+        bus.write_u16(IO_START, 0x0100);
+        // BG0CNT: char base 0, screen base block 8 (0x4000), 4 bpp, prioridad 0.
+        bus.write_u16(IO_START + 0x008, 8 << 8);
+        // Tile 1 (offset 0x20): fila 0 toda al índice de paleta 1 (4 bpp = 0x11 ×4).
+        for b in 0..4 {
+            bus.write_u8(VRAM_START + 0x20 + b, 0x11);
+        }
+        // Mapa: celda (0,0) → tile 1 (en el screen base block 8 = VRAM 0x4000).
+        bus.write_u16(VRAM_START + 0x4000, 0x0001);
+        // Paleta: backdrop (0) azul, índice 1 rojo.
+        bus.write_u16(PRAM_START, 0x7C00);
+        bus.write_u16(PRAM_START + 2, 0x001F);
+
+        bus.render_frame();
+
+        assert_eq!(fb_pixel(&bus, 0, 0), [0xFF, 0x00, 0x00, 0xFF], "tile 1 → rojo en (0,0)");
+        assert_eq!(fb_pixel(&bus, 8, 0), [0x00, 0x00, 0xFF, 0xFF], "celda vacía → backdrop azul");
     }
 
     // ---- PPU: barrido por scanlines (Mini-Hito 2.4b) --------------------
