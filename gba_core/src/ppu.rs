@@ -1,5 +1,6 @@
 //! La **PPU** (Picture Processing Unit): el subsistema gráfico de la GBA.
-//! Mini-Hitos **2.4a–2.4c** (bitmap modo 3 → barrido por scanlines → fondos de tiles).
+//! Mini-Hitos **2.4a–2.4d** (bitmap modo 3 → barrido por scanlines → fondos de tiles
+//! → sprites/OAM).
 //!
 //! ## De "frame de una vez" a "línea a línea"
 //!
@@ -55,12 +56,13 @@
 //!
 //! ## Qué queda para los siguientes hitos
 //!
-//! Tras 2.4c esta PPU dibuja los **fondos de texto** de los modos 0 y 1 (BG0–3 /
-//! BG0–1) además del **modo 3** bitmap, todo por scanlines. Quedan: los fondos
-//! **afines** (modo 2 entero y el BG2 del modo 1) para el 2.4f, los **sprites** (OAM)
-//! para el 2.4d, los **modos bitmap 4/5** para el 2.4e y los efectos (ventanas,
-//! blending, mosaico) para 2.4g–2.4h. El resto de bits de `DISPCNT`/`BGxCNT` no
-//! usados aquí (p. ej. *mosaic*) se almacenan sin efecto.
+//! Tras 2.4d esta PPU dibuja los **fondos de texto** de los modos 0 y 1 (BG0–3 /
+//! BG0–1), el **modo 3** bitmap y la capa de **sprites** (OAM, regulares), todo por
+//! scanlines y compuesto por prioridad. Quedan: los fondos **afines** (modo 2 entero
+//! y el BG2 del modo 1) **y los sprites afines** para el 2.4f, los **modos bitmap
+//! 4/5** para el 2.4e y los efectos (ventanas, blending, mosaico) para 2.4g–2.4h. El
+//! resto de bits de `DISPCNT`/`BGxCNT` no usados aquí (p. ej. *mosaic*) se almacenan
+//! sin efecto.
 
 use crate::interrupt::{Interrupt, InterruptControl};
 use crate::{BYTES_PER_PIXEL, FRAMEBUFFER_SIZE, SCREEN_HEIGHT, SCREEN_WIDTH};
@@ -90,6 +92,11 @@ const FORCED_BLANK: u16 = 1 << 7;
 /// Bit del *enable* del fondo 0 en `DISPCNT` (bit 8). Los fondos BG0–BG3 ocupan los
 /// bits 8-11: el fondo `n` se muestra si su bit `8 + n` está a 1.
 const DISPCNT_BG0_ENABLE: u16 = 1 << 8;
+/// Bit de **mapeo 1D** de los tiles de sprites en `DISPCNT` (bit 6): 1 = los tiles de
+/// un sprite van consecutivos en VRAM; 0 = mapeo 2D (rejilla de 32×32 tiles).
+const DISPCNT_OBJ_1D: u16 = 1 << 6;
+/// Bit de *enable* de los **sprites** (OBJ) en `DISPCNT` (bit 12): 1 = se dibujan.
+const DISPCNT_OBJ_ENABLE: u16 = 1 << 12;
 
 // Bits de `DISPSTAT`.
 /// *Flag* de V-Blank (bit 0, solo lectura): 1 mientras el barrido está en V-Blank.
@@ -125,6 +132,46 @@ const SCREEN_BLOCK_BYTES: usize = 0x800;
 const TILE_BYTES_4BPP: usize = 32;
 /// Bytes de un tile en 8 bpp (8×8 píxeles, un byte cada uno): 64.
 const TILE_BYTES_8BPP: usize = 64;
+
+// ---- Sprites / OAM (Mini-Hito 2.4d) ----
+
+/// Offset (en bytes, dentro de la VRAM) del **bloque de tiles de los sprites**: los
+/// OBJ leen sus tiles a partir de `0x0601_0000`, es decir, 64 KiB dentro de la VRAM.
+const OBJ_TILE_VRAM_BASE: usize = 0x1_0000;
+/// Offset (en bytes, dentro de la PRAM) de la **paleta de sprites**: las 256 entradas
+/// de OBJ viven en la mitad alta de la PRAM (`0x0500_0200`).
+const OBJ_PALETTE_BYTE_BASE: usize = 0x200;
+/// Número de entradas de la OAM (128 sprites, 8 bytes cada uno).
+const OAM_ENTRIES: usize = 128;
+/// Granularidad del **número de tile** de un sprite (siempre en unidades de 32 bytes,
+/// el tamaño de un tile 4 bpp), aunque el sprite sea 8 bpp.
+const OBJ_TILE_UNIT_BYTES: usize = TILE_BYTES_4BPP;
+
+// Campos de los atributos de un sprite (OAM, 3 × 16 bits por entrada).
+/// `attr0` bits 0-7: coordenada **Y** (8 bits, con envoltura a 256).
+const OBJ_ATTR0_Y_MASK: u16 = 0xFF;
+/// `attr0` bit 8: sprite **afín** (rotación/escalado). Sin él, bit 9 = *disable*.
+const OBJ_ATTR0_AFFINE: u16 = 1 << 8;
+/// `attr0` bit 9 (en sprites no afines): sprite **deshabilitado** (no se dibuja).
+const OBJ_ATTR0_DISABLE: u16 = 1 << 9;
+/// `attr0` bit 13: profundidad de color **8 bpp** (256 colores); si es 0, 4 bpp.
+const OBJ_ATTR0_8BPP: u16 = 1 << 13;
+/// `attr0` bits 14-15: **forma** del sprite (cuadrado / horizontal / vertical).
+const OBJ_ATTR0_SHAPE_SHIFT: u16 = 14;
+/// `attr1` bits 0-8: coordenada **X** (9 bits, con envoltura a 512).
+const OBJ_ATTR1_X_MASK: u16 = 0x1FF;
+/// `attr1` bit 12: **volteo horizontal** (sprites no afines).
+const OBJ_ATTR1_HFLIP: u16 = 1 << 12;
+/// `attr1` bit 13: **volteo vertical** (sprites no afines).
+const OBJ_ATTR1_VFLIP: u16 = 1 << 13;
+/// `attr1` bits 14-15: **tamaño** (junto con la forma de `attr0`, ver [`obj_size`]).
+const OBJ_ATTR1_SIZE_SHIFT: u16 = 14;
+/// `attr2` bits 0-9: **número de tile** base del sprite.
+const OBJ_ATTR2_TILE_MASK: u16 = 0x3FF;
+/// `attr2` bits 10-11: **prioridad** del sprite frente a los fondos (0 = más al frente).
+const OBJ_ATTR2_PRIORITY_SHIFT: u16 = 10;
+/// `attr2` bits 12-15: **banco de paleta** (4 bpp, 16 colores por banco).
+const OBJ_ATTR2_PALBANK_SHIFT: u16 = 12;
 
 // Campos de una **entrada de mapa de tiles** (16 bits, modo texto).
 /// Máscara del **número de tile** (bits 0-9).
@@ -369,8 +416,8 @@ impl Ppu {
     ///
     /// > Los fondos **afines** (modo 2 entero, y el BG2 del modo 1) son del Mini-Hito
     /// > 2.4f; aquí solo se dibujan los fondos de **texto** (modo 0: BG0–3; modo 1:
-    /// > BG0–1). Los sprites llegan en 2.4d.
-    pub fn render_scanline(&mut self, y: u16, vram: &[u8], pram: &[u8]) {
+    /// > BG0–1). Sobre ellos se compone la **capa de sprites** (OAM, Mini-Hito 2.4d).
+    pub fn render_scanline(&mut self, y: u16, vram: &[u8], pram: &[u8], oam: &[u8]) {
         let y = y as usize;
         if y >= SCREEN_HEIGHT {
             return;
@@ -383,6 +430,14 @@ impl Ppu {
         let bghofs = self.bghofs;
         let bgvofs = self.bgvofs;
 
+        // Capa de **sprites** de esta línea (Mini-Hito 2.4d): un color + prioridad por
+        // píxel, o transparente. Es independiente del modo de fondo y se compone luego
+        // sobre los fondos según prioridad. Solo se calcula si los OBJ están activos.
+        let mut objs = [ObjPixel::TRANSPARENT; SCREEN_WIDTH];
+        if dispcnt & DISPCNT_OBJ_ENABLE != 0 {
+            render_obj_line(&mut objs, y, dispcnt, oam, vram, pram);
+        }
+
         let start = y * SCREEN_WIDTH * BYTES_PER_PIXEL;
         let row = &mut self.framebuffer[start..start + SCREEN_WIDTH * BYTES_PER_PIXEL];
 
@@ -391,20 +446,11 @@ impl Ppu {
             return;
         }
         match (dispcnt & BG_MODE_MASK) as u8 {
-            mode @ (0 | 1) => render_tiled_row(row, y, mode, dispcnt, &bgcnt, &bghofs, &bgvofs, vram, pram),
-            3 => {
-                // Cada píxel: 2 bytes BGR555 desde la VRAM, fila a fila.
-                let row_base = y * SCREEN_WIDTH * 2;
-                for (x, out) in row.chunks_exact_mut(BYTES_PER_PIXEL).enumerate() {
-                    let off = row_base + x * 2;
-                    let color = u16::from_le_bytes([
-                        vram.get(off).copied().unwrap_or(0),
-                        vram.get(off + 1).copied().unwrap_or(0),
-                    ]);
-                    out.copy_from_slice(&bgr555_to_rgba(color));
-                }
+            mode @ (0 | 1) => {
+                render_tiled_row(row, y, mode, dispcnt, &bgcnt, &bghofs, &bgvofs, &objs, vram, pram)
             }
-            _ => fill_row(row, backdrop(pram)),
+            3 => render_bitmap3_row(row, y, &bgcnt, &objs, vram, pram),
+            _ => render_backdrop_row(row, &objs, pram),
         }
     }
 
@@ -412,9 +458,9 @@ impl Ppu {
     /// 2.4a. Es el render **bajo demanda** que conservan el frontend para un volcado
     /// inmediato y los tests; el render por scanlines del bucle usa
     /// [`Ppu::render_scanline`] línea a línea.
-    pub fn render_frame(&mut self, vram: &[u8], pram: &[u8]) {
+    pub fn render_frame(&mut self, vram: &[u8], pram: &[u8], oam: &[u8]) {
         for y in 0..SCREEN_HEIGHT as u16 {
-            self.render_scanline(y, vram, pram);
+            self.render_scanline(y, vram, pram, oam);
         }
     }
 
@@ -526,6 +572,7 @@ fn render_tiled_row(
     bgcnt: &[u16; 4],
     bghofs: &[u16; 4],
     bgvofs: &[u16; 4],
+    objs: &[ObjPixel; SCREEN_WIDTH],
     vram: &[u8],
     pram: &[u8],
 ) {
@@ -549,16 +596,64 @@ fn render_tiled_row(
     // queda delante (regla de la GBA).
     order.sort_by_key(|&bg| ((bgcnt[bg] & BGCNT_PRIORITY_MASK) as u8, bg as u8));
 
-    let backdrop = backdrop(pram);
     for (x, out) in row.chunks_exact_mut(BYTES_PER_PIXEL).enumerate() {
-        let mut rgba = backdrop;
-        for &bg in order.iter() {
-            if let Some(color) = sample_text_bg(bgcnt[bg], bghofs[bg], bgvofs[bg], x, y, vram, pram) {
-                rgba = bgr555_to_rgba(color);
+        // Fondo ganador del píxel: el primero (más al frente) con color no
+        // transparente, junto a su prioridad para compararla con el sprite.
+        let mut bg = None;
+        for &b in order.iter() {
+            if let Some(color) = sample_text_bg(bgcnt[b], bghofs[b], bgvofs[b], x, y, vram, pram) {
+                bg = Some((color, (bgcnt[b] & BGCNT_PRIORITY_MASK) as u8));
                 break;
             }
         }
-        out.copy_from_slice(&rgba);
+        out.copy_from_slice(&compose_pixel(bg, objs[x], pram));
+    }
+}
+
+/// Compone una scanline del **modo 3** (bitmap directo 16 bpp) con la capa de
+/// sprites. El bitmap actúa como un único fondo (BG2) opaco, con la prioridad de
+/// `BG2CNT`; los sprites se imponen según su propia prioridad.
+fn render_bitmap3_row(
+    row: &mut [u8],
+    y: usize,
+    bgcnt: &[u16; 4],
+    objs: &[ObjPixel; SCREEN_WIDTH],
+    vram: &[u8],
+    pram: &[u8],
+) {
+    let bg_priority = (bgcnt[2] & BGCNT_PRIORITY_MASK) as u8;
+    let row_base = y * SCREEN_WIDTH * 2;
+    for (x, out) in row.chunks_exact_mut(BYTES_PER_PIXEL).enumerate() {
+        let off = row_base + x * 2;
+        let color = u16::from_le_bytes([read_at(vram, off), read_at(vram, off + 1)]);
+        out.copy_from_slice(&compose_pixel(Some((color, bg_priority)), objs[x], pram));
+    }
+}
+
+/// Compone una scanline de un modo **sin fondo dibujado** (modo 2 afín aún pendiente,
+/// o cualquier otro): solo el *backdrop* y la capa de sprites encima.
+fn render_backdrop_row(row: &mut [u8], objs: &[ObjPixel; SCREEN_WIDTH], pram: &[u8]) {
+    for (x, out) in row.chunks_exact_mut(BYTES_PER_PIXEL).enumerate() {
+        out.copy_from_slice(&compose_pixel(None, objs[x], pram));
+    }
+}
+
+/// Combina el píxel del **fondo** ganador (`bg`: color BGR555 + prioridad, o `None` si
+/// es transparente) con el de la **capa de sprites** (`obj`). Un sprite opaco se
+/// impone si su prioridad es **≤** la del fondo (a igualdad, el sprite va delante), o
+/// si el fondo es transparente. Si nada opaco hay, queda el *backdrop* (`PRAM[0]`).
+fn compose_pixel(bg: Option<(u16, u8)>, obj: ObjPixel, pram: &[u8]) -> [u8; 4] {
+    let obj_wins = obj.opaque
+        && match bg {
+            Some((_, bg_prio)) => obj.priority <= bg_prio,
+            None => true,
+        };
+    if obj_wins {
+        return bgr555_to_rgba(obj.color);
+    }
+    match bg {
+        Some((color, _)) => bgr555_to_rgba(color),
+        None => backdrop(pram),
     }
 }
 
@@ -647,10 +742,156 @@ fn bg_size_tiles(bgcnt: u16) -> (usize, usize) {
     }
 }
 
+// ---- Sprites / OAM (Mini-Hito 2.4d) -----------------------------------------
+
+/// Un píxel ya resuelto de la **capa de sprites** de una scanline: su color BGR555,
+/// la prioridad del sprite (para compararla con la del fondo) y si es opaco. El valor
+/// [`ObjPixel::TRANSPARENT`] es el de "ningún sprite aquí".
+#[derive(Clone, Copy)]
+struct ObjPixel {
+    color: u16,
+    priority: u8,
+    opaque: bool,
+}
+
+impl ObjPixel {
+    /// Píxel sin sprite: transparente y con la peor prioridad (detrás de todo).
+    const TRANSPARENT: ObjPixel = ObjPixel { color: 0, priority: 4, opaque: false };
+}
+
+/// Rellena la capa de sprites `objs` con los OBJ visibles en la scanline `y`,
+/// leyendo la OAM (atributos), la VRAM (tiles) y la PRAM (paleta de sprites) que el
+/// bus presta. Recorre los 128 sprites en orden de índice OAM; a igualdad de píxel,
+/// el de **menor índice** manda (se escribe solo si el píxel sigue transparente).
+///
+/// > Solo dibuja sprites **regulares** (no afines): los afines (rotación/escalado,
+/// > `attr0` bit 8) son del Mini-Hito 2.4f y aquí se omiten. Tampoco se modelan aún
+/// > los modos de OBJ semitransparente / ventana (`attr0` bits 10-11) ni el *mosaic*.
+fn render_obj_line(
+    objs: &mut [ObjPixel; SCREEN_WIDTH],
+    y: usize,
+    dispcnt: u16,
+    oam: &[u8],
+    vram: &[u8],
+    pram: &[u8],
+) {
+    let one_d = dispcnt & DISPCNT_OBJ_1D != 0;
+
+    for i in 0..OAM_ENTRIES {
+        let base = i * 8;
+        let attr0 = read_u16_at(oam, base);
+        // Afín (bit 8) → 2.4f. No afín + disable (bit 9) → no se dibuja.
+        if attr0 & OBJ_ATTR0_AFFINE != 0 || attr0 & OBJ_ATTR0_DISABLE != 0 {
+            continue;
+        }
+        let attr1 = read_u16_at(oam, base + 2);
+        let attr2 = read_u16_at(oam, base + 4);
+
+        let shape = (attr0 >> OBJ_ATTR0_SHAPE_SHIFT) & 0b11;
+        let size = (attr1 >> OBJ_ATTR1_SIZE_SHIFT) & 0b11;
+        let (w, h) = obj_size(shape, size);
+
+        // Fila dentro del sprite (con envoltura a 256). Si cae fuera, el sprite no
+        // toca esta línea: un sprite cerca del borde inferior "envuelve" arriba.
+        let y_coord = attr0 & OBJ_ATTR0_Y_MASK;
+        let row_in = ((y as u16).wrapping_sub(y_coord) & 0xFF) as usize;
+        if row_in >= h {
+            continue;
+        }
+
+        let x_coord = (attr1 & OBJ_ATTR1_X_MASK) as usize;
+        let eight_bpp = attr0 & OBJ_ATTR0_8BPP != 0;
+        let hflip = attr1 & OBJ_ATTR1_HFLIP != 0;
+        let vflip = attr1 & OBJ_ATTR1_VFLIP != 0;
+        let tile_base = (attr2 & OBJ_ATTR2_TILE_MASK) as usize;
+        let priority = ((attr2 >> OBJ_ATTR2_PRIORITY_SHIFT) & 0b11) as u8;
+        let pal_bank = ((attr2 >> OBJ_ATTR2_PALBANK_SHIFT) & 0xF) as usize;
+
+        let sy = if vflip { h - 1 - row_in } else { row_in };
+
+        for col in 0..w {
+            // Envoltura horizontal a 512 y recorte a la pantalla.
+            let screen_x = (x_coord + col) & 0x1FF;
+            if screen_x >= SCREEN_WIDTH || objs[screen_x].opaque {
+                continue;
+            }
+            let sx = if hflip { w - 1 - col } else { col };
+            let index = obj_tile_index(sx, sy, w, tile_base, eight_bpp, one_d, vram);
+            if index == 0 {
+                continue; // índice 0 = transparente
+            }
+            // Paleta de sprites (segunda mitad de la PRAM): 4 bpp por banco, 8 bpp directo.
+            let pal_index = if eight_bpp { index as usize } else { pal_bank * 16 + index as usize };
+            let off = OBJ_PALETTE_BYTE_BASE + pal_index * 2;
+            let color = u16::from_le_bytes([read_at(pram, off), read_at(pram, off + 1)]);
+            objs[screen_x] = ObjPixel { color, priority, opaque: true };
+        }
+    }
+}
+
+/// Índice de paleta del píxel `(sx, sy)` **dentro** de un sprite (con los volteos ya
+/// aplicados por el llamador), localizando su tile en la VRAM de OBJ según el mapeo
+/// 1D/2D. El número de tile va siempre en unidades de 32 bytes; un tile 8 bpp ocupa
+/// dos. Nunca panica (acceso por `read_at`).
+fn obj_tile_index(
+    sx: usize,
+    sy: usize,
+    width: usize,
+    tile_base: usize,
+    eight_bpp: bool,
+    one_d: bool,
+    vram: &[u8],
+) -> u8 {
+    let (cell_x, cell_y) = (sx / 8, sy / 8);
+    let (tx, ty) = (sx % 8, sy % 8);
+    let units_per_tile = if eight_bpp { 2 } else { 1 };
+    let tile_units = if one_d {
+        // 1D: los tiles del sprite van consecutivos (ancho/8 por fila).
+        tile_base + (cell_y * (width / 8) + cell_x) * units_per_tile
+    } else {
+        // 2D: rejilla fija de 32 unidades de tile por fila en la VRAM de OBJ.
+        tile_base + cell_y * 32 + cell_x * units_per_tile
+    };
+    let tile_addr = OBJ_TILE_VRAM_BASE + tile_units * OBJ_TILE_UNIT_BYTES;
+    if eight_bpp {
+        read_at(vram, tile_addr + ty * 8 + tx)
+    } else {
+        let byte = read_at(vram, tile_addr + ty * 4 + tx / 2);
+        if tx & 1 == 0 { byte & 0x0F } else { byte >> 4 }
+    }
+}
+
+/// Dimensiones en píxeles (ancho, alto) de un sprite a partir de su **forma**
+/// (`attr0` bits 14-15) y **tamaño** (`attr1` bits 14-15), según la tabla de GBATEK.
+fn obj_size(shape: u16, size: u16) -> (usize, usize) {
+    match (shape, size) {
+        (0, 0) => (8, 8),
+        (0, 1) => (16, 16),
+        (0, 2) => (32, 32),
+        (0, 3) => (64, 64),
+        (1, 0) => (16, 8),
+        (1, 1) => (32, 8),
+        (1, 2) => (32, 16),
+        (1, 3) => (64, 32),
+        (2, 0) => (8, 16),
+        (2, 1) => (8, 32),
+        (2, 2) => (16, 32),
+        (2, 3) => (32, 64),
+        // Forma 3 (prohibida): sin tamaño definido; tratamos como el mínimo.
+        _ => (8, 8),
+    }
+}
+
+/// Lee un valor de 16 bits *little-endian* de un buffer (OAM) sin panicar.
+#[inline]
+fn read_u16_at(buf: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes([read_at(buf, off), read_at(buf, off + 1)])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bus::{PRAM_SIZE, VRAM_SIZE};
+    use crate::bus::{OAM_SIZE, PRAM_SIZE, VRAM_SIZE};
 
     /// Comprueba que **todas** las líneas visibles del framebuffer son el color RGBA
     /// dado (helper para los tests de relleno).
@@ -817,7 +1058,7 @@ mod tests {
         let off = SCREEN_WIDTH * 2;
         vram[off..off + 2].copy_from_slice(&0x001Fu16.to_le_bytes());
 
-        ppu.render_scanline(1, &vram, &pram);
+        ppu.render_scanline(1, &vram, &pram, &[]);
 
         assert_eq!(pixel(&ppu, 0, 1), [0xFF, 0x00, 0x00, 0xFF], "fila 1 renderizada");
         // La fila 0 no se tocó: sigue como el framebuffer recién creado (ceros).
@@ -834,7 +1075,7 @@ mod tests {
         let last = (SCREEN_WIDTH * SCREEN_HEIGHT - 1) * 2;
         vram[last..last + 2].copy_from_slice(&0x7C00u16.to_le_bytes()); // último azul
 
-        ppu.render_frame(&vram, &pram);
+        ppu.render_frame(&vram, &pram, &[]);
 
         assert_eq!(pixel(&ppu, 0, 0), [0xFF, 0x00, 0x00, 0xFF]);
         assert_eq!(pixel(&ppu, SCREEN_WIDTH - 1, SCREEN_HEIGHT - 1), [0x00, 0x00, 0xFF, 0xFF]);
@@ -847,7 +1088,7 @@ mod tests {
         let mut vram = vec![0u8; VRAM_SIZE];
         vram[0..2].copy_from_slice(&0x001Fu16.to_le_bytes()); // rojo (debe ignorarse)
         let pram = vec![0u8; PRAM_SIZE];
-        ppu.render_scanline(0, &vram, &pram);
+        ppu.render_scanline(0, &vram, &pram, &[]);
         assert_eq!(pixel(&ppu, 0, 0), WHITE, "el forced blank ignora la VRAM");
     }
 
@@ -858,7 +1099,7 @@ mod tests {
         let vram = vec![0u8; VRAM_SIZE];
         let mut pram = vec![0u8; PRAM_SIZE];
         pram[0..2].copy_from_slice(&0x03E0u16.to_le_bytes()); // backdrop verde
-        ppu.render_frame(&vram, &pram);
+        ppu.render_frame(&vram, &pram, &[]);
         assert!(all_rows_are(&ppu, [0x00, 0xFF, 0x00, 0xFF]), "todo el backdrop verde");
     }
 
@@ -928,7 +1169,7 @@ mod tests {
         poner_color_pram(&mut pram, 0, 0x7C00); // backdrop azul
         poner_color_pram(&mut pram, 1, 0x001F); // paleta 1 = rojo
 
-        ppu.render_scanline(0, &vram, &pram);
+        ppu.render_scanline(0, &vram, &pram, &[]);
 
         // Los 8 píxeles del tile 1 son rojos.
         assert_eq!(pixel(&ppu, 0, 0), [0xFF, 0x00, 0x00, 0xFF], "píxel del tile 1");
@@ -953,7 +1194,7 @@ mod tests {
         poner_color_pram(&mut pram, 0, 0x7C00); // backdrop
         poner_color_pram(&mut pram, 1, 0x001F); // rojo
 
-        ppu.render_scanline(0, &vram, &pram);
+        ppu.render_scanline(0, &vram, &pram, &[]);
 
         // Con hofs=8, el tile de la celda (1,0) se ve ya en x=0.
         assert_eq!(pixel(&ppu, 0, 0), [0xFF, 0x00, 0x00, 0xFF], "scroll trae el tile (1,0) a x=0");
@@ -983,7 +1224,7 @@ mod tests {
         poner_color_pram(&mut pram, 1, 0x001F); // rojo (BG0)
         poner_color_pram(&mut pram, 2, 0x03E0); // verde (BG1)
 
-        ppu.render_scanline(0, &vram, &pram);
+        ppu.render_scanline(0, &vram, &pram, &[]);
 
         // BG1 tiene prioridad 0 (delante de BG0, prioridad 1) → se ve verde.
         assert_eq!(pixel(&ppu, 0, 0), [0x00, 0xFF, 0x00, 0xFF], "gana la menor prioridad (BG1)");
@@ -1005,7 +1246,7 @@ mod tests {
         poner_color_pram(&mut pram, 0, 0x7C00); // backdrop azul
         poner_color_pram(&mut pram, 1, 0x001F); // rojo
 
-        ppu.render_scanline(0, &vram, &pram);
+        ppu.render_scanline(0, &vram, &pram, &[]);
 
         // Sin volteo el píxel rojo estaría en x=0; con volteo horizontal pasa a x=7.
         assert_eq!(pixel(&ppu, 0, 0), [0x00, 0x00, 0xFF, 0xFF], "x=0 ya no es el píxel del tile");
@@ -1029,7 +1270,7 @@ mod tests {
         poner_color_pram(&mut pram, 0, 0x0000);
         poner_color_pram(&mut pram, 5, 0x001F); // índice 5 = rojo
 
-        ppu.render_scanline(0, &vram, &pram);
+        ppu.render_scanline(0, &vram, &pram, &[]);
 
         assert_eq!(pixel(&ppu, 0, 0), [0xFF, 0x00, 0x00, 0xFF], "8 bpp resuelve por índice directo");
     }
@@ -1053,5 +1294,240 @@ mod tests {
         assert!(!ppu.can_wake(&irq), "sin IE no puede despertar");
         irq.write_u8(0x200, Interrupt::VBlank.bit() as u8); // IE = V-Blank
         assert!(ppu.can_wake(&irq), "con ambos enables, sí");
+    }
+
+    // ---- Sprites / OAM (Mini-Hito 2.4d) -------------------------------------
+
+    /// Una OAM con los **128 sprites deshabilitados** (bit 9 de `attr0`). Es el punto
+    /// de partida de los tests: una OAM a ceros sería en realidad 128 sprites válidos
+    /// de 8×8 apilados en el origen (los juegos reales también desactivan los que no
+    /// usan o los sacan de pantalla).
+    fn oam_vacia() -> Vec<u8> {
+        let mut oam = vec![0u8; OAM_SIZE];
+        for i in 0..OAM_ENTRIES {
+            oam[i * 8..i * 8 + 2].copy_from_slice(&OBJ_ATTR0_DISABLE.to_le_bytes());
+        }
+        oam
+    }
+
+    /// Escribe los tres atributos de un sprite en la OAM (el 4º hueco de cada entrada
+    /// es parámetro afín, que este hito no usa).
+    fn poner_sprite(oam: &mut [u8], i: usize, attr0: u16, attr1: u16, attr2: u16) {
+        let base = i * 8;
+        oam[base..base + 2].copy_from_slice(&attr0.to_le_bytes());
+        oam[base + 2..base + 4].copy_from_slice(&attr1.to_le_bytes());
+        oam[base + 4..base + 6].copy_from_slice(&attr2.to_le_bytes());
+    }
+
+    /// Programa un color en la entrada `i` de la **paleta de sprites** (PRAM `0x200`+).
+    fn poner_color_obj_pram(pram: &mut [u8], i: usize, color: u16) {
+        let off = OBJ_PALETTE_BYTE_BASE + i * 2;
+        pram[off..off + 2].copy_from_slice(&color.to_le_bytes());
+    }
+
+    /// DISPCNT con un modo, y opcionalmente OBJ habilitado y mapeo 1D.
+    fn dispcnt(ppu: &mut Ppu, mode: u8, obj_enable: bool, one_d: bool) {
+        let mut v = mode as u16;
+        if obj_enable {
+            v |= DISPCNT_OBJ_ENABLE;
+        }
+        if one_d {
+            v |= DISPCNT_OBJ_1D;
+        }
+        ppu.write_u8(0x000, v as u8);
+        ppu.write_u8(0x001, (v >> 8) as u8);
+    }
+
+    #[test]
+    fn un_sprite_se_dibuja_sobre_el_backdrop() {
+        let mut ppu = Ppu::new();
+        dispcnt(&mut ppu, 0, true, true); // modo 0, OBJ on, 1D
+
+        let mut vram = vec![0u8; VRAM_SIZE];
+        let mut pram = vec![0u8; PRAM_SIZE];
+        let mut oam = oam_vacia();
+
+        // Tile 0 de OBJ (en 0x10000), fila 0 toda al índice 1.
+        poner_fila0_tile_4bpp(&mut vram, OBJ_TILE_VRAM_BASE, 0, 1);
+        poner_color_pram(&mut pram, 0, 0x7C00); // backdrop azul
+        poner_color_obj_pram(&mut pram, 1, 0x001F); // paleta OBJ índice 1 = rojo
+        // Sprite 0: 8×8 (forma 0/tamaño 0), X=0 Y=0, tile 0, prioridad 0.
+        poner_sprite(&mut oam, 0, 0x0000, 0x0000, 0x0000);
+
+        ppu.render_scanline(0, &vram, &pram, &oam);
+
+        assert_eq!(pixel(&ppu, 0, 0), [0xFF, 0x00, 0x00, 0xFF], "sprite rojo en x=0");
+        assert_eq!(pixel(&ppu, 7, 0), [0xFF, 0x00, 0x00, 0xFF], "el sprite cubre 8 px");
+        assert_eq!(pixel(&ppu, 8, 0), [0x00, 0x00, 0xFF, 0xFF], "fuera del sprite → backdrop");
+    }
+
+    #[test]
+    fn el_sprite_respeta_su_posicion_x_e_y() {
+        let mut ppu = Ppu::new();
+        dispcnt(&mut ppu, 0, true, true);
+
+        let mut vram = vec![0u8; VRAM_SIZE];
+        let mut pram = vec![0u8; PRAM_SIZE];
+        let mut oam = oam_vacia();
+        poner_fila0_tile_4bpp(&mut vram, OBJ_TILE_VRAM_BASE, 0, 1);
+        poner_color_obj_pram(&mut pram, 1, 0x001F); // rojo
+        // Sprite en X=100, Y=50.
+        poner_sprite(&mut oam, 0, 50, 100, 0x0000);
+
+        // La fila 0 del sprite cae en la scanline 50; el píxel 0 del sprite en x=100.
+        ppu.render_scanline(50, &vram, &pram, &oam);
+        assert_eq!(pixel(&ppu, 100, 50), [0xFF, 0x00, 0x00, 0xFF], "esquina del sprite");
+        assert_eq!(pixel(&ppu, 99, 50), [0x00, 0x00, 0x00, 0xFF], "justo a la izquierda, nada");
+        // Otra scanline distinta no toca el sprite (solo su fila 0 tiene datos).
+        ppu.render_scanline(49, &vram, &pram, &oam);
+        assert_eq!(pixel(&ppu, 100, 49), [0x00, 0x00, 0x00, 0xFF], "la línea de arriba, nada");
+    }
+
+    #[test]
+    fn la_prioridad_decide_entre_sprite_y_fondo() {
+        // BG0 y un sprite caen en el mismo píxel; gana el de menor prioridad.
+        let prep = || {
+            let mut ppu = Ppu::new();
+            // Modo 0, BG0 (bit 8) + OBJ (bit 12) + 1D (bit 6).
+            ppu.write_u8(0x000, DISPCNT_OBJ_1D as u8);
+            ppu.write_u8(0x001, ((DISPCNT_BG0_ENABLE | DISPCNT_OBJ_ENABLE) >> 8) as u8);
+            ppu.write_u8(0x009, 0x08); // BG0CNT: screen base block 8
+
+            let mut vram = vec![0u8; VRAM_SIZE];
+            let mut pram = vec![0u8; PRAM_SIZE];
+            let mut oam = oam_vacia();
+            // Fondo: tile 1 (índice 1 = verde) en la celda (0,0).
+            poner_fila0_tile_4bpp(&mut vram, 0, 1, 1);
+            vram[0x4000..0x4002].copy_from_slice(&0x0001u16.to_le_bytes());
+            poner_color_pram(&mut pram, 1, 0x03E0); // BG: verde
+            // Sprite: tile 0 (índice 1 = rojo) en (0,0).
+            poner_fila0_tile_4bpp(&mut vram, OBJ_TILE_VRAM_BASE, 0, 1);
+            poner_color_obj_pram(&mut pram, 1, 0x001F); // OBJ: rojo
+            poner_sprite(&mut oam, 0, 0x0000, 0x0000, 0x0000);
+            (ppu, vram, pram, oam)
+        };
+
+        // Sprite prioridad 0, BG0 prioridad 1 → gana el sprite (rojo).
+        let (mut ppu, vram, pram, mut oam) = prep();
+        ppu.write_u8(0x008, 0x01); // BG0CNT prioridad 1
+        poner_sprite(&mut oam, 0, 0x0000, 0x0000, 0x0000); // OBJ prioridad 0
+        ppu.render_scanline(0, &vram, &pram, &oam);
+        assert_eq!(pixel(&ppu, 0, 0), [0xFF, 0x00, 0x00, 0xFF], "sprite (prio 0) delante del BG (prio 1)");
+
+        // Sprite prioridad 2, BG0 prioridad 0 → gana el fondo (verde).
+        let (mut ppu, vram, pram, mut oam) = prep();
+        ppu.write_u8(0x008, 0x00); // BG0CNT prioridad 0
+        poner_sprite(&mut oam, 0, 0x0000, 0x0000, 2 << OBJ_ATTR2_PRIORITY_SHIFT); // OBJ prioridad 2
+        ppu.render_scanline(0, &vram, &pram, &oam);
+        assert_eq!(pixel(&ppu, 0, 0), [0x00, 0xFF, 0x00, 0xFF], "BG (prio 0) delante del sprite (prio 2)");
+    }
+
+    #[test]
+    fn el_volteo_horizontal_de_un_sprite_se_aplica() {
+        let mut ppu = Ppu::new();
+        dispcnt(&mut ppu, 0, true, true);
+
+        let mut vram = vec![0u8; VRAM_SIZE];
+        let mut pram = vec![0u8; PRAM_SIZE];
+        let mut oam = oam_vacia();
+        // Tile 0, fila 0: solo el píxel 0 (nibble bajo del primer byte) al índice 1.
+        vram[OBJ_TILE_VRAM_BASE] = 0x01;
+        poner_color_obj_pram(&mut pram, 1, 0x001F); // rojo
+        // Sprite 8×8 en (0,0) con volteo horizontal (attr1 bit 12).
+        poner_sprite(&mut oam, 0, 0x0000, OBJ_ATTR1_HFLIP, 0x0000);
+
+        ppu.render_scanline(0, &vram, &pram, &oam);
+
+        assert_eq!(pixel(&ppu, 0, 0), [0x00, 0x00, 0x00, 0xFF], "x=0 ya no es el píxel del sprite");
+        assert_eq!(pixel(&ppu, 7, 0), [0xFF, 0x00, 0x00, 0xFF], "el píxel se volteó a x=7");
+    }
+
+    #[test]
+    fn un_sprite_8bpp_usa_la_paleta_directa() {
+        let mut ppu = Ppu::new();
+        dispcnt(&mut ppu, 0, true, true);
+
+        let mut vram = vec![0u8; VRAM_SIZE];
+        let mut pram = vec![0u8; PRAM_SIZE];
+        let mut oam = oam_vacia();
+        // 8 bpp: un byte por píxel. Tile 0, px0 = índice 5.
+        vram[OBJ_TILE_VRAM_BASE] = 5;
+        poner_color_obj_pram(&mut pram, 5, 0x001F); // índice 5 = rojo
+        // Sprite 8×8, 8 bpp (attr0 bit 13), en (0,0).
+        poner_sprite(&mut oam, 0, OBJ_ATTR0_8BPP, 0x0000, 0x0000);
+
+        ppu.render_scanline(0, &vram, &pram, &oam);
+        assert_eq!(pixel(&ppu, 0, 0), [0xFF, 0x00, 0x00, 0xFF], "8 bpp resuelve por índice directo");
+    }
+
+    #[test]
+    fn un_sprite_deshabilitado_o_con_obj_off_no_se_dibuja() {
+        let mut vram = vec![0u8; VRAM_SIZE];
+        let mut pram = vec![0u8; PRAM_SIZE];
+        let mut oam = oam_vacia();
+        poner_fila0_tile_4bpp(&mut vram, OBJ_TILE_VRAM_BASE, 0, 1);
+        poner_color_pram(&mut pram, 0, 0x7C00); // backdrop azul
+        poner_color_obj_pram(&mut pram, 1, 0x001F); // rojo
+
+        // (a) OBJ deshabilitado en DISPCNT: no se compone la capa de sprites.
+        let mut ppu = Ppu::new();
+        dispcnt(&mut ppu, 0, false, true);
+        poner_sprite(&mut oam, 0, 0x0000, 0x0000, 0x0000);
+        ppu.render_scanline(0, &vram, &pram, &oam);
+        assert_eq!(pixel(&ppu, 0, 0), [0x00, 0x00, 0xFF, 0xFF], "OBJ off → solo backdrop");
+
+        // (b) OBJ on, pero el sprite marcado como deshabilitado (attr0 bit 9).
+        let mut ppu = Ppu::new();
+        dispcnt(&mut ppu, 0, true, true);
+        poner_sprite(&mut oam, 0, OBJ_ATTR0_DISABLE, 0x0000, 0x0000);
+        ppu.render_scanline(0, &vram, &pram, &oam);
+        assert_eq!(pixel(&ppu, 0, 0), [0x00, 0x00, 0xFF, 0xFF], "sprite disable → solo backdrop");
+    }
+
+    #[test]
+    fn un_sprite_afin_se_omite_por_ahora() {
+        // Los sprites afines (attr0 bit 8) son del 2.4f: de momento no se dibujan.
+        let mut ppu = Ppu::new();
+        dispcnt(&mut ppu, 0, true, true);
+        let mut vram = vec![0u8; VRAM_SIZE];
+        let mut pram = vec![0u8; PRAM_SIZE];
+        let mut oam = oam_vacia();
+        poner_fila0_tile_4bpp(&mut vram, OBJ_TILE_VRAM_BASE, 0, 1);
+        poner_color_pram(&mut pram, 0, 0x7C00); // backdrop azul
+        poner_color_obj_pram(&mut pram, 1, 0x001F);
+        poner_sprite(&mut oam, 0, OBJ_ATTR0_AFFINE, 0x0000, 0x0000);
+        ppu.render_scanline(0, &vram, &pram, &oam);
+        assert_eq!(pixel(&ppu, 0, 0), [0x00, 0x00, 0xFF, 0xFF], "afín omitido → backdrop");
+    }
+
+    #[test]
+    fn obj_size_cubre_las_formas_y_tamanos() {
+        assert_eq!(obj_size(0, 0), (8, 8)); // cuadrado mínimo
+        assert_eq!(obj_size(0, 3), (64, 64)); // cuadrado máximo
+        assert_eq!(obj_size(1, 0), (16, 8)); // horizontal
+        assert_eq!(obj_size(1, 3), (64, 32));
+        assert_eq!(obj_size(2, 0), (8, 16)); // vertical
+        assert_eq!(obj_size(2, 3), (32, 64));
+    }
+
+    #[test]
+    fn el_menor_indice_de_oam_queda_delante() {
+        // Dos sprites en el mismo píxel con la misma prioridad: gana el de índice OAM
+        // menor (sprite 0 sobre sprite 1).
+        let mut ppu = Ppu::new();
+        dispcnt(&mut ppu, 0, true, true);
+        let mut vram = vec![0u8; VRAM_SIZE];
+        let mut pram = vec![0u8; PRAM_SIZE];
+        let mut oam = oam_vacia();
+        // Tile 0 → índice 1 (rojo); tile 1 → índice 1 pero banco de paleta 1 (verde).
+        poner_fila0_tile_4bpp(&mut vram, OBJ_TILE_VRAM_BASE, 0, 1);
+        poner_fila0_tile_4bpp(&mut vram, OBJ_TILE_VRAM_BASE, 1, 1);
+        poner_color_obj_pram(&mut pram, 1, 0x001F); // banco 0, índice 1 = rojo
+        poner_color_obj_pram(&mut pram, 16 + 1, 0x03E0); // banco 1, índice 1 = verde
+        // Sprite 1 (verde, banco 1) y sprite 0 (rojo, banco 0), ambos en (0,0).
+        poner_sprite(&mut oam, 1, 0x0000, 0x0000, 0x0001 | (1 << OBJ_ATTR2_PALBANK_SHIFT));
+        poner_sprite(&mut oam, 0, 0x0000, 0x0000, 0x0000);
+        ppu.render_scanline(0, &vram, &pram, &oam);
+        assert_eq!(pixel(&ppu, 0, 0), [0xFF, 0x00, 0x00, 0xFF], "el sprite 0 (rojo) tapa al 1");
     }
 }

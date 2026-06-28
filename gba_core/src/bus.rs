@@ -565,7 +565,7 @@ impl Bus {
         self.ppu.enter_hblank(&mut self.irq);
         // El render y el DMA de H-Blank solo ocurren en las líneas visibles.
         if (line as usize) < SCREEN_HEIGHT {
-            self.ppu.render_scanline(line, &self.vram, &self.pram);
+            self.ppu.render_scanline(line, &self.vram, &self.pram, &self.oam);
             self.run_dma_for_timing(DMA_TIMING_HBLANK);
         }
         let next = at + HBLANK_CYCLES;
@@ -613,7 +613,7 @@ impl Bus {
     /// ejecución, en cambio, la imagen se compone **scanline a scanline** en los
     /// eventos del [`Scheduler`] (ver [`Bus::sync_to_cycle`]).
     pub fn render_frame(&mut self) {
-        self.ppu.render_frame(&self.vram, &self.pram);
+        self.ppu.render_frame(&self.vram, &self.pram, &self.oam);
     }
 
     /// El framebuffer RGBA ya compuesto por la PPU (la salida visual del núcleo). Lo
@@ -1103,6 +1103,37 @@ mod tests {
 
         assert_eq!(fb_pixel(&bus, 0, 0), [0xFF, 0x00, 0x00, 0xFF], "tile 1 → rojo en (0,0)");
         assert_eq!(fb_pixel(&bus, 8, 0), [0x00, 0x00, 0xFF, 0xFF], "celda vacía → backdrop azul");
+    }
+
+    #[test]
+    fn render_frame_dibuja_un_sprite_modo0() {
+        // End-to-end por el bus (Mini-Hito 2.4d): programar un sprite en la OAM, su
+        // tile en la VRAM de OBJ (0x0601_0000) y su paleta (PRAM 0x200), y comprobar
+        // que el barrido lo compone sobre el backdrop.
+        let mut bus = Bus::new(Vec::new());
+        // DISPCNT = modo 0 + OBJ habilitado (bit 12) + mapeo 1D (bit 6).
+        bus.write_u16(IO_START, (1 << 12) | (1 << 6));
+        // Deshabilitar los 128 sprites (bit 9 de attr0): una OAM a ceros serían 128
+        // sprites válidos de 8×8 apilados en el origen.
+        for i in 0..128u32 {
+            bus.write_u16(OAM_START + i * 8, 1 << 9);
+        }
+        // Tile 0 de OBJ (VRAM 0x10000): fila 0 toda al índice 1 (4 bpp = 0x11 ×4).
+        for b in 0..4 {
+            bus.write_u8(VRAM_START + 0x10000 + b, 0x11);
+        }
+        // Paleta de sprites (PRAM 0x200): índice 1 = rojo.
+        bus.write_u16(PRAM_START + 0x200 + 2, 0x001F);
+        // Sprite 0: 8×8, X=20 Y=10, tile 0, prioridad 0 (regular, habilitado).
+        bus.write_u16(OAM_START, 10); // attr0: Y=10
+        bus.write_u16(OAM_START + 2, 20); // attr1: X=20
+        bus.write_u16(OAM_START + 4, 0); // attr2: tile 0
+
+        bus.render_frame();
+
+        assert_eq!(fb_pixel(&bus, 20, 10), [0xFF, 0x00, 0x00, 0xFF], "esquina del sprite en (20,10)");
+        assert_eq!(fb_pixel(&bus, 27, 10), [0xFF, 0x00, 0x00, 0xFF], "el sprite abarca 8 px");
+        assert_eq!(fb_pixel(&bus, 28, 10), [0x00, 0x00, 0x00, 0xFF], "fuera del sprite → backdrop");
     }
 
     // ---- PPU: barrido por scanlines (Mini-Hito 2.4b) --------------------
