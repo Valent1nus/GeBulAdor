@@ -1,6 +1,6 @@
 //! La **PPU** (Picture Processing Unit): el subsistema gráfico de la GBA.
-//! Mini-Hitos **2.4a–2.4d** (bitmap modo 3 → barrido por scanlines → fondos de tiles
-//! → sprites/OAM).
+//! Mini-Hitos **2.4a–2.4e** (bitmap modo 3 → barrido por scanlines → fondos de tiles
+//! → sprites/OAM → modos bitmap 4 y 5 con doble buffer).
 //!
 //! ## De "frame de una vez" a "línea a línea"
 //!
@@ -56,13 +56,13 @@
 //!
 //! ## Qué queda para los siguientes hitos
 //!
-//! Tras 2.4d esta PPU dibuja los **fondos de texto** de los modos 0 y 1 (BG0–3 /
-//! BG0–1), el **modo 3** bitmap y la capa de **sprites** (OAM, regulares), todo por
-//! scanlines y compuesto por prioridad. Quedan: los fondos **afines** (modo 2 entero
-//! y el BG2 del modo 1) **y los sprites afines** para el 2.4f, los **modos bitmap
-//! 4/5** para el 2.4e y los efectos (ventanas, blending, mosaico) para 2.4g–2.4h. El
-//! resto de bits de `DISPCNT`/`BGxCNT` no usados aquí (p. ej. *mosaic*) se almacenan
-//! sin efecto.
+//! Tras 2.4e esta PPU dibuja los **fondos de texto** de los modos 0 y 1 (BG0–3 /
+//! BG0–1), los **modos bitmap** 3 (16bpp directo), 4 (8bpp paletado con doble buffer)
+//! y 5 (16bpp 160×128 con doble buffer), y la capa de **sprites** (OAM, regulares),
+//! todo por scanlines y compuesto por prioridad. Quedan: los fondos **afines** (modo
+//! 2 entero y el BG2 del modo 1) **y los sprites afines** para el 2.4f y los efectos
+//! (ventanas, blending, mosaico) para 2.4g–2.4h. El resto de bits de
+//! `DISPCNT`/`BGxCNT` no usados aquí (p. ej. *mosaic*) se almacenan sin efecto.
 
 use crate::interrupt::{Interrupt, InterruptControl};
 use crate::{BYTES_PER_PIXEL, FRAMEBUFFER_SIZE, SCREEN_HEIGHT, SCREEN_WIDTH};
@@ -87,6 +87,10 @@ const BG_REGS_END: u32 = 0x020;
 
 /// Máscara del **modo de vídeo** en `DISPCNT` (bits 0-2).
 const BG_MODE_MASK: u16 = 0b111;
+/// Bit de **selección de frame** en `DISPCNT` (bit 4): en los modos bitmap con doble
+/// buffer (4 y 5), elige qué *frame* se muestra — 0 = frame 0 (VRAM `0x0600_0000`),
+/// 1 = frame 1 (`0x0600_A000`). Los modos 0–3 lo ignoran.
+const DISPCNT_FRAME_SELECT: u16 = 1 << 4;
 /// Bit de ***forced blank*** en `DISPCNT` (bit 7): pantalla en blanco.
 const FORCED_BLANK: u16 = 1 << 7;
 /// Bit del *enable* del fondo 0 en `DISPCNT` (bit 8). Los fondos BG0–BG3 ocupan los
@@ -132,6 +136,18 @@ const SCREEN_BLOCK_BYTES: usize = 0x800;
 const TILE_BYTES_4BPP: usize = 32;
 /// Bytes de un tile en 8 bpp (8×8 píxeles, un byte cada uno): 64.
 const TILE_BYTES_8BPP: usize = 64;
+
+// ---- Modos bitmap con doble buffer (Mini-Hito 2.4e) -------------------------
+
+/// Tamaño en bytes de **un** *frame* de los modos bitmap con doble buffer (4 y 5):
+/// 0xA000 (40 KiB). El frame 1 empieza en la VRAM a este offset (`0x0600_A000`).
+const FRAME_BYTES: usize = 0xA000;
+/// Ancho en píxeles del bitmap **reducido** del modo 5 (el resto de la pantalla, hasta
+/// los 240 px, queda fuera de la imagen).
+const MODE5_WIDTH: usize = 160;
+/// Alto en píxeles del bitmap **reducido** del modo 5 (las líneas 128–159 quedan
+/// fuera de la imagen).
+const MODE5_HEIGHT: usize = 128;
 
 // ---- Sprites / OAM (Mini-Hito 2.4d) ----
 
@@ -410,9 +426,10 @@ impl Ppu {
     /// pinta nada (las líneas de V-Blank no tienen píxeles).
     ///
     /// El orden de decisión reproduce el del hardware: *forced blank* → línea blanca;
-    /// modos de **tiles** 0/1 (2.4c) → composición de fondos por prioridad; modo 3 →
-    /// bitmap directo 16bpp de la VRAM; cualquier otro modo (aún sin implementar) → el
-    /// *backdrop* (`PRAM[0]`).
+    /// modos de **tiles** 0/1 (2.4c) → composición de fondos por prioridad; modos
+    /// **bitmap** 3 (16bpp directo), 4 (8bpp paletado con doble buffer) y 5 (16bpp
+    /// 160×128 con doble buffer, 2.4e) → el bitmap como BG2; cualquier otro modo (el 2
+    /// afín, aún sin implementar) → el *backdrop* (`PRAM[0]`).
     ///
     /// > Los fondos **afines** (modo 2 entero, y el BG2 del modo 1) son del Mini-Hito
     /// > 2.4f; aquí solo se dibujan los fondos de **texto** (modo 0: BG0–3; modo 1:
@@ -450,6 +467,8 @@ impl Ppu {
                 render_tiled_row(row, y, mode, dispcnt, &bgcnt, &bghofs, &bgvofs, &objs, vram, pram)
             }
             3 => render_bitmap3_row(row, y, &bgcnt, &objs, vram, pram),
+            4 => render_bitmap4_row(row, y, dispcnt, &bgcnt, &objs, vram, pram),
+            5 => render_bitmap5_row(row, y, dispcnt, &bgcnt, &objs, vram, pram),
             _ => render_backdrop_row(row, &objs, pram),
         }
     }
@@ -627,6 +646,68 @@ fn render_bitmap3_row(
         let off = row_base + x * 2;
         let color = u16::from_le_bytes([read_at(vram, off), read_at(vram, off + 1)]);
         out.copy_from_slice(&compose_pixel(Some((color, bg_priority)), objs[x], pram));
+    }
+}
+
+/// Compone una scanline del **modo 4** (bitmap paletado de 8 bpp con doble buffer,
+/// Mini-Hito 2.4e). Cada píxel de la VRAM es **un byte** = índice en la paleta de
+/// fondo (`PRAM`); el índice **0 es transparente** (deja ver sprites/*backdrop*),
+/// igual que un tile. El bit de *frame select* de `DISPCNT` elige cuál de los dos
+/// *frames* (offset 0 o `0xA000`) se muestra. El bitmap actúa como BG2, con la
+/// prioridad de `BG2CNT`.
+fn render_bitmap4_row(
+    row: &mut [u8],
+    y: usize,
+    dispcnt: u16,
+    bgcnt: &[u16; 4],
+    objs: &[ObjPixel; SCREEN_WIDTH],
+    vram: &[u8],
+    pram: &[u8],
+) {
+    let bg_priority = (bgcnt[2] & BGCNT_PRIORITY_MASK) as u8;
+    let frame_base = if dispcnt & DISPCNT_FRAME_SELECT != 0 { FRAME_BYTES } else { 0 };
+    let row_base = frame_base + y * SCREEN_WIDTH;
+    for (x, out) in row.chunks_exact_mut(BYTES_PER_PIXEL).enumerate() {
+        let index = read_at(vram, row_base + x) as usize;
+        // Índice 0 = transparente: el píxel del fondo no aporta nada (queda el sprite
+        // o el backdrop). Cualquier otro índice lee su color de la paleta de fondo.
+        let bg = if index == 0 {
+            None
+        } else {
+            let off = index * 2;
+            let color = u16::from_le_bytes([read_at(pram, off), read_at(pram, off + 1)]);
+            Some((color, bg_priority))
+        };
+        out.copy_from_slice(&compose_pixel(bg, objs[x], pram));
+    }
+}
+
+/// Compone una scanline del **modo 5** (bitmap directo 16 bpp **reducido** a 160×128
+/// con doble buffer, Mini-Hito 2.4e). Igual que el modo 3 pero con menos resolución:
+/// los píxeles fuera del recuadro 160×128 quedan fuera de la imagen y muestran el
+/// *backdrop*. El bit de *frame select* de `DISPCNT` elige el *frame* (offset 0 o
+/// `0xA000`). El bitmap actúa como BG2, con la prioridad de `BG2CNT`.
+fn render_bitmap5_row(
+    row: &mut [u8],
+    y: usize,
+    dispcnt: u16,
+    bgcnt: &[u16; 4],
+    objs: &[ObjPixel; SCREEN_WIDTH],
+    vram: &[u8],
+    pram: &[u8],
+) {
+    let bg_priority = (bgcnt[2] & BGCNT_PRIORITY_MASK) as u8;
+    let frame_base = if dispcnt & DISPCNT_FRAME_SELECT != 0 { FRAME_BYTES } else { 0 };
+    for (x, out) in row.chunks_exact_mut(BYTES_PER_PIXEL).enumerate() {
+        // Fuera del recuadro 160×128 no hay imagen: solo backdrop (y sprites encima).
+        let bg = if x < MODE5_WIDTH && y < MODE5_HEIGHT {
+            let off = frame_base + (y * MODE5_WIDTH + x) * 2;
+            let color = u16::from_le_bytes([read_at(vram, off), read_at(vram, off + 1)]);
+            Some((color, bg_priority))
+        } else {
+            None
+        };
+        out.copy_from_slice(&compose_pixel(bg, objs[x], pram));
     }
 }
 
@@ -1529,5 +1610,98 @@ mod tests {
         poner_sprite(&mut oam, 0, 0x0000, 0x0000, 0x0000);
         ppu.render_scanline(0, &vram, &pram, &oam);
         assert_eq!(pixel(&ppu, 0, 0), [0xFF, 0x00, 0x00, 0xFF], "el sprite 0 (rojo) tapa al 1");
+    }
+
+    // ---- Modos bitmap 4 y 5 (Mini-Hito 2.4e) --------------------------------
+
+    #[test]
+    fn modo4_resuelve_el_color_por_la_paleta_y_respeta_el_indice_0() {
+        let mut ppu = Ppu::new();
+        ppu.write_u8(0x000, 0x04); // modo 4
+        let mut vram = vec![0u8; VRAM_SIZE];
+        let mut pram = vec![0u8; PRAM_SIZE];
+        // (0,1) → índice 3; (1,1) → índice 0 (transparente).
+        vram[SCREEN_WIDTH] = 3; // y=1, x=0
+        vram[SCREEN_WIDTH + 1] = 0; // y=1, x=1
+        poner_color_pram(&mut pram, 0, 0x7C00); // backdrop azul
+        poner_color_pram(&mut pram, 3, 0x001F); // índice 3 = rojo
+
+        ppu.render_scanline(1, &vram, &pram, &[]);
+
+        assert_eq!(pixel(&ppu, 0, 1), [0xFF, 0x00, 0x00, 0xFF], "índice 3 → rojo");
+        assert_eq!(pixel(&ppu, 1, 1), [0x00, 0x00, 0xFF, 0xFF], "índice 0 → backdrop");
+    }
+
+    #[test]
+    fn modo4_el_frame_select_elige_el_segundo_buffer() {
+        let mut ppu = Ppu::new();
+        ppu.write_u8(0x000, 0x04 | DISPCNT_FRAME_SELECT as u8); // modo 4, frame 1
+        let mut vram = vec![0u8; VRAM_SIZE];
+        let mut pram = vec![0u8; PRAM_SIZE];
+        // El frame 0 (offset 0) tiene índice 2; el frame 1 (offset 0xA000) índice 1.
+        vram[0] = 2;
+        vram[FRAME_BYTES] = 1;
+        poner_color_pram(&mut pram, 1, 0x001F); // rojo
+        poner_color_pram(&mut pram, 2, 0x03E0); // verde
+
+        ppu.render_scanline(0, &vram, &pram, &[]);
+
+        assert_eq!(pixel(&ppu, 0, 0), [0xFF, 0x00, 0x00, 0xFF], "frame 1 → lee el índice del 0xA000");
+    }
+
+    #[test]
+    fn modo5_pinta_16bpp_dentro_del_recuadro_y_backdrop_fuera() {
+        let mut ppu = Ppu::new();
+        ppu.write_u8(0x000, 0x05); // modo 5
+        let mut vram = vec![0u8; VRAM_SIZE];
+        let mut pram = vec![0u8; PRAM_SIZE];
+        poner_color_pram(&mut pram, 0, 0x03E0); // backdrop verde
+        // (0,0) dentro del recuadro 160×128 = rojo directo.
+        vram[0..2].copy_from_slice(&0x001Fu16.to_le_bytes());
+
+        ppu.render_scanline(0, &vram, &pram, &[]);
+
+        assert_eq!(pixel(&ppu, 0, 0), [0xFF, 0x00, 0x00, 0xFF], "dentro del recuadro");
+        // x=160 está fuera del ancho reducido → backdrop.
+        assert_eq!(pixel(&ppu, MODE5_WIDTH, 0), [0x00, 0xFF, 0x00, 0xFF], "fuera del ancho → backdrop");
+        // La línea 128 está fuera del alto reducido → backdrop en toda la fila.
+        ppu.render_scanline(MODE5_HEIGHT as u16, &vram, &pram, &[]);
+        assert_eq!(pixel(&ppu, 0, MODE5_HEIGHT), [0x00, 0xFF, 0x00, 0xFF], "fuera del alto → backdrop");
+    }
+
+    #[test]
+    fn modo5_el_frame_select_elige_el_segundo_buffer() {
+        let mut ppu = Ppu::new();
+        ppu.write_u8(0x000, 0x05 | DISPCNT_FRAME_SELECT as u8); // modo 5, frame 1
+        let mut vram = vec![0u8; VRAM_SIZE];
+        let pram = vec![0u8; PRAM_SIZE];
+        // Frame 0 azul, frame 1 rojo en (0,0); debe verse el del frame 1.
+        vram[0..2].copy_from_slice(&0x7C00u16.to_le_bytes());
+        vram[FRAME_BYTES..FRAME_BYTES + 2].copy_from_slice(&0x001Fu16.to_le_bytes());
+
+        ppu.render_scanline(0, &vram, &pram, &[]);
+
+        assert_eq!(pixel(&ppu, 0, 0), [0xFF, 0x00, 0x00, 0xFF], "frame 1 → rojo del 0xA000");
+    }
+
+    #[test]
+    fn modo4_un_sprite_se_compone_sobre_el_bitmap() {
+        // El bitmap del modo 4 es BG2; un sprite con mejor prioridad se impone.
+        let mut ppu = Ppu::new();
+        dispcnt(&mut ppu, 4, true, true); // modo 4, OBJ on, 1D
+        let mut vram = vec![0u8; VRAM_SIZE];
+        let mut pram = vec![0u8; PRAM_SIZE];
+        let mut oam = oam_vacia();
+        vram[8] = 2; // bitmap (8,0) = índice 2 (justo fuera del sprite 8×8)
+        poner_color_pram(&mut pram, 2, 0x03E0); // bitmap verde
+        poner_fila0_tile_4bpp(&mut vram, OBJ_TILE_VRAM_BASE, 0, 1);
+        poner_color_obj_pram(&mut pram, 1, 0x001F); // sprite rojo
+        poner_sprite(&mut oam, 0, 0x0000, 0x0000, 0x0000); // sprite 8×8 prioridad 0
+
+        ppu.render_scanline(0, &vram, &pram, &oam);
+
+        // El sprite 8×8 cubre x=0..7; el bitmap se ve a partir de x=8.
+        assert_eq!(pixel(&ppu, 0, 0), [0xFF, 0x00, 0x00, 0xFF], "sprite (prio 0) sobre el bitmap");
+        assert_eq!(pixel(&ppu, 8, 0), [0x00, 0xFF, 0x00, 0xFF], "fuera del sprite → bitmap verde");
     }
 }
