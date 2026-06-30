@@ -1,6 +1,7 @@
 //! La **PPU** (Picture Processing Unit): el subsistema gráfico de la GBA.
-//! Mini-Hitos **2.4a–2.4f** (bitmap modo 3 → barrido por scanlines → fondos de tiles
-//! → sprites/OAM → modos bitmap 4 y 5 con doble buffer → fondos y sprites afines).
+//! Mini-Hitos **2.4a–2.4g** (bitmap modo 3 → barrido por scanlines → fondos de tiles
+//! → sprites/OAM → modos bitmap 4 y 5 con doble buffer → fondos y sprites afines →
+//! ventanas WIN0/WIN1/OBJ).
 //!
 //! ## De "frame de una vez" a "línea a línea"
 //!
@@ -60,9 +61,10 @@
 //! afines** (BG2 del modo 1; BG2/BG3 del modo 2), los **modos bitmap** 3 (16bpp
 //! directo), 4 (8bpp paletado con doble buffer) y 5 (16bpp 160×128 con doble buffer),
 //! y la capa de **sprites** (OAM) **regulares y afines** (rotación/escalado), todo por
-//! scanlines y compuesto por prioridad. Quedan los efectos (ventanas, blending,
-//! mosaico) para 2.4g–2.4h. El resto de bits de `DISPCNT`/`BGxCNT` no usados aquí
-//! (p. ej. *mosaic*) se almacenan sin efecto.
+//! scanlines y compuesto por prioridad, con el recorte de las **ventanas** WIN0/WIN1
+//! y la **ventana de objetos** (2.4g) decidiendo qué capas se ven en cada píxel. Quedan
+//! los efectos de color (blending, *fade*) y el *mosaic* para 2.4h. El resto de bits de
+//! `DISPCNT`/`BGxCNT` no usados aquí se almacenan sin efecto.
 
 use crate::interrupt::{Interrupt, InterruptControl};
 use crate::{BYTES_PER_PIXEL, FRAMEBUFFER_SIZE, SCREEN_HEIGHT, SCREEN_WIDTH};
@@ -92,8 +94,35 @@ const BG_REGS_END: u32 = 0x020;
 const AFFINE_REGS_START: u32 = 0x020;
 /// Bytes por fondo afín en el bloque de parámetros (PA..PD + X + Y = 16).
 const AFFINE_REGS_PER_BG: u32 = 0x010;
-/// Primer byte **después** del bloque afín (`0x040`, donde empezarán las ventanas 2.4g).
+/// Primer byte **después** del bloque afín (`0x040`, donde empiezan las ventanas 2.4g).
 const AFFINE_REGS_END: u32 = AFFINE_REGS_START + 2 * AFFINE_REGS_PER_BG;
+
+// ---- Registros de ventanas (Mini-Hito 2.4g) ---------------------------------
+
+/// `WIN0H` (`0x040`): límites horizontales de la ventana 0 — byte alto = X1 (borde
+/// izquierdo), byte bajo = X2 (borde derecho, exclusivo). `WIN1H` en `0x042`.
+const WIN0H_LO: u32 = 0x040;
+/// `WIN0V` (`0x044`): límites verticales de la ventana 0 — byte alto = Y1 (arriba),
+/// byte bajo = Y2 (abajo, exclusivo). `WIN1V` en `0x046`.
+const WIN0V_LO: u32 = 0x044;
+/// `WININ` (`0x048`): control de capas **dentro** de WIN0 (byte bajo) y WIN1 (alto).
+const WININ_LO: u32 = 0x048;
+/// `WINOUT` (`0x04A`): control de capas **fuera** de toda ventana (byte bajo) y dentro
+/// de la **ventana de objetos** (byte alto).
+const WINOUT_LO: u32 = 0x04A;
+/// Primer byte del bloque de registros de ventana (`0x040`).
+const WINDOW_REGS_START: u32 = WIN0H_LO;
+/// Primer byte **después** del bloque de ventanas (`0x04C`).
+const WINDOW_REGS_END: u32 = 0x04C;
+
+/// Máscara de las 6 capas controlables por ventana en `WININ`/`WINOUT`: BG0–3 (bits
+/// 0-3), OBJ (bit 4) y efectos de color (bit 5).
+const WIN_LAYER_MASK: u8 = 0x3F;
+/// Bit de la capa de **sprites** (OBJ) dentro de un control de ventana (bit 4).
+const WIN_OBJ_BIT: u8 = 1 << 4;
+/// Bit de la capa **BG2** dentro de un control de ventana (bit 2): recorta el bitmap
+/// en los modos 3/4/5, donde BG2 es la única capa de fondo.
+const WIN_BG2_BIT: u8 = 1 << 2;
 
 /// Máscara del **modo de vídeo** en `DISPCNT` (bits 0-2).
 const BG_MODE_MASK: u16 = 0b111;
@@ -111,6 +140,12 @@ const DISPCNT_BG0_ENABLE: u16 = 1 << 8;
 const DISPCNT_OBJ_1D: u16 = 1 << 6;
 /// Bit de *enable* de los **sprites** (OBJ) en `DISPCNT` (bit 12): 1 = se dibujan.
 const DISPCNT_OBJ_ENABLE: u16 = 1 << 12;
+/// Bit de *enable* de la **ventana 0** (WIN0) en `DISPCNT` (bit 13, Mini-Hito 2.4g).
+const DISPCNT_WIN0_ENABLE: u16 = 1 << 13;
+/// Bit de *enable* de la **ventana 1** (WIN1) en `DISPCNT` (bit 14).
+const DISPCNT_WIN1_ENABLE: u16 = 1 << 14;
+/// Bit de *enable* de la **ventana de objetos** (OBJ window) en `DISPCNT` (bit 15).
+const DISPCNT_OBJWIN_ENABLE: u16 = 1 << 15;
 
 // Bits de `DISPSTAT`.
 /// *Flag* de V-Blank (bit 0, solo lectura): 1 mientras el barrido está en V-Blank.
@@ -187,6 +222,11 @@ const OBJ_ATTR0_DISABLE: u16 = 1 << 9;
 /// `attr0` bit 9 (en sprites **afines**): **doble tamaño** del recuadro de dibujo
 /// (Mini-Hito 2.4f). El mismo bit es "disable" en los no afines; lo decide el bit 8.
 const OBJ_ATTR0_DOUBLE: u16 = 1 << 9;
+/// `attr0` bits 10-11: **modo** del OBJ — 0 normal, 1 semitransparente (blending,
+/// 2.4h), 2 **ventana de objetos** (define máscara, no se dibuja, 2.4g), 3 prohibido.
+const OBJ_ATTR0_MODE_SHIFT: u16 = 10;
+/// Valor del modo "ventana de objetos" en `attr0` bits 10-11.
+const OBJ_MODE_WINDOW: u16 = 2;
 /// `attr0` bit 13: profundidad de color **8 bpp** (256 colores); si es 0, 4 bpp.
 const OBJ_ATTR0_8BPP: u16 = 1 << 13;
 /// `attr0` bits 14-15: **forma** del sprite (cuadrado / horizontal / vertical).
@@ -271,6 +311,19 @@ pub struct Ppu {
     /// desde el bit 27 al usarlo. De **solo escritura**.
     bgx: [i32; 2],
     bgy: [i32; 2],
+    /// Límites **horizontales** de las ventanas (`WIN0H`/`WIN1H`, `0x0400_0040`+,
+    /// Mini-Hito 2.4g): byte alto = X1 (izquierda), bajo = X2 (derecha, exclusivo).
+    /// Índice 0 = WIN0, 1 = WIN1. De **solo escritura**.
+    winh: [u16; 2],
+    /// Límites **verticales** de las ventanas (`WIN0V`/`WIN1V`): byte alto = Y1, bajo
+    /// = Y2 (exclusivo). De **solo escritura**.
+    winv: [u16; 2],
+    /// Control de capas **dentro** de las ventanas (`WININ`): byte bajo = WIN0, alto =
+    /// WIN1; en cada uno, bits 0-3 BG0–3, bit 4 OBJ, bit 5 efectos.
+    winin: u16,
+    /// Control de capas **fuera** de toda ventana y dentro de la **ventana de objetos**
+    /// (`WINOUT`): byte bajo = fuera, alto = OBJ window.
+    winout: u16,
     /// Framebuffer RGBA del núcleo ([`FRAMEBUFFER_SIZE`] bytes). La PPU lo va
     /// rellenando **scanline a scanline** ([`Ppu::render_scanline`]); el frontend lo
     /// lee a través de [`crate::Bus::framebuffer`].
@@ -294,6 +347,10 @@ impl Ppu {
             bgpd: [0; 2],
             bgx: [0; 2],
             bgy: [0; 2],
+            winh: [0; 2],
+            winv: [0; 2],
+            winin: 0,
+            winout: 0,
             framebuffer: vec![0; FRAMEBUFFER_SIZE],
         }
     }
@@ -306,6 +363,7 @@ impl Ppu {
         (DISPCNT_LO..DISPCNT_LO + 2).contains(&io_off)
             || (DISPSTAT_LO..BG_REGS_END).contains(&io_off)
             || (AFFINE_REGS_START..AFFINE_REGS_END).contains(&io_off)
+            || (WINDOW_REGS_START..WINDOW_REGS_END).contains(&io_off)
     }
 
     /// Lee un byte de un registro de la PPU. Nunca panica: un offset fuera de los
@@ -323,7 +381,13 @@ impl Ppu {
                 let idx = ((n - BG0CNT_LO) / 2) as usize;
                 (self.bgcnt[idx] >> (((n & 1) * 8) as u16)) as u8
             }
-            // BGxHOFS/BGxVOFS (0x010–0x01F): de solo escritura, se leen como 0.
+            // WININ/WINOUT (0x048–0x04B): legibles. WIN0H/V/WIN1H/V son de solo
+            // escritura (se leen como 0), igual que el bloque de scroll/afín.
+            WININ_LO => self.winin as u8,
+            n if n == WININ_LO + 1 => (self.winin >> 8) as u8,
+            WINOUT_LO => self.winout as u8,
+            n if n == WINOUT_LO + 1 => (self.winout >> 8) as u8,
+            // BGxHOFS/BGxVOFS y WIN*H/V (solo escritura) y demás: se leen como 0.
             _ => 0,
         }
     }
@@ -388,6 +452,18 @@ impl Ppu {
                     8..=11 => write_byte_i32(&mut self.bgx[i], local - 8, value),
                     _ => write_byte_i32(&mut self.bgy[i], local - 12, value),
                 }
+            }
+            // Registros de ventana (0x040–0x04B, Mini-Hito 2.4g). WIN0H/WIN1H y
+            // WIN0V/WIN1V son pares contiguos (índice por bit 1); WININ/WINOUT enteros.
+            n if (WIN0H_LO..WIN0V_LO).contains(&n) => {
+                write_byte(&mut self.winh[((n - WIN0H_LO) / 2) as usize], n & 1, value)
+            }
+            n if (WIN0V_LO..WININ_LO).contains(&n) => {
+                write_byte(&mut self.winv[((n - WIN0V_LO) / 2) as usize], n & 1, value)
+            }
+            n if (WININ_LO..WININ_LO + 2).contains(&n) => write_byte(&mut self.winin, n & 1, value),
+            n if (WINOUT_LO..WINDOW_REGS_END).contains(&n) => {
+                write_byte(&mut self.winout, n & 1, value)
             }
             // VCOUNT es de solo lectura.
             _ => {}
@@ -506,13 +582,31 @@ impl Ppu {
         // con `self`): todos son `Copy`.
         let dispcnt = self.dispcnt;
         let bg = self.bg_registers();
+        let win_regs = self.window_registers();
 
         // Capa de **sprites** de esta línea (Mini-Hito 2.4d): un color + prioridad por
         // píxel, o transparente. Es independiente del modo de fondo y se compone luego
         // sobre los fondos según prioridad. Solo se calcula si los OBJ están activos.
+        // De paso se marca la cobertura de la **ventana de objetos** (2.4g): los OBJ en
+        // modo ventana no se dibujan, solo definen su recorte.
         let mut objs = [ObjPixel::TRANSPARENT; SCREEN_WIDTH];
+        let mut obj_window = [false; SCREEN_WIDTH];
         if dispcnt & DISPCNT_OBJ_ENABLE != 0 {
-            render_obj_line(&mut objs, y, dispcnt, oam, vram, pram);
+            render_obj_line(&mut objs, &mut obj_window, y, dispcnt, oam, vram, pram);
+        }
+
+        // Ventanas (Mini-Hito 2.4g): si hay alguna activa, una máscara por píxel dice
+        // qué capas se ven (BG0–3 y OBJ). Sin ventanas, todas las capas son visibles.
+        let computed = compute_window_mask(dispcnt, &win_regs, &obj_window, y);
+        let all_visible = [WIN_LAYER_MASK; SCREEN_WIDTH];
+        let win = computed.as_ref().unwrap_or(&all_visible);
+        if computed.is_some() {
+            // Los sprites que caen en una capa OBJ no permitida desaparecen.
+            for (x, obj) in objs.iter_mut().enumerate() {
+                if win[x] & WIN_OBJ_BIT == 0 {
+                    *obj = ObjPixel::TRANSPARENT;
+                }
+            }
         }
 
         let start = y * SCREEN_WIDTH * BYTES_PER_PIXEL;
@@ -523,10 +617,10 @@ impl Ppu {
             return;
         }
         match (dispcnt & BG_MODE_MASK) as u8 {
-            mode @ 0..=2 => render_tiled_row(row, y, mode, dispcnt, &bg, &objs, vram, pram),
-            3 => render_bitmap3_row(row, y, &bg.cnt, &objs, vram, pram),
-            4 => render_bitmap4_row(row, y, dispcnt, &bg.cnt, &objs, vram, pram),
-            5 => render_bitmap5_row(row, y, dispcnt, &bg.cnt, &objs, vram, pram),
+            mode @ 0..=2 => render_tiled_row(row, y, mode, dispcnt, &bg, win, &objs, vram, pram),
+            3 => render_bitmap3_row(row, y, &bg.cnt, win, &objs, vram, pram),
+            4 => render_bitmap4_row(row, y, dispcnt, &bg.cnt, win, &objs, vram, pram),
+            5 => render_bitmap5_row(row, y, dispcnt, &bg.cnt, win, &objs, vram, pram),
             _ => render_backdrop_row(row, &objs, pram),
         }
     }
@@ -544,6 +638,16 @@ impl Ppu {
             pd: self.bgpd,
             x: self.bgx,
             y: self.bgy,
+        }
+    }
+
+    /// Instantánea (`Copy`) de los registros de ventana para el render de una scanline.
+    fn window_registers(&self) -> WindowRegs {
+        WindowRegs {
+            winh: self.winh,
+            winv: self.winv,
+            winin: self.winin,
+            winout: self.winout,
         }
     }
 
@@ -688,6 +792,73 @@ enum BgKind {
     Affine,
 }
 
+/// Instantánea (`Copy`) de los registros de ventana (Mini-Hito 2.4g).
+#[derive(Clone, Copy)]
+struct WindowRegs {
+    winh: [u16; 2],
+    winv: [u16; 2],
+    winin: u16,
+    winout: u16,
+}
+
+/// Calcula, para la scanline `y`, la **máscara de capas por píxel** que imponen las
+/// ventanas (Mini-Hito 2.4g): por cada `x`, los 6 bits de control (BG0–3, OBJ, efecto)
+/// del control de ventana que le aplica. Devuelve `None` si **no hay ninguna ventana
+/// activa** en `DISPCNT` (caso común: todo visible, sin coste por píxel).
+///
+/// Prioridad de regiones (GBATEK): si el píxel cae dentro de **WIN0** → `WININ` bajo;
+/// si no, dentro de **WIN1** → `WININ` alto; si no, cubierto por la **ventana de
+/// objetos** → `WINOUT` alto; en otro caso → `WINOUT` bajo (fuera de todo).
+fn compute_window_mask(
+    dispcnt: u16,
+    win: &WindowRegs,
+    obj_window: &[bool; SCREEN_WIDTH],
+    y: usize,
+) -> Option<[u8; SCREEN_WIDTH]> {
+    let win0 = dispcnt & DISPCNT_WIN0_ENABLE != 0;
+    let win1 = dispcnt & DISPCNT_WIN1_ENABLE != 0;
+    let objwin = dispcnt & DISPCNT_OBJWIN_ENABLE != 0;
+    if !win0 && !win1 && !objwin {
+        return None;
+    }
+    // Una ventana solo recorta en las líneas dentro de su rango vertical.
+    let row_in0 = win0 && coord_in_window(win.winv[0], y, SCREEN_HEIGHT);
+    let row_in1 = win1 && coord_in_window(win.winv[1], y, SCREEN_HEIGHT);
+
+    // Control de cada región, recortado a las 6 capas válidas.
+    let winin0 = win.winin as u8 & WIN_LAYER_MASK;
+    let winin1 = (win.winin >> 8) as u8 & WIN_LAYER_MASK;
+    let objwin_ctrl = (win.winout >> 8) as u8 & WIN_LAYER_MASK;
+    let outside = win.winout as u8 & WIN_LAYER_MASK;
+
+    let mut mask = [0u8; SCREEN_WIDTH];
+    for (x, m) in mask.iter_mut().enumerate() {
+        *m = if row_in0 && coord_in_window(win.winh[0], x, SCREEN_WIDTH) {
+            winin0
+        } else if row_in1 && coord_in_window(win.winh[1], x, SCREEN_WIDTH) {
+            winin1
+        } else if objwin && obj_window[x] {
+            objwin_ctrl
+        } else {
+            outside
+        };
+    }
+    Some(mask)
+}
+
+/// `true` si la coordenada `p` cae dentro del rango `[inicio, fin)` de un registro de
+/// ventana (`WIN*H`/`WIN*V`: byte alto = inicio, byte bajo = fin exclusivo). Según
+/// GBATEK, un `fin` mayor que el máximo de pantalla, o un `inicio > fin`, se interpreta
+/// como `fin = máximo` (la ventana llega hasta el borde).
+fn coord_in_window(reg: u16, p: usize, max: usize) -> bool {
+    let start = (reg >> 8) as usize;
+    let mut end = (reg & 0xFF) as usize;
+    if end > max || start > end {
+        end = max;
+    }
+    p >= start && p < end
+}
+
 /// Renderiza una scanline `y` en los **modos de tiles** 0, 1 y 2, componiendo los
 /// fondos activos por orden de prioridad sobre el *backdrop*.
 ///
@@ -704,6 +875,7 @@ fn render_tiled_row(
     mode: u8,
     dispcnt: u16,
     bg: &BgRegisters,
+    win: &[u8; SCREEN_WIDTH],
     objs: &[ObjPixel; SCREEN_WIDTH],
     vram: &[u8],
     pram: &[u8],
@@ -739,6 +911,10 @@ fn render_tiled_row(
         // transparente, junto a su prioridad para compararla con el sprite.
         let mut winner = None;
         for &(idx, kind) in order.iter() {
+            // La ventana puede ocultar este fondo en este píxel (Mini-Hito 2.4g).
+            if win[x] & (1 << idx) == 0 {
+                continue;
+            }
             let sample = match kind {
                 BgKind::Text => {
                     sample_text_bg(bg.cnt[idx], bg.hofs[idx], bg.vofs[idx], x, y, vram, pram)
@@ -821,6 +997,7 @@ fn render_bitmap3_row(
     row: &mut [u8],
     y: usize,
     bgcnt: &[u16; 4],
+    win: &[u8; SCREEN_WIDTH],
     objs: &[ObjPixel; SCREEN_WIDTH],
     vram: &[u8],
     pram: &[u8],
@@ -828,9 +1005,15 @@ fn render_bitmap3_row(
     let bg_priority = (bgcnt[2] & BGCNT_PRIORITY_MASK) as u8;
     let row_base = y * SCREEN_WIDTH * 2;
     for (x, out) in row.chunks_exact_mut(BYTES_PER_PIXEL).enumerate() {
-        let off = row_base + x * 2;
-        let color = u16::from_le_bytes([read_at(vram, off), read_at(vram, off + 1)]);
-        out.copy_from_slice(&compose_pixel(Some((color, bg_priority)), objs[x], pram));
+        // El bitmap es BG2: la ventana puede ocultarlo en este píxel (Mini-Hito 2.4g).
+        let bg = if win[x] & WIN_BG2_BIT != 0 {
+            let off = row_base + x * 2;
+            let color = u16::from_le_bytes([read_at(vram, off), read_at(vram, off + 1)]);
+            Some((color, bg_priority))
+        } else {
+            None
+        };
+        out.copy_from_slice(&compose_pixel(bg, objs[x], pram));
     }
 }
 
@@ -840,11 +1023,13 @@ fn render_bitmap3_row(
 /// igual que un tile. El bit de *frame select* de `DISPCNT` elige cuál de los dos
 /// *frames* (offset 0 o `0xA000`) se muestra. El bitmap actúa como BG2, con la
 /// prioridad de `BG2CNT`.
+#[allow(clippy::too_many_arguments)]
 fn render_bitmap4_row(
     row: &mut [u8],
     y: usize,
     dispcnt: u16,
     bgcnt: &[u16; 4],
+    win: &[u8; SCREEN_WIDTH],
     objs: &[ObjPixel; SCREEN_WIDTH],
     vram: &[u8],
     pram: &[u8],
@@ -854,9 +1039,9 @@ fn render_bitmap4_row(
     let row_base = frame_base + y * SCREEN_WIDTH;
     for (x, out) in row.chunks_exact_mut(BYTES_PER_PIXEL).enumerate() {
         let index = read_at(vram, row_base + x) as usize;
-        // Índice 0 = transparente: el píxel del fondo no aporta nada (queda el sprite
-        // o el backdrop). Cualquier otro índice lee su color de la paleta de fondo.
-        let bg = if index == 0 {
+        // BG2 oculto por la ventana, o índice 0 (transparente): el fondo no aporta nada
+        // (queda el sprite o el backdrop). Si no, lee el color de la paleta de fondo.
+        let bg = if win[x] & WIN_BG2_BIT == 0 || index == 0 {
             None
         } else {
             let off = index * 2;
@@ -872,11 +1057,13 @@ fn render_bitmap4_row(
 /// los píxeles fuera del recuadro 160×128 quedan fuera de la imagen y muestran el
 /// *backdrop*. El bit de *frame select* de `DISPCNT` elige el *frame* (offset 0 o
 /// `0xA000`). El bitmap actúa como BG2, con la prioridad de `BG2CNT`.
+#[allow(clippy::too_many_arguments)]
 fn render_bitmap5_row(
     row: &mut [u8],
     y: usize,
     dispcnt: u16,
     bgcnt: &[u16; 4],
+    win: &[u8; SCREEN_WIDTH],
     objs: &[ObjPixel; SCREEN_WIDTH],
     vram: &[u8],
     pram: &[u8],
@@ -884,8 +1071,8 @@ fn render_bitmap5_row(
     let bg_priority = (bgcnt[2] & BGCNT_PRIORITY_MASK) as u8;
     let frame_base = if dispcnt & DISPCNT_FRAME_SELECT != 0 { FRAME_BYTES } else { 0 };
     for (x, out) in row.chunks_exact_mut(BYTES_PER_PIXEL).enumerate() {
-        // Fuera del recuadro 160×128 no hay imagen: solo backdrop (y sprites encima).
-        let bg = if x < MODE5_WIDTH && y < MODE5_HEIGHT {
+        // Fuera del recuadro 160×128, u oculto por la ventana (BG2): solo backdrop/sprites.
+        let bg = if win[x] & WIN_BG2_BIT != 0 && x < MODE5_WIDTH && y < MODE5_HEIGHT {
             let off = frame_base + (y * MODE5_WIDTH + x) * 2;
             let color = u16::from_le_bytes([read_at(vram, off), read_at(vram, off + 1)]);
             Some((color, bg_priority))
@@ -1031,10 +1218,13 @@ impl ObjPixel {
 /// el de **menor índice** manda (se escribe solo si el píxel sigue transparente).
 ///
 /// > Dibuja sprites **regulares** y **afines** (rotación/escalado, `attr0` bit 8,
-/// > Mini-Hito 2.4f). No se modelan aún los modos de OBJ semitransparente / ventana
-/// > (`attr0` bits 10-11) ni el *mosaic*.
+/// > Mini-Hito 2.4f). Los sprites en modo **ventana de objetos** (`attr0` bits 10-11
+/// > = 2, Mini-Hito 2.4g) no se dibujan: sus píxeles opacos marcan la cobertura en
+/// > `obj_window` (la usa [`compute_window_mask`]). El modo semitransparente (1) se
+/// > trata como normal de momento (blending = 2.4h); el *mosaic* tampoco se modela.
 fn render_obj_line(
     objs: &mut [ObjPixel; SCREEN_WIDTH],
+    obj_window: &mut [bool; SCREEN_WIDTH],
     y: usize,
     dispcnt: u16,
     oam: &[u8],
@@ -1051,6 +1241,13 @@ fn render_obj_line(
         if !affine && attr0 & OBJ_ATTR0_DISABLE != 0 {
             continue;
         }
+        // Modo del OBJ: 3 es prohibido (se ignora); 2 es ventana (marca cobertura en
+        // vez de pintar color).
+        let mode = (attr0 >> OBJ_ATTR0_MODE_SHIFT) & 0b11;
+        if mode == 3 {
+            continue;
+        }
+        let is_window = mode == OBJ_MODE_WINDOW;
         let attr1 = read_u16_at(oam, base + 2);
         let attr2 = read_u16_at(oam, base + 4);
 
@@ -1064,6 +1261,18 @@ fn render_obj_line(
         let tile_base = (attr2 & OBJ_ATTR2_TILE_MASK) as usize;
         let priority = ((attr2 >> OBJ_ATTR2_PRIORITY_SHIFT) & 0b11) as u8;
         let pal_bank = ((attr2 >> OBJ_ATTR2_PALBANK_SHIFT) & 0xF) as usize;
+
+        // Deposita un píxel del sprite: un OBJ ventana marca cobertura; el resto pinta.
+        let mut emit = |screen_x: usize, index: u8| {
+            if index == 0 || screen_x >= SCREEN_WIDTH {
+                return;
+            }
+            if is_window {
+                obj_window[screen_x] = true;
+            } else {
+                put_obj_pixel(objs, screen_x, index, eight_bpp, pal_bank, priority, pram);
+            }
+        };
 
         if affine {
             // Recuadro de dibujo: el doble del sprite si el bit 9 (doble tamaño) está.
@@ -1081,9 +1290,6 @@ fn render_obj_line(
             let dy = row_in as i32 - hbh;
             for col in 0..bw {
                 let screen_x = (x_coord + col) & 0x1FF;
-                if screen_x >= SCREEN_WIDTH || objs[screen_x].opaque {
-                    continue;
-                }
                 // Transforma el punto del recuadro (relativo al centro) a coordenada de
                 // textura del sprite con la matriz inversa que guarda la OAM.
                 let dx = col as i32 - hbw;
@@ -1094,7 +1300,7 @@ fn render_obj_line(
                 }
                 let index =
                     obj_tile_index(sx as usize, sy as usize, w, tile_base, eight_bpp, one_d, vram);
-                put_obj_pixel(objs, screen_x, index, eight_bpp, pal_bank, priority, pram);
+                emit(screen_x, index);
             }
         } else {
             // Fila dentro del sprite (con envoltura a 256). Si cae fuera, no toca esta
@@ -1109,12 +1315,9 @@ fn render_obj_line(
             for col in 0..w {
                 // Envoltura horizontal a 512 y recorte a la pantalla.
                 let screen_x = (x_coord + col) & 0x1FF;
-                if screen_x >= SCREEN_WIDTH || objs[screen_x].opaque {
-                    continue;
-                }
                 let sx = if hflip { w - 1 - col } else { col };
                 let index = obj_tile_index(sx, sy, w, tile_base, eight_bpp, one_d, vram);
-                put_obj_pixel(objs, screen_x, index, eight_bpp, pal_bank, priority, pram);
+                emit(screen_x, index);
             }
         }
     }
@@ -1245,7 +1448,9 @@ mod tests {
         assert!(Ppu::handles(0x01F)); // BG3VOFS (byte alto)
         assert!(Ppu::handles(0x020)); // BG2PA (afín, 2.4f)
         assert!(Ppu::handles(0x03F)); // BG3Y (byte alto)
-        assert!(!Ppu::handles(0x040)); // ya fuera (WIN0H, ventanas en 2.4g)
+        assert!(Ppu::handles(0x040)); // WIN0H (ventanas, 2.4g)
+        assert!(Ppu::handles(0x04B)); // WINOUT (byte alto)
+        assert!(!Ppu::handles(0x04C)); // ya fuera (MOSAIC, en 2.4h)
     }
 
     #[test]
@@ -2078,5 +2283,126 @@ mod tests {
         assert_eq!(pixel(&ppu, 0, 0), [0xFF, 0x00, 0x00, 0xFF], "zoom 2×: x=0 rojo");
         assert_eq!(pixel(&ppu, 15, 0), [0xFF, 0x00, 0x00, 0xFF], "zoom 2×: x=15 aún dentro");
         assert_eq!(pixel(&ppu, 16, 0), [0x00, 0x00, 0xFF, 0xFF], "x=16 ya fuera → backdrop");
+    }
+
+    // ---- Ventanas (Mini-Hito 2.4g) ------------------------------------------
+
+    #[test]
+    fn winin_winout_legibles_y_winh_winv_de_solo_escritura() {
+        let mut ppu = Ppu::new();
+        ppu.write_u8(0x048, 0x3F); // WININ bajo (WIN0)
+        ppu.write_u8(0x049, 0x12); // WININ alto (WIN1)
+        ppu.write_u8(0x04A, 0x21); // WINOUT bajo (fuera)
+        ppu.write_u8(0x04B, 0x05); // WINOUT alto (OBJ window)
+        assert_eq!(ppu.read_u8(0x048), 0x3F);
+        assert_eq!(ppu.read_u8(0x049), 0x12);
+        assert_eq!(ppu.read_u8(0x04A), 0x21);
+        assert_eq!(ppu.read_u8(0x04B), 0x05);
+        // WIN0H/WIN0V son de solo escritura → se leen como 0.
+        ppu.write_u8(0x040, 0xAB);
+        ppu.write_u8(0x044, 0xCD);
+        assert_eq!(ppu.read_u8(0x040), 0);
+        assert_eq!(ppu.read_u8(0x044), 0);
+    }
+
+    #[test]
+    fn coord_in_window_maneja_los_bordes() {
+        // [inicio, fin): inicio en byte alto, fin (exclusivo) en bajo.
+        assert!(coord_in_window(0x0008, 0, 240)); // 0 dentro de [0,8)
+        assert!(coord_in_window(0x0008, 7, 240));
+        assert!(!coord_in_window(0x0008, 8, 240)); // 8 ya fuera
+        // inicio > fin → la ventana llega hasta el borde (fin = max).
+        assert!(coord_in_window(0x6400, 200, 240)); // X1=100, X2=0 → [100,240)
+        assert!(!coord_in_window(0x6400, 50, 240));
+        // fin > max → recortado a max.
+        assert!(coord_in_window(0x00FF, 200, 240)); // [0, 255→240)
+    }
+
+    /// Deja BG0 (screen base block 8) rojo en la fila 0 y el backdrop azul.
+    fn bg0_fila0_roja(vram: &mut [u8], pram: &mut [u8]) {
+        poner_fila0_tile_4bpp(vram, 0, 1, 1); // tile 1 → índice 1
+        for c in 0..31 {
+            vram[0x4000 + c * 2..0x4000 + c * 2 + 2].copy_from_slice(&0x0001u16.to_le_bytes());
+        }
+        poner_color_pram(pram, 0, 0x7C00); // backdrop azul
+        poner_color_pram(pram, 1, 0x001F); // BG0 rojo
+    }
+
+    #[test]
+    fn win0_muestra_el_fondo_dentro_y_lo_oculta_fuera() {
+        let mut ppu = Ppu::new();
+        // Modo 0, BG0 (bit 8) + WIN0 (bit 13) → byte alto 0x21.
+        ppu.write_u8(0x000, 0x00);
+        ppu.write_u8(0x001, 0x21);
+        ppu.write_u8(0x009, 0x08); // BG0CNT: screen base block 8
+        // WIN0 = [0,8) en X y en Y (byte alto = inicio, bajo = fin).
+        ppu.write_u8(0x040, 8); // WIN0H X2
+        ppu.write_u8(0x041, 0); // WIN0H X1
+        ppu.write_u8(0x044, 8); // WIN0V Y2
+        ppu.write_u8(0x045, 0); // WIN0V Y1
+        ppu.write_u8(0x048, 0x01); // WININ: BG0 visible dentro de WIN0
+        ppu.write_u8(0x04A, 0x00); // WINOUT: BG0 oculto fuera
+
+        let mut vram = vec![0u8; VRAM_SIZE];
+        let mut pram = vec![0u8; PRAM_SIZE];
+        bg0_fila0_roja(&mut vram, &mut pram);
+
+        ppu.render_scanline(0, &vram, &pram, &[]);
+        assert_eq!(pixel(&ppu, 0, 0), [0xFF, 0x00, 0x00, 0xFF], "dentro de WIN0 → BG0 rojo");
+        assert_eq!(pixel(&ppu, 100, 0), [0x00, 0x00, 0xFF, 0xFF], "fuera de WIN0 → backdrop");
+        // En una línea fuera del rango vertical de WIN0, todo es "fuera" → oculto.
+        ppu.render_scanline(50, &vram, &pram, &[]);
+        assert_eq!(pixel(&ppu, 0, 50), [0x00, 0x00, 0xFF, 0xFF], "fuera del rango vertical → backdrop");
+    }
+
+    #[test]
+    fn la_ventana_de_objetos_revela_el_fondo_bajo_el_sprite() {
+        let mut ppu = Ppu::new();
+        // Modo 0, BG0 (bit 8) + OBJ (bit 12) + OBJ window (bit 15) → byte alto 0x91.
+        ppu.write_u8(0x000, 0x00);
+        ppu.write_u8(0x001, 0x91);
+        ppu.write_u8(0x009, 0x08); // BG0CNT: screen base block 8
+        ppu.write_u8(0x04A, 0x00); // WINOUT bajo (fuera): BG0 oculto
+        ppu.write_u8(0x04B, 0x01); // WINOUT alto (OBJ window): BG0 visible
+
+        let mut vram = vec![0u8; VRAM_SIZE];
+        let mut pram = vec![0u8; PRAM_SIZE];
+        bg0_fila0_roja(&mut vram, &mut pram);
+        let mut oam = oam_vacia();
+        // Sprite en modo ventana (attr0 bits 10-11 = 2), 8×8 en (0,0): solo recorta.
+        poner_fila0_tile_4bpp(&mut vram, OBJ_TILE_VRAM_BASE, 0, 1);
+        poner_sprite(&mut oam, 0, OBJ_MODE_WINDOW << OBJ_ATTR0_MODE_SHIFT, 0x0000, 0x0000);
+
+        ppu.render_scanline(0, &vram, &pram, &oam);
+        assert_eq!(pixel(&ppu, 0, 0), [0xFF, 0x00, 0x00, 0xFF], "bajo el OBJ window → BG0 visible");
+        assert_eq!(pixel(&ppu, 7, 0), [0xFF, 0x00, 0x00, 0xFF], "cobertura 8 px del sprite");
+        assert_eq!(pixel(&ppu, 100, 0), [0x00, 0x00, 0xFF, 0xFF], "fuera → BG0 oculto, backdrop");
+    }
+
+    #[test]
+    fn la_ventana_tambien_recorta_los_sprites() {
+        // Un sprite normal solo se ve donde la ventana permite la capa OBJ.
+        let mut ppu = Ppu::new();
+        // Modo 0, OBJ (bit 12) + WIN0 (bit 13) → byte alto 0x30.
+        ppu.write_u8(0x000, 0x00);
+        ppu.write_u8(0x001, 0x30);
+        ppu.write_u8(0x040, 4); // WIN0H X2 = 4
+        ppu.write_u8(0x041, 0); // WIN0H X1 = 0
+        ppu.write_u8(0x044, 160); // WIN0V cubre toda la pantalla en Y
+        ppu.write_u8(0x045, 0);
+        ppu.write_u8(0x048, WIN_OBJ_BIT); // WININ: OBJ visible dentro de WIN0
+        ppu.write_u8(0x04A, 0x00); // WINOUT: OBJ oculto fuera
+
+        let mut vram = vec![0u8; VRAM_SIZE];
+        let mut pram = vec![0u8; PRAM_SIZE];
+        let mut oam = oam_vacia();
+        poner_fila0_tile_4bpp(&mut vram, OBJ_TILE_VRAM_BASE, 0, 1);
+        poner_color_pram(&mut pram, 0, 0x7C00); // backdrop azul
+        poner_color_obj_pram(&mut pram, 1, 0x001F); // sprite rojo
+        poner_sprite(&mut oam, 0, 0x0000, 0x0000, 0x0000); // 8×8 en (0,0)
+
+        ppu.render_scanline(0, &vram, &pram, &oam);
+        assert_eq!(pixel(&ppu, 0, 0), [0xFF, 0x00, 0x00, 0xFF], "x<4 dentro de WIN0 → sprite visible");
+        assert_eq!(pixel(&ppu, 5, 0), [0x00, 0x00, 0xFF, 0xFF], "x≥4 fuera → sprite oculto, backdrop");
     }
 }
