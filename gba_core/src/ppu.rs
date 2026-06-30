@@ -1,6 +1,6 @@
 //! La **PPU** (Picture Processing Unit): el subsistema gráfico de la GBA.
-//! Mini-Hitos **2.4a–2.4e** (bitmap modo 3 → barrido por scanlines → fondos de tiles
-//! → sprites/OAM → modos bitmap 4 y 5 con doble buffer).
+//! Mini-Hitos **2.4a–2.4f** (bitmap modo 3 → barrido por scanlines → fondos de tiles
+//! → sprites/OAM → modos bitmap 4 y 5 con doble buffer → fondos y sprites afines).
 //!
 //! ## De "frame de una vez" a "línea a línea"
 //!
@@ -56,13 +56,13 @@
 //!
 //! ## Qué queda para los siguientes hitos
 //!
-//! Tras 2.4e esta PPU dibuja los **fondos de texto** de los modos 0 y 1 (BG0–3 /
-//! BG0–1), los **modos bitmap** 3 (16bpp directo), 4 (8bpp paletado con doble buffer)
-//! y 5 (16bpp 160×128 con doble buffer), y la capa de **sprites** (OAM, regulares),
-//! todo por scanlines y compuesto por prioridad. Quedan: los fondos **afines** (modo
-//! 2 entero y el BG2 del modo 1) **y los sprites afines** para el 2.4f y los efectos
-//! (ventanas, blending, mosaico) para 2.4g–2.4h. El resto de bits de
-//! `DISPCNT`/`BGxCNT` no usados aquí (p. ej. *mosaic*) se almacenan sin efecto.
+//! Tras 2.4f esta PPU dibuja los **fondos de texto** de los modos 0 y 1, los **fondos
+//! afines** (BG2 del modo 1; BG2/BG3 del modo 2), los **modos bitmap** 3 (16bpp
+//! directo), 4 (8bpp paletado con doble buffer) y 5 (16bpp 160×128 con doble buffer),
+//! y la capa de **sprites** (OAM) **regulares y afines** (rotación/escalado), todo por
+//! scanlines y compuesto por prioridad. Quedan los efectos (ventanas, blending,
+//! mosaico) para 2.4g–2.4h. El resto de bits de `DISPCNT`/`BGxCNT` no usados aquí
+//! (p. ej. *mosaic*) se almacenan sin efecto.
 
 use crate::interrupt::{Interrupt, InterruptControl};
 use crate::{BYTES_PER_PIXEL, FRAMEBUFFER_SIZE, SCREEN_HEIGHT, SCREEN_WIDTH};
@@ -82,8 +82,18 @@ const BG0CNT_LO: u32 = 0x008;
 /// `0x010`–`0x011`. Los 8 registros `BGxHOFS`/`BGxVOFS` ocupan `0x010`–`0x01F`
 /// intercalados (HOFS, VOFS, HOFS, VOFS… por fondo).
 const BG0HOFS_LO: u32 = 0x010;
-/// Primer byte **después** del bloque de registros de scroll de fondo (`0x020`).
+/// Primer byte **después** del bloque de registros de scroll de fondo (`0x020`),
+/// donde empieza el bloque afín.
 const BG_REGS_END: u32 = 0x020;
+/// Primer byte del bloque de **parámetros afines** de BG2/BG3 (`0x020`, Mini-Hito
+/// 2.4f): por fondo, `PA`/`PB`/`PC`/`PD` (4×16 bits) + el punto de referencia `X`/`Y`
+/// (2×32 bits) = 16 bytes; BG2 en `0x020`–`0x02F`, BG3 en `0x030`–`0x03F`. Todos de
+/// **solo escritura**.
+const AFFINE_REGS_START: u32 = 0x020;
+/// Bytes por fondo afín en el bloque de parámetros (PA..PD + X + Y = 16).
+const AFFINE_REGS_PER_BG: u32 = 0x010;
+/// Primer byte **después** del bloque afín (`0x040`, donde empezarán las ventanas 2.4g).
+const AFFINE_REGS_END: u32 = AFFINE_REGS_START + 2 * AFFINE_REGS_PER_BG;
 
 /// Máscara del **modo de vídeo** en `DISPCNT` (bits 0-2).
 const BG_MODE_MASK: u16 = 0b111;
@@ -126,6 +136,10 @@ const BGCNT_PRIORITY_MASK: u16 = 0b11;
 /// Bit de **color de 256 colores / 8 bpp** en `BGxCNT` (bit 7): si está a 0, el
 /// fondo usa 16 paletas de 16 colores (4 bpp).
 const BGCNT_8BPP: u16 = 1 << 7;
+/// Bit de **envoltura del área de display** en `BGxCNT` (bit 13, solo fondos afines,
+/// Mini-Hito 2.4f): 1 = el fondo se repite (envuelve) fuera de su área; 0 = lo de
+/// fuera es transparente.
+const BGCNT_AFFINE_WRAP: u16 = 1 << 13;
 /// Tamaño en bytes de un **bloque de caracteres** (*char base block*, bits 2-3 de
 /// `BGxCNT` × esto): 16 KiB.
 const CHAR_BLOCK_BYTES: usize = 0x4000;
@@ -170,12 +184,20 @@ const OBJ_ATTR0_Y_MASK: u16 = 0xFF;
 const OBJ_ATTR0_AFFINE: u16 = 1 << 8;
 /// `attr0` bit 9 (en sprites no afines): sprite **deshabilitado** (no se dibuja).
 const OBJ_ATTR0_DISABLE: u16 = 1 << 9;
+/// `attr0` bit 9 (en sprites **afines**): **doble tamaño** del recuadro de dibujo
+/// (Mini-Hito 2.4f). El mismo bit es "disable" en los no afines; lo decide el bit 8.
+const OBJ_ATTR0_DOUBLE: u16 = 1 << 9;
 /// `attr0` bit 13: profundidad de color **8 bpp** (256 colores); si es 0, 4 bpp.
 const OBJ_ATTR0_8BPP: u16 = 1 << 13;
 /// `attr0` bits 14-15: **forma** del sprite (cuadrado / horizontal / vertical).
 const OBJ_ATTR0_SHAPE_SHIFT: u16 = 14;
 /// `attr1` bits 0-8: coordenada **X** (9 bits, con envoltura a 512).
 const OBJ_ATTR1_X_MASK: u16 = 0x1FF;
+/// `attr1` bits 9-13 (sprites **afines**): índice del **grupo de parámetros afines**
+/// (0–31) en la OAM (Mini-Hito 2.4f). En los no afines, los bits 12-13 son los volteos.
+const OBJ_ATTR1_AFFINE_IDX_SHIFT: u16 = 9;
+/// Máscara (tras el desplazamiento) del índice de grupo afín: 5 bits.
+const OBJ_ATTR1_AFFINE_IDX_MASK: u16 = 0x1F;
 /// `attr1` bit 12: **volteo horizontal** (sprites no afines).
 const OBJ_ATTR1_HFLIP: u16 = 1 << 12;
 /// `attr1` bit 13: **volteo vertical** (sprites no afines).
@@ -237,6 +259,18 @@ pub struct Ppu {
     /// *Scroll* vertical de cada fondo `BG0VOFS`–`BG3VOFS` (`0x0400_0012`+, de
     /// **solo escritura**, 9 bits útiles).
     bgvofs: [u16; 4],
+    /// Parámetros de la **matriz afín** de BG2 y BG3 (`PA`/`PB`/`PC`/`PD`,
+    /// `0x0400_0020`+, Mini-Hito 2.4f): punto fijo 8.8 con signo. Índice 0 = BG2,
+    /// 1 = BG3. De **solo escritura**.
+    bgpa: [i16; 2],
+    bgpb: [i16; 2],
+    bgpc: [i16; 2],
+    bgpd: [i16; 2],
+    /// Punto de **referencia** afín de BG2/BG3 (`BGxX`/`BGxY`, `0x0400_0028`+): 28 bits
+    /// con signo en punto fijo 20.8. Guardado crudo (32 bits); se extiende de signo
+    /// desde el bit 27 al usarlo. De **solo escritura**.
+    bgx: [i32; 2],
+    bgy: [i32; 2],
     /// Framebuffer RGBA del núcleo ([`FRAMEBUFFER_SIZE`] bytes). La PPU lo va
     /// rellenando **scanline a scanline** ([`Ppu::render_scanline`]); el frontend lo
     /// lee a través de [`crate::Bus::framebuffer`].
@@ -254,6 +288,12 @@ impl Ppu {
             bgcnt: [0; 4],
             bghofs: [0; 4],
             bgvofs: [0; 4],
+            bgpa: [0; 2],
+            bgpb: [0; 2],
+            bgpc: [0; 2],
+            bgpd: [0; 2],
+            bgx: [0; 2],
+            bgy: [0; 2],
             framebuffer: vec![0; FRAMEBUFFER_SIZE],
         }
     }
@@ -265,6 +305,7 @@ impl Ppu {
     pub fn handles(io_off: u32) -> bool {
         (DISPCNT_LO..DISPCNT_LO + 2).contains(&io_off)
             || (DISPSTAT_LO..BG_REGS_END).contains(&io_off)
+            || (AFFINE_REGS_START..AFFINE_REGS_END).contains(&io_off)
     }
 
     /// Lee un byte de un registro de la PPU. Nunca panica: un offset fuera de los
@@ -326,6 +367,27 @@ impl Ppu {
                     &mut self.bgvofs[idx]
                 };
                 write_byte(reg, n & 1, value);
+            }
+            // Bloque afín de BG2/BG3 (0x020–0x03F, solo escritura): por fondo, PA..PD
+            // (4×16 bits) y X/Y (2×32 bits). Ver AFFINE_REGS_START.
+            n if (AFFINE_REGS_START..AFFINE_REGS_END).contains(&n) => {
+                let i = ((n - AFFINE_REGS_START) / AFFINE_REGS_PER_BG) as usize;
+                let local = (n - AFFINE_REGS_START) % AFFINE_REGS_PER_BG;
+                match local {
+                    // PA/PB/PC/PD: cada uno 2 bytes, en este orden.
+                    0..=7 => {
+                        let reg = match local / 2 {
+                            0 => &mut self.bgpa[i],
+                            1 => &mut self.bgpb[i],
+                            2 => &mut self.bgpc[i],
+                            _ => &mut self.bgpd[i],
+                        };
+                        write_byte_i16(reg, local & 1, value);
+                    }
+                    // X: 4 bytes (0x08–0x0B). Y: 4 bytes (0x0C–0x0F).
+                    8..=11 => write_byte_i32(&mut self.bgx[i], local - 8, value),
+                    _ => write_byte_i32(&mut self.bgy[i], local - 12, value),
+                }
             }
             // VCOUNT es de solo lectura.
             _ => {}
@@ -426,14 +488,14 @@ impl Ppu {
     /// pinta nada (las líneas de V-Blank no tienen píxeles).
     ///
     /// El orden de decisión reproduce el del hardware: *forced blank* → línea blanca;
-    /// modos de **tiles** 0/1 (2.4c) → composición de fondos por prioridad; modos
-    /// **bitmap** 3 (16bpp directo), 4 (8bpp paletado con doble buffer) y 5 (16bpp
-    /// 160×128 con doble buffer, 2.4e) → el bitmap como BG2; cualquier otro modo (el 2
-    /// afín, aún sin implementar) → el *backdrop* (`PRAM[0]`).
+    /// modos de **tiles** 0/1/2 (texto y afines, 2.4c/2.4f) → composición de fondos por
+    /// prioridad; modos **bitmap** 3 (16bpp directo), 4 (8bpp paletado con doble buffer)
+    /// y 5 (16bpp 160×128 con doble buffer, 2.4e) → el bitmap como BG2; un modo inválido
+    /// (6/7) → el *backdrop* (`PRAM[0]`).
     ///
-    /// > Los fondos **afines** (modo 2 entero, y el BG2 del modo 1) son del Mini-Hito
-    /// > 2.4f; aquí solo se dibujan los fondos de **texto** (modo 0: BG0–3; modo 1:
-    /// > BG0–1). Sobre ellos se compone la **capa de sprites** (OAM, Mini-Hito 2.4d).
+    /// > Los fondos de texto (modo 0: BG0–3; modo 1: BG0–1) y los **afines** (modo 1:
+    /// > BG2; modo 2: BG2/BG3) se componen por prioridad, y sobre ellos la **capa de
+    /// > sprites** (OAM, regulares y afines, Mini-Hitos 2.4d/2.4f).
     pub fn render_scanline(&mut self, y: u16, vram: &[u8], pram: &[u8], oam: &[u8]) {
         let y = y as usize;
         if y >= SCREEN_HEIGHT {
@@ -443,9 +505,7 @@ impl Ppu {
         // tomar prestado el framebuffer mutablemente (evita un conflicto de préstamos
         // con `self`): todos son `Copy`.
         let dispcnt = self.dispcnt;
-        let bgcnt = self.bgcnt;
-        let bghofs = self.bghofs;
-        let bgvofs = self.bgvofs;
+        let bg = self.bg_registers();
 
         // Capa de **sprites** de esta línea (Mini-Hito 2.4d): un color + prioridad por
         // píxel, o transparente. Es independiente del modo de fondo y se compone luego
@@ -463,13 +523,27 @@ impl Ppu {
             return;
         }
         match (dispcnt & BG_MODE_MASK) as u8 {
-            mode @ (0 | 1) => {
-                render_tiled_row(row, y, mode, dispcnt, &bgcnt, &bghofs, &bgvofs, &objs, vram, pram)
-            }
-            3 => render_bitmap3_row(row, y, &bgcnt, &objs, vram, pram),
-            4 => render_bitmap4_row(row, y, dispcnt, &bgcnt, &objs, vram, pram),
-            5 => render_bitmap5_row(row, y, dispcnt, &bgcnt, &objs, vram, pram),
+            mode @ 0..=2 => render_tiled_row(row, y, mode, dispcnt, &bg, &objs, vram, pram),
+            3 => render_bitmap3_row(row, y, &bg.cnt, &objs, vram, pram),
+            4 => render_bitmap4_row(row, y, dispcnt, &bg.cnt, &objs, vram, pram),
+            5 => render_bitmap5_row(row, y, dispcnt, &bg.cnt, &objs, vram, pram),
             _ => render_backdrop_row(row, &objs, pram),
+        }
+    }
+
+    /// Toma una **instantánea** (`Copy`) de los registros de fondo para el render de
+    /// una scanline, evitando tomar prestado `self` mientras se escribe el framebuffer.
+    fn bg_registers(&self) -> BgRegisters {
+        BgRegisters {
+            cnt: self.bgcnt,
+            hofs: self.bghofs,
+            vofs: self.bgvofs,
+            pa: self.bgpa,
+            pb: self.bgpb,
+            pc: self.bgpc,
+            pd: self.bgpd,
+            x: self.bgx,
+            y: self.bgy,
         }
     }
 
@@ -573,60 +647,171 @@ fn write_byte(reg: &mut u16, byte_sel: u32, value: u8) {
     }
 }
 
-/// Renderiza una scanline `y` en los **modos de tiles** 0 y 1 (Mini-Hito 2.4c),
-/// componiendo los fondos de **texto** activos por orden de prioridad sobre el
-/// *backdrop*.
+/// Como [`write_byte`] pero sobre un registro de 16 bits **con signo** (un parámetro
+/// afín `PA`/`PB`/`PC`/`PD`): opera sobre los bits crudos y reinterpreta.
+fn write_byte_i16(reg: &mut i16, byte_sel: u32, value: u8) {
+    let mut bits = *reg as u16;
+    write_byte(&mut bits, byte_sel, value);
+    *reg = bits as i16;
+}
+
+/// Escribe el byte `byte_idx` (0 = el menos significativo) de un registro de 32 bits
+/// con signo (el punto de referencia afín `BGxX`/`BGxY`), conservando el resto.
+fn write_byte_i32(reg: &mut i32, byte_idx: u32, value: u8) {
+    let shift = byte_idx * 8;
+    let mut bits = *reg as u32;
+    bits = (bits & !(0xFFu32 << shift)) | (u32::from(value) << shift);
+    *reg = bits as i32;
+}
+
+/// Instantánea (`Copy`) de los registros de fondo para el render de una scanline.
+/// Agrupa los de **texto** (`cnt`/`hofs`/`vofs`, BG0–3) y los **afines** de BG2/BG3
+/// (`pa`–`pd` matriz + `x`/`y` punto de referencia, indexados 0 = BG2, 1 = BG3).
+#[derive(Clone, Copy)]
+struct BgRegisters {
+    cnt: [u16; 4],
+    hofs: [u16; 4],
+    vofs: [u16; 4],
+    pa: [i16; 2],
+    pb: [i16; 2],
+    pc: [i16; 2],
+    pd: [i16; 2],
+    x: [i32; 2],
+    y: [i32; 2],
+}
+
+/// Tipo de un fondo según el modo de vídeo: de **texto** (regular, con scroll y
+/// volteos, 2.4c) o **afín** (matriz de rotación/escalado, siempre 8 bpp, 2.4f).
+#[derive(Clone, Copy)]
+enum BgKind {
+    Text,
+    Affine,
+}
+
+/// Renderiza una scanline `y` en los **modos de tiles** 0, 1 y 2, componiendo los
+/// fondos activos por orden de prioridad sobre el *backdrop*.
 ///
-/// Solo se dibujan los fondos de texto válidos en el modo (modo 0 → BG0–3; modo 1 →
-/// BG0–1; el BG2 afín del modo 1 es del 2.4f) **y** habilitados en `DISPCNT`. Se
-/// ordenan por (prioridad, índice de fondo): para cada píxel se toma el primer fondo
-/// —el más al frente— que aporte un color no transparente (índice de paleta ≠ 0); si
-/// ninguno lo hace, queda el *backdrop*.
+/// Cada modo dibuja un conjunto de fondos, de **texto** o **afines** (Mini-Hito 2.4f):
+/// modo 0 → BG0–3 de texto; modo 1 → BG0/1 de texto + **BG2 afín**; modo 2 → **BG2/3
+/// afines**. De ellos se toman los habilitados en `DISPCNT` y se ordenan por
+/// (prioridad, índice de fondo): para cada píxel gana el primer fondo —el más al
+/// frente— que aporte un color no transparente (índice de paleta ≠ 0); si ninguno lo
+/// hace, queda el *backdrop*. Sobre el resultado se compone la capa de sprites.
 #[allow(clippy::too_many_arguments)]
 fn render_tiled_row(
     row: &mut [u8],
     y: usize,
     mode: u8,
     dispcnt: u16,
-    bgcnt: &[u16; 4],
-    bghofs: &[u16; 4],
-    bgvofs: &[u16; 4],
+    bg: &BgRegisters,
     objs: &[ObjPixel; SCREEN_WIDTH],
     vram: &[u8],
     pram: &[u8],
 ) {
-    // Fondos de texto que el modo permite dibujar (los afines son del 2.4f).
-    let text_bgs: &[usize] = match mode {
-        0 => &[0, 1, 2, 3],
-        1 => &[0, 1],
+    // Fondos que dibuja cada modo y de qué tipo (GBATEK).
+    let layers: &[(usize, BgKind)] = match mode {
+        0 => &[
+            (0, BgKind::Text),
+            (1, BgKind::Text),
+            (2, BgKind::Text),
+            (3, BgKind::Text),
+        ],
+        1 => &[(0, BgKind::Text), (1, BgKind::Text), (2, BgKind::Affine)],
+        2 => &[(2, BgKind::Affine), (3, BgKind::Affine)],
         _ => &[],
     };
     // De ellos, los habilitados en DISPCNT (bits 8-11), ordenados por prioridad.
-    let mut order = [0usize; 4];
+    let mut order = [(0usize, BgKind::Text); 4];
     let mut count = 0;
-    for &bg in text_bgs {
-        if dispcnt & (DISPCNT_BG0_ENABLE << bg) != 0 {
-            order[count] = bg;
+    for &(idx, kind) in layers {
+        if dispcnt & (DISPCNT_BG0_ENABLE << idx) != 0 {
+            order[count] = (idx, kind);
             count += 1;
         }
     }
     let order = &mut order[..count];
     // Estable y por (prioridad, índice): a igual prioridad, el fondo de menor índice
     // queda delante (regla de la GBA).
-    order.sort_by_key(|&bg| ((bgcnt[bg] & BGCNT_PRIORITY_MASK) as u8, bg as u8));
+    order.sort_by_key(|&(idx, _)| ((bg.cnt[idx] & BGCNT_PRIORITY_MASK) as u8, idx as u8));
 
     for (x, out) in row.chunks_exact_mut(BYTES_PER_PIXEL).enumerate() {
         // Fondo ganador del píxel: el primero (más al frente) con color no
         // transparente, junto a su prioridad para compararla con el sprite.
-        let mut bg = None;
-        for &b in order.iter() {
-            if let Some(color) = sample_text_bg(bgcnt[b], bghofs[b], bgvofs[b], x, y, vram, pram) {
-                bg = Some((color, (bgcnt[b] & BGCNT_PRIORITY_MASK) as u8));
+        let mut winner = None;
+        for &(idx, kind) in order.iter() {
+            let sample = match kind {
+                BgKind::Text => {
+                    sample_text_bg(bg.cnt[idx], bg.hofs[idx], bg.vofs[idx], x, y, vram, pram)
+                }
+                BgKind::Affine => sample_affine_bg(bg, idx, x, y, vram, pram),
+            };
+            if let Some(color) = sample {
+                winner = Some((color, (bg.cnt[idx] & BGCNT_PRIORITY_MASK) as u8));
                 break;
             }
         }
-        out.copy_from_slice(&compose_pixel(bg, objs[x], pram));
+        out.copy_from_slice(&compose_pixel(winner, objs[x], pram));
     }
+}
+
+/// Muestrea el color de un **fondo afín** (BG2 o BG3, `idx` 2/3; los parámetros viven
+/// indexados 0/1) en el píxel de pantalla `(screen_x, screen_y)`, aplicando la matriz
+/// de rotación/escalado y el punto de referencia. Devuelve el color **BGR555**, o
+/// `None` si es transparente (índice 0) o si el punto cae fuera del área sin envoltura.
+///
+/// El hardware mapea la pantalla a la textura con `(tx, ty) = P·(x, y) + ref`, con
+/// `PA..PD` en punto fijo 8.8 y el punto de referencia en 20.8; el `>> 8` recupera el
+/// píxel de textura. Los fondos afines son **siempre 8 bpp** y su mapa tiene **1 byte
+/// por celda** (número de tile, sin volteos ni banco de paleta). Nunca panica.
+fn sample_affine_bg(
+    bg: &BgRegisters,
+    idx: usize,
+    screen_x: usize,
+    screen_y: usize,
+    vram: &[u8],
+    pram: &[u8],
+) -> Option<u16> {
+    let a = idx - 2; // BG2 → 0, BG3 → 1
+    let bgcnt = bg.cnt[idx];
+    let (pa, pb) = (bg.pa[a] as i32, bg.pb[a] as i32);
+    let (pc, pd) = (bg.pc[a] as i32, bg.pd[a] as i32);
+    let refx = sign_extend_28(bg.x[a]);
+    let refy = sign_extend_28(bg.y[a]);
+
+    // Transformación afín (8.8 fijo): (x,y) de pantalla → (tx,ty) de textura.
+    let (x, y) = (screen_x as i32, screen_y as i32);
+    let mut ix = (pa * x + pb * y + refx) >> 8;
+    let mut iy = (pc * x + pd * y + refy) >> 8;
+
+    let size_px = 128i32 << ((bgcnt >> 14) & 0b11); // 128/256/512/1024 px (cuadrado)
+    if bgcnt & BGCNT_AFFINE_WRAP != 0 {
+        // Envoltura: el fondo se repite (tamaño es potencia de dos).
+        ix &= size_px - 1;
+        iy &= size_px - 1;
+    } else if !(0..size_px).contains(&ix) || !(0..size_px).contains(&iy) {
+        return None; // fuera del área y sin envoltura → transparente
+    }
+    let (ix, iy) = (ix as usize, iy as usize);
+    let tiles_per_row = (size_px / 8) as usize;
+
+    // Mapa afín: 1 byte por celda = número de tile.
+    let screen_base = ((bgcnt >> 8) & 0x1F) as usize * SCREEN_BLOCK_BYTES;
+    let tile_num = read_at(vram, screen_base + (iy / 8) * tiles_per_row + ix / 8) as usize;
+    // Tiles afines: siempre 8 bpp, paleta de fondo de 256 colores.
+    let char_base = ((bgcnt >> 2) & 0b11) as usize * CHAR_BLOCK_BYTES;
+    let index = read_at(vram, char_base + tile_num * TILE_BYTES_8BPP + (iy % 8) * 8 + ix % 8);
+    if index == 0 {
+        return None; // índice 0 = transparente
+    }
+    let off = index as usize * 2;
+    Some(u16::from_le_bytes([read_at(pram, off), read_at(pram, off + 1)]))
+}
+
+/// Extiende de signo un valor afín de **28 bits** (el punto de referencia `BGxX/Y`,
+/// guardado en 32 bits) tomando el bit 27 como bit de signo.
+#[inline]
+fn sign_extend_28(v: i32) -> i32 {
+    (v << 4) >> 4
 }
 
 /// Compone una scanline del **modo 3** (bitmap directo 16 bpp) con la capa de
@@ -711,8 +896,8 @@ fn render_bitmap5_row(
     }
 }
 
-/// Compone una scanline de un modo **sin fondo dibujado** (modo 2 afín aún pendiente,
-/// o cualquier otro): solo el *backdrop* y la capa de sprites encima.
+/// Compone una scanline de un modo **sin fondo dibujado** (un modo de vídeo inválido,
+/// 6 o 7): solo el *backdrop* y la capa de sprites encima.
 fn render_backdrop_row(row: &mut [u8], objs: &[ObjPixel; SCREEN_WIDTH], pram: &[u8]) {
     for (x, out) in row.chunks_exact_mut(BYTES_PER_PIXEL).enumerate() {
         out.copy_from_slice(&compose_pixel(None, objs[x], pram));
@@ -845,9 +1030,9 @@ impl ObjPixel {
 /// bus presta. Recorre los 128 sprites en orden de índice OAM; a igualdad de píxel,
 /// el de **menor índice** manda (se escribe solo si el píxel sigue transparente).
 ///
-/// > Solo dibuja sprites **regulares** (no afines): los afines (rotación/escalado,
-/// > `attr0` bit 8) son del Mini-Hito 2.4f y aquí se omiten. Tampoco se modelan aún
-/// > los modos de OBJ semitransparente / ventana (`attr0` bits 10-11) ni el *mosaic*.
+/// > Dibuja sprites **regulares** y **afines** (rotación/escalado, `attr0` bit 8,
+/// > Mini-Hito 2.4f). No se modelan aún los modos de OBJ semitransparente / ventana
+/// > (`attr0` bits 10-11) ni el *mosaic*.
 fn render_obj_line(
     objs: &mut [ObjPixel; SCREEN_WIDTH],
     y: usize,
@@ -861,8 +1046,9 @@ fn render_obj_line(
     for i in 0..OAM_ENTRIES {
         let base = i * 8;
         let attr0 = read_u16_at(oam, base);
-        // Afín (bit 8) → 2.4f. No afín + disable (bit 9) → no se dibuja.
-        if attr0 & OBJ_ATTR0_AFFINE != 0 || attr0 & OBJ_ATTR0_DISABLE != 0 {
+        let affine = attr0 & OBJ_ATTR0_AFFINE != 0;
+        // El bit 9 es "disable" en los no afines (y "doble tamaño" en los afines).
+        if !affine && attr0 & OBJ_ATTR0_DISABLE != 0 {
             continue;
         }
         let attr1 = read_u16_at(oam, base + 2);
@@ -872,42 +1058,98 @@ fn render_obj_line(
         let size = (attr1 >> OBJ_ATTR1_SIZE_SHIFT) & 0b11;
         let (w, h) = obj_size(shape, size);
 
-        // Fila dentro del sprite (con envoltura a 256). Si cae fuera, el sprite no
-        // toca esta línea: un sprite cerca del borde inferior "envuelve" arriba.
         let y_coord = attr0 & OBJ_ATTR0_Y_MASK;
-        let row_in = ((y as u16).wrapping_sub(y_coord) & 0xFF) as usize;
-        if row_in >= h {
-            continue;
-        }
-
         let x_coord = (attr1 & OBJ_ATTR1_X_MASK) as usize;
         let eight_bpp = attr0 & OBJ_ATTR0_8BPP != 0;
-        let hflip = attr1 & OBJ_ATTR1_HFLIP != 0;
-        let vflip = attr1 & OBJ_ATTR1_VFLIP != 0;
         let tile_base = (attr2 & OBJ_ATTR2_TILE_MASK) as usize;
         let priority = ((attr2 >> OBJ_ATTR2_PRIORITY_SHIFT) & 0b11) as u8;
         let pal_bank = ((attr2 >> OBJ_ATTR2_PALBANK_SHIFT) & 0xF) as usize;
 
-        let sy = if vflip { h - 1 - row_in } else { row_in };
-
-        for col in 0..w {
-            // Envoltura horizontal a 512 y recorte a la pantalla.
-            let screen_x = (x_coord + col) & 0x1FF;
-            if screen_x >= SCREEN_WIDTH || objs[screen_x].opaque {
+        if affine {
+            // Recuadro de dibujo: el doble del sprite si el bit 9 (doble tamaño) está.
+            let (bw, bh) = if attr0 & OBJ_ATTR0_DOUBLE != 0 { (w * 2, h * 2) } else { (w, h) };
+            let row_in = ((y as u16).wrapping_sub(y_coord) & 0xFF) as usize;
+            if row_in >= bh {
                 continue;
             }
-            let sx = if hflip { w - 1 - col } else { col };
-            let index = obj_tile_index(sx, sy, w, tile_base, eight_bpp, one_d, vram);
-            if index == 0 {
-                continue; // índice 0 = transparente
+            // Matriz afín del grupo de parámetros seleccionado (attr1 bits 9-13).
+            let group = ((attr1 >> OBJ_ATTR1_AFFINE_IDX_SHIFT) & OBJ_ATTR1_AFFINE_IDX_MASK) as usize;
+            let (pa, pb, pc, pd) = obj_affine_params(oam, group);
+            // Centros del recuadro y de la textura del sprite.
+            let (hbw, hbh) = (bw as i32 / 2, bh as i32 / 2);
+            let (hw, hh) = (w as i32 / 2, h as i32 / 2);
+            let dy = row_in as i32 - hbh;
+            for col in 0..bw {
+                let screen_x = (x_coord + col) & 0x1FF;
+                if screen_x >= SCREEN_WIDTH || objs[screen_x].opaque {
+                    continue;
+                }
+                // Transforma el punto del recuadro (relativo al centro) a coordenada de
+                // textura del sprite con la matriz inversa que guarda la OAM.
+                let dx = col as i32 - hbw;
+                let sx = ((pa * dx + pb * dy) >> 8) + hw;
+                let sy = ((pc * dx + pd * dy) >> 8) + hh;
+                if sx < 0 || sx >= w as i32 || sy < 0 || sy >= h as i32 {
+                    continue; // el punto cae fuera del sprite real
+                }
+                let index =
+                    obj_tile_index(sx as usize, sy as usize, w, tile_base, eight_bpp, one_d, vram);
+                put_obj_pixel(objs, screen_x, index, eight_bpp, pal_bank, priority, pram);
             }
-            // Paleta de sprites (segunda mitad de la PRAM): 4 bpp por banco, 8 bpp directo.
-            let pal_index = if eight_bpp { index as usize } else { pal_bank * 16 + index as usize };
-            let off = OBJ_PALETTE_BYTE_BASE + pal_index * 2;
-            let color = u16::from_le_bytes([read_at(pram, off), read_at(pram, off + 1)]);
-            objs[screen_x] = ObjPixel { color, priority, opaque: true };
+        } else {
+            // Fila dentro del sprite (con envoltura a 256). Si cae fuera, no toca esta
+            // línea: un sprite cerca del borde inferior "envuelve" arriba.
+            let row_in = ((y as u16).wrapping_sub(y_coord) & 0xFF) as usize;
+            if row_in >= h {
+                continue;
+            }
+            let hflip = attr1 & OBJ_ATTR1_HFLIP != 0;
+            let vflip = attr1 & OBJ_ATTR1_VFLIP != 0;
+            let sy = if vflip { h - 1 - row_in } else { row_in };
+            for col in 0..w {
+                // Envoltura horizontal a 512 y recorte a la pantalla.
+                let screen_x = (x_coord + col) & 0x1FF;
+                if screen_x >= SCREEN_WIDTH || objs[screen_x].opaque {
+                    continue;
+                }
+                let sx = if hflip { w - 1 - col } else { col };
+                let index = obj_tile_index(sx, sy, w, tile_base, eight_bpp, one_d, vram);
+                put_obj_pixel(objs, screen_x, index, eight_bpp, pal_bank, priority, pram);
+            }
         }
     }
+}
+
+/// Resuelve el color de un **índice de tile** de sprite (`index`) y lo deposita en la
+/// capa OBJ en `screen_x`, **solo si** el píxel sigue libre (el sprite de menor índice
+/// OAM manda) y el índice no es 0 (transparente). 4 bpp toma el color de un banco de
+/// 16; 8 bpp, de la paleta de sprites completa (segunda mitad de la PRAM).
+fn put_obj_pixel(
+    objs: &mut [ObjPixel; SCREEN_WIDTH],
+    screen_x: usize,
+    index: u8,
+    eight_bpp: bool,
+    pal_bank: usize,
+    priority: u8,
+    pram: &[u8],
+) {
+    if index == 0 || screen_x >= SCREEN_WIDTH || objs[screen_x].opaque {
+        return;
+    }
+    let pal_index = if eight_bpp { index as usize } else { pal_bank * 16 + index as usize };
+    let off = OBJ_PALETTE_BYTE_BASE + pal_index * 2;
+    let color = u16::from_le_bytes([read_at(pram, off), read_at(pram, off + 1)]);
+    objs[screen_x] = ObjPixel { color, priority, opaque: true };
+}
+
+/// Lee los cuatro parámetros de la **matriz afín** (`PA`,`PB`,`PC`,`PD`, en punto fijo
+/// 8.8 con signo) del grupo `group` (0–31) de la OAM. Cada grupo ocupa 32 bytes (4
+/// entradas de sprite) y guarda un parámetro en el **4º** *halfword* de cada entrada:
+/// PA en `+0x06`, PB en `+0x0E`, PC en `+0x16`, PD en `+0x1E`.
+fn obj_affine_params(oam: &[u8], group: usize) -> (i32, i32, i32, i32) {
+    let base = group * 32;
+    let p = |off: usize| read_u16_at(oam, base + off) as i16 as i32;
+    (p(0x06), p(0x0E), p(0x16), p(0x1E))
 }
 
 /// Índice de paleta del píxel `(sx, sy)` **dentro** de un sprite (con los volteos ya
@@ -1001,7 +1243,9 @@ mod tests {
         assert!(Ppu::handles(0x00F)); // BG3CNT (byte alto)
         assert!(Ppu::handles(0x010)); // BG0HOFS
         assert!(Ppu::handles(0x01F)); // BG3VOFS (byte alto)
-        assert!(!Ppu::handles(0x020)); // ya fuera (BG2 afín BG2PA, llega en 2.4f)
+        assert!(Ppu::handles(0x020)); // BG2PA (afín, 2.4f)
+        assert!(Ppu::handles(0x03F)); // BG3Y (byte alto)
+        assert!(!Ppu::handles(0x040)); // ya fuera (WIN0H, ventanas en 2.4g)
     }
 
     #[test]
@@ -1174,9 +1418,9 @@ mod tests {
     }
 
     #[test]
-    fn un_modo_no_implementado_pinta_el_backdrop() {
+    fn un_modo_invalido_pinta_el_backdrop() {
         let mut ppu = Ppu::new();
-        ppu.write_u8(0x000, 0x02); // modo 2 (solo fondos afines, aún sin implementar)
+        ppu.write_u8(0x000, 0x06); // modo 6 (inválido): sin fondo, solo backdrop
         let vram = vec![0u8; VRAM_SIZE];
         let mut pram = vec![0u8; PRAM_SIZE];
         pram[0..2].copy_from_slice(&0x03E0u16.to_le_bytes()); // backdrop verde
@@ -1406,6 +1650,16 @@ mod tests {
         pram[off..off + 2].copy_from_slice(&color.to_le_bytes());
     }
 
+    /// Escribe los cuatro parámetros afines (`PA`,`PB`,`PC`,`PD`) del grupo `group` en
+    /// la OAM, en los huecos del 4º *halfword* de sus 4 entradas (ver `obj_affine_params`).
+    fn poner_obj_affine(oam: &mut [u8], group: usize, pa: u16, pb: u16, pc: u16, pd: u16) {
+        let base = group * 32;
+        oam[base + 0x06..base + 0x08].copy_from_slice(&pa.to_le_bytes());
+        oam[base + 0x0E..base + 0x10].copy_from_slice(&pb.to_le_bytes());
+        oam[base + 0x16..base + 0x18].copy_from_slice(&pc.to_le_bytes());
+        oam[base + 0x1E..base + 0x20].copy_from_slice(&pd.to_le_bytes());
+    }
+
     /// DISPCNT con un modo, y opcionalmente OBJ habilitado y mapeo 1D.
     fn dispcnt(ppu: &mut Ppu, mode: u8, obj_enable: bool, one_d: bool) {
         let mut v = mode as u16;
@@ -1566,8 +1820,9 @@ mod tests {
     }
 
     #[test]
-    fn un_sprite_afin_se_omite_por_ahora() {
-        // Los sprites afines (attr0 bit 8) son del 2.4f: de momento no se dibujan.
+    fn un_sprite_afin_con_matriz_identidad_se_dibuja_como_uno_regular() {
+        // Con la matriz afín identidad (PA=PD=0x100, PB=PC=0), un sprite afín debe
+        // verse igual que un sprite regular (Mini-Hito 2.4f).
         let mut ppu = Ppu::new();
         dispcnt(&mut ppu, 0, true, true);
         let mut vram = vec![0u8; VRAM_SIZE];
@@ -1575,10 +1830,17 @@ mod tests {
         let mut oam = oam_vacia();
         poner_fila0_tile_4bpp(&mut vram, OBJ_TILE_VRAM_BASE, 0, 1);
         poner_color_pram(&mut pram, 0, 0x7C00); // backdrop azul
-        poner_color_obj_pram(&mut pram, 1, 0x001F);
+        poner_color_obj_pram(&mut pram, 1, 0x001F); // rojo
+        // Grupo afín 0: identidad (PA=0x0100, PD=0x0100).
+        poner_obj_affine(&mut oam, 0, 0x0100, 0x0000, 0x0000, 0x0100);
+        // Sprite afín 8×8 en (0,0), grupo 0.
         poner_sprite(&mut oam, 0, OBJ_ATTR0_AFFINE, 0x0000, 0x0000);
+
         ppu.render_scanline(0, &vram, &pram, &oam);
-        assert_eq!(pixel(&ppu, 0, 0), [0x00, 0x00, 0xFF, 0xFF], "afín omitido → backdrop");
+
+        assert_eq!(pixel(&ppu, 0, 0), [0xFF, 0x00, 0x00, 0xFF], "afín identidad = sprite rojo");
+        assert_eq!(pixel(&ppu, 7, 0), [0xFF, 0x00, 0x00, 0xFF], "cubre los 8 px");
+        assert_eq!(pixel(&ppu, 8, 0), [0x00, 0x00, 0xFF, 0xFF], "fuera → backdrop");
     }
 
     #[test]
@@ -1703,5 +1965,118 @@ mod tests {
         // El sprite 8×8 cubre x=0..7; el bitmap se ve a partir de x=8.
         assert_eq!(pixel(&ppu, 0, 0), [0xFF, 0x00, 0x00, 0xFF], "sprite (prio 0) sobre el bitmap");
         assert_eq!(pixel(&ppu, 8, 0), [0x00, 0xFF, 0x00, 0xFF], "fuera del sprite → bitmap verde");
+    }
+
+    // ---- Fondos y sprites afines (Mini-Hito 2.4f) ---------------------------
+
+    /// Escribe los parámetros afines de un fondo (`bg` = 2 o 3) por sus registros de
+    /// solo escritura (`0x020`+): matriz `PA`/`PB`/`PC`/`PD` (8.8) y referencia `X`/`Y`.
+    #[allow(clippy::too_many_arguments)]
+    fn poner_bg_afin(ppu: &mut Ppu, bg: u32, pa: i16, pb: i16, pc: i16, pd: i16, x: i32, y: i32) {
+        let base = AFFINE_REGS_START + (bg - 2) * AFFINE_REGS_PER_BG;
+        let mut w16 = |off: u32, v: u16| {
+            ppu.write_u8(off, v as u8);
+            ppu.write_u8(off + 1, (v >> 8) as u8);
+        };
+        w16(base, pa as u16);
+        w16(base + 2, pb as u16);
+        w16(base + 4, pc as u16);
+        w16(base + 6, pd as u16);
+        for b in 0..4 {
+            ppu.write_u8(base + 8 + b, (x >> (b * 8)) as u8);
+            ppu.write_u8(base + 12 + b, (y >> (b * 8)) as u8);
+        }
+    }
+
+    /// Un fondo afín 8 bpp con matriz **identidad** se dibuja como un fondo normal;
+    /// fuera de su área (128×128, sin envoltura) se ve el *backdrop*.
+    #[test]
+    fn modo2_dibuja_un_fondo_afin_con_identidad() {
+        let mut ppu = Ppu::new();
+        // Modo 2, BG2 habilitado (bit 10 → byte alto 0x04).
+        ppu.write_u8(0x000, 0x02);
+        ppu.write_u8(0x001, 0x04);
+        // BG2CNT (0x00C): screen base block 1 (0x800), char base 0, tamaño 0 (128×128).
+        ppu.write_u8(0x00D, 0x01);
+
+        let mut vram = vec![0u8; VRAM_SIZE];
+        let mut pram = vec![0u8; PRAM_SIZE];
+        // Mapa afín: celda (0,0) → tile 1 (1 byte por celda, en el screen base block).
+        vram[0x800] = 1;
+        // Tile 1 en 8 bpp: 64 bytes/tile; píxel (0,0) = índice 5.
+        vram[64] = 5;
+        poner_color_pram(&mut pram, 0, 0x7C00); // backdrop azul
+        poner_color_pram(&mut pram, 5, 0x001F); // índice 5 = rojo
+        // Identidad: PA=PD=1.0 (0x100), sin traslación.
+        poner_bg_afin(&mut ppu, 2, 0x0100, 0, 0, 0x0100, 0, 0);
+
+        ppu.render_scanline(0, &vram, &pram, &[]);
+        assert_eq!(pixel(&ppu, 0, 0), [0xFF, 0x00, 0x00, 0xFF], "afín identidad → tile rojo");
+        // x=200 cae fuera del área de 128 px y sin envoltura → backdrop.
+        assert_eq!(pixel(&ppu, 200, 0), [0x00, 0x00, 0xFF, 0xFF], "fuera del área → backdrop");
+    }
+
+    /// Con el bit de envoltura de `BGxCNT` (13), el fondo afín se repite fuera de su área.
+    #[test]
+    fn el_fondo_afin_envuelve_con_el_bit_de_wrap() {
+        let mut vram = vec![0u8; VRAM_SIZE];
+        let mut pram = vec![0u8; PRAM_SIZE];
+        // Mapa: todas las celdas de la primera fila de tiles → tile 1; tile 1 todo a 5.
+        for c in 0..16 {
+            vram[0x800 + c] = 1;
+        }
+        for b in 0..64 {
+            vram[64 + b] = 5;
+        }
+        poner_color_pram(&mut pram, 0, 0x7C00); // backdrop azul
+        poner_color_pram(&mut pram, 5, 0x001F); // rojo
+
+        // Referencia X = -1 píxel (ix = -1): sin envoltura cae fuera; con ella, repite.
+        let prep = |wrap: bool| {
+            let mut ppu = Ppu::new();
+            ppu.write_u8(0x000, 0x02);
+            ppu.write_u8(0x001, 0x04); // BG2 enable
+            let mut cnt = 0x01u16 << 8; // screen base block 1
+            if wrap {
+                cnt |= BGCNT_AFFINE_WRAP;
+            }
+            ppu.write_u8(0x00C, cnt as u8);
+            ppu.write_u8(0x00D, (cnt >> 8) as u8);
+            poner_bg_afin(&mut ppu, 2, 0x0100, 0, 0, 0x0100, -256, 0); // refx = -1.0
+            ppu
+        };
+
+        let mut sin = prep(false);
+        sin.render_scanline(0, &vram, &pram, &[]);
+        assert_eq!(pixel(&sin, 0, 0), [0x00, 0x00, 0xFF, 0xFF], "sin wrap, ix=-1 → backdrop");
+
+        let mut con = prep(true);
+        con.render_scanline(0, &vram, &pram, &[]);
+        assert_eq!(pixel(&con, 0, 0), [0xFF, 0x00, 0x00, 0xFF], "con wrap, ix=-1 envuelve → tile");
+    }
+
+    /// Un sprite afín con doble tamaño y la matriz a 0.5 (PA=PD=0x80) se dibuja al
+    /// **doble** de su tamaño (zoom 2×): un 8×8 ocupa 16 px de pantalla.
+    #[test]
+    fn un_sprite_afin_escala_al_doble() {
+        let mut ppu = Ppu::new();
+        dispcnt(&mut ppu, 0, true, true);
+        let mut vram = vec![0u8; VRAM_SIZE];
+        let mut pram = vec![0u8; PRAM_SIZE];
+        let mut oam = oam_vacia();
+        // Tile 0 fila 0 todo al índice 1 (rojo).
+        poner_fila0_tile_4bpp(&mut vram, OBJ_TILE_VRAM_BASE, 0, 1);
+        poner_color_pram(&mut pram, 0, 0x7C00); // backdrop azul
+        poner_color_obj_pram(&mut pram, 1, 0x001F); // rojo
+        // Grupo 0: PA=PD=0x80 (0.5 → cada píxel de pantalla avanza media textura → 2×).
+        poner_obj_affine(&mut oam, 0, 0x0080, 0x0000, 0x0000, 0x0080);
+        // Sprite afín 8×8 con doble tamaño (recuadro 16×16) en (0,0), grupo 0.
+        poner_sprite(&mut oam, 0, OBJ_ATTR0_AFFINE | OBJ_ATTR0_DOUBLE, 0x0000, 0x0000);
+
+        ppu.render_scanline(0, &vram, &pram, &oam);
+        // La fila 0 del tile (roja) se estira por los 16 px del recuadro.
+        assert_eq!(pixel(&ppu, 0, 0), [0xFF, 0x00, 0x00, 0xFF], "zoom 2×: x=0 rojo");
+        assert_eq!(pixel(&ppu, 15, 0), [0xFF, 0x00, 0x00, 0xFF], "zoom 2×: x=15 aún dentro");
+        assert_eq!(pixel(&ppu, 16, 0), [0x00, 0x00, 0xFF, 0xFF], "x=16 ya fuera → backdrop");
     }
 }
